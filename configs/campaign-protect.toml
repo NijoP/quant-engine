@@ -1,0 +1,38 @@
+# 24 NOV 2026 LAUNCH-TIME PROTECTIVE CAMPAIGN (owner directive, 24 Nov 2026).
+# Run:  qe-desk --profile campaign-protect        (QE_CAMPAIGN_CONFIG overrides the path)
+# PAPER by default. Live needs: execution_mode = "live" below AND
+# QE_EXECUTION_MODE=live + QE_LIVE_OPERATOR_CONFIRM in the desk environment, a
+# `--features live` build, and the owner arm (typed on a terminal):
+#   qe-live-check arm --hours 22 --first-trade-verifies-protection
+# Docs: docs/CAMPAIGN_PROTECT.md.
+#
+# Campaign clock: T0 = the instant the armed desk gets its first FRESH verified
+# INR futures-wallet read (<= 30 s old); E0 = that read. A failed or stale read
+# refuses activation (and entries). Deadline fixed: 2026-11-24 23:30 IST.
+# Target(t) = E0 * (50000 / E0) ^ ((t - T0) / (D - T0)), hourly checkpoints from
+# T0 plus the final 23:30 checkpoint. The curve is a progress measure ONLY: it
+# never changes sizing, leverage, gates or entries.
+#
+# Limits derived from E0 at activation (cannot be loosened here):
+#   per-trade planned loss <= min(INR 1, 1% E0)  (stop loss + fees + slippage)
+#   cumulative loss        <= min(INR 5, 5% E0)  (permanent stop)
+#   floor                  >= 0.95 * E0          (permanent stop)
+# Strategy gates are the normal ones (calibration authority + positive net EV
+# after actual costs). An order below the exchange minimum notional is REJECTED,
+# never resized up. Expect most or all opportunities to be rejected.
+execution_mode = "paper"
+deadline_ms = 1795543200000           # 2026-11-24 23:30 IST: exit-only from here, persisted
+leverage_cap = 5                      # never above the instrument max either
+max_open_positions = 1
+max_hold_ms = 120000                  # monotonic, from the confirmed fill
+isolated_margin = true                # verified on the exchange position after every fill
+entry = "maker"                       # passive GTC limit; unfilled remainder cancelled, never chased
+maker_timeout_s = 4
+require_calibration_for_live = true
+require_positive_net_ev_for_live = true
+allow_raise_to_min_notional = false
+allow_size_up_after_loss = false
+behind_schedule_changes_risk = false
+paper_start_equity_inr = 201.45
+paper_slippage_bps = 2.0
+data_dir = "data/desk-campaign-protect" # live runs use "<data_dir>-live"

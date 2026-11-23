@@ -74,6 +74,9 @@ pub const SUPERSEDED_22H_DEADLINE_MS: i64 = 1_795_537_800_000;
 pub const CAMPAIGN_BASELINE_INR: Decimal = dec!(101.45);
 /// IST = UTC + 05:30, no daylight saving.
 pub const IST_OFFSET_MS: i64 = 19_800_000;
+/// Launch-time protective campaign (configs/campaign-protect.toml, owner
+/// directive of 24 Nov 2026): fixed deadline 2026-11-24 23:30 IST.
+pub const LAUNCH_DEADLINE_MS: i64 = 1_795_543_200_000;
 
 /// Where the reported equity comes from. Paper equity is never real capital.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +127,10 @@ pub struct CampaignConfig {
     /// (the protective INR 1 / INR 5 profile).
     #[serde(default)]
     pub bold_play: bool,
+    /// Launch-time campaign ([`CampaignConfig::protect_launch`]): T0 and E0 are
+    /// the activation instant and the verified wallet read at activation.
+    #[serde(default)]
+    pub launch: bool,
 }
 
 impl Default for CampaignConfig {
@@ -142,11 +149,60 @@ impl Default for CampaignConfig {
             max_hold_secs: 120,
             on_track_band: dec!(0.01),
             bold_play: false,
+            launch: false,
         }
     }
 }
 
 impl CampaignConfig {
+    /// Protective launch-time profile (configs/campaign-protect.toml): T0 = the
+    /// activation instant, E0 = the verified live INR futures wallet at T0,
+    /// deadline fixed at 23:30 IST. Per-trade planned loss <= min(INR 1, 1 % E0),
+    /// cumulative <= min(INR 5, 5 % E0), floor >= 95 % E0 (rounded UP to paise),
+    /// one position, 120 s. Entries open at T0 (no preparation hour).
+    pub fn protect_launch(t0_ms: i64, e0: Decimal) -> Self {
+        let floor =
+            (e0 * dec!(0.95)).round_dp_with_strategy(2, RoundingStrategy::ToPositiveInfinity);
+        Self {
+            start_ms: t0_ms,
+            first_entry_ms: t0_ms,
+            deadline_ms: LAUNCH_DEADLINE_MS,
+            start_equity: e0,
+            risk_reference_equity: e0,
+            target: dec!(50000),
+            floor,
+            max_loss_per_trade: dec!(1).min(e0 * dec!(0.01)),
+            max_campaign_loss: dec!(5).min(e0 * dec!(0.05)),
+            max_open_positions: 1,
+            max_hold_secs: 120,
+            on_track_band: dec!(0.01),
+            bold_play: false,
+            launch: true,
+        }
+    }
+
+    /// Number of checkpoints after the start: one per whole hour from T0 plus
+    /// the final checkpoint at the deadline (a partial last hour counts).
+    pub fn checkpoint_count(&self) -> u32 {
+        let span = (self.deadline_ms - self.start_ms).max(0);
+        ((span + HOUR_MS - 1) / HOUR_MS) as u32
+    }
+
+    /// Checkpoint index reached at `now` (0 at T0, [`Self::checkpoint_count`] at
+    /// and after the deadline).
+    pub fn checkpoint_index(&self, now_ms: i64) -> u32 {
+        if now_ms >= self.deadline_ms {
+            return self.checkpoint_count();
+        }
+        (((now_ms - self.start_ms).max(0) / HOUR_MS) as u32).min(self.checkpoint_count())
+    }
+
+    /// "23:00 IST" style label of the deadline.
+    pub fn deadline_label(&self) -> String {
+        let iso = iso_ist(self.deadline_ms);
+        format!("{} IST", &iso[11..16])
+    }
+
     /// Bold-play profile with an owner-set floor (required, no default).
     pub fn bold(floor: Decimal) -> Self {
         Self {
@@ -219,7 +275,7 @@ impl CampaignConfig {
 
     /// Hourly checkpoint requirement, whole rupees (the published table).
     pub fn checkpoint_required(&self, hour: u32) -> Decimal {
-        r0(self.target_equity_exact(hour as f64))
+        r0(self.target_equity_exact(self.elapsed_hours(self.checkpoint_ms(hour))))
     }
 
     /// Fractional hours elapsed since the start (may be negative or > H).
@@ -233,7 +289,7 @@ impl CampaignConfig {
     }
 
     pub fn checkpoint_ms(&self, hour: u32) -> i64 {
-        self.start_ms + hour as i64 * HOUR_MS
+        (self.start_ms + hour as i64 * HOUR_MS).min(self.deadline_ms)
     }
 
     /// The per-trade planned-loss budget allowed right now. It depends only on the
@@ -346,6 +402,18 @@ pub struct Campaign {
     pub final_record: Option<FinalRecord>,
     /// Gate reason last logged (transition-only logging of repeated blocks).
     pub last_gate: Option<String>,
+    /// Launch-time campaign not yet activated (no T0/E0): entries refused.
+    #[serde(default)]
+    pub awaiting_activation: bool,
+    /// Equity source of the activation read (E0).
+    #[serde(default)]
+    pub activated_source: Option<EquitySource>,
+    /// Realised P&L of every closed campaign trade (series statistics).
+    #[serde(default)]
+    pub trade_pnls: Vec<Decimal>,
+    /// Largest marked drawdown from the peak observed so far.
+    #[serde(default)]
+    pub max_drawdown: Decimal,
     #[serde(skip)]
     pub events: Vec<CampaignEvent>,
 }
@@ -354,7 +422,11 @@ impl Campaign {
     pub fn new(cfg: CampaignConfig, source: EquitySource) -> Self {
         let start = cfg.start_equity;
         Self {
-            checkpoint_actual: vec![None; CAMPAIGN_HOURS as usize + 1],
+            checkpoint_actual: vec![None; cfg.checkpoint_count() as usize + 1],
+            awaiting_activation: false,
+            activated_source: None,
+            trade_pnls: vec![],
+            max_drawdown: Decimal::ZERO,
             cfg,
             equity_source: source,
             equity: None,
@@ -387,16 +459,86 @@ impl Campaign {
             }
         }
         let c: Campaign = serde_json::from_str(json).map_err(|e| format!("campaign state: {e}"))?;
+        if cfg.launch {
+            // Launch-time campaign: T0/E0 come from the persisted activation;
+            // the profile derived from them must be unchanged.
+            let ok = c.cfg.launch
+                && (c.awaiting_activation
+                    || c.cfg == CampaignConfig::protect_launch(c.cfg.start_ms, c.cfg.start_equity))
+                && c.cfg.deadline_ms == cfg.deadline_ms;
+            if !ok {
+                return Err(
+                    "persisted campaign is not this launch-time profile: owner review required"
+                        .into(),
+                );
+            }
+            if c.checkpoint_actual.len() != c.cfg.checkpoint_count() as usize + 1 {
+                return Err("persisted campaign checkpoint table is malformed".into());
+            }
+            return Ok(c);
+        }
         if &c.cfg != cfg {
             return Err(
                 "persisted campaign has a different schedule/risk profile: owner review required"
                     .into(),
             );
         }
-        if c.checkpoint_actual.len() != CAMPAIGN_HOURS as usize + 1 {
+        if c.checkpoint_actual.len() != c.cfg.checkpoint_count() as usize + 1 {
             return Err("persisted campaign checkpoint table is malformed".into());
         }
         Ok(c)
+    }
+
+    /// A launch-time campaign waiting for activation (T0/E0 unknown).
+    pub fn awaiting_launch(source: EquitySource) -> Self {
+        let mut c = Self::new(
+            // placeholder E0 (never displayed: to_json reports "awaiting activation")
+            CampaignConfig::protect_launch(LAUNCH_DEADLINE_MS, dec!(1)),
+            source,
+        );
+        c.awaiting_activation = true;
+        c
+    }
+
+    /// Activate a launch-time campaign: T0 = `now`, E0 = `equity`, which must be
+    /// a fresh verified read (the caller passes None when the read failed or is
+    /// stale and activation is then refused). Never re-activates.
+    pub fn activate(
+        &mut self,
+        now: i64,
+        equity: Option<Decimal>,
+        source: EquitySource,
+    ) -> Result<(), String> {
+        if !self.awaiting_activation {
+            return Err("campaign already activated".into());
+        }
+        if now >= self.cfg.deadline_ms {
+            return Err(format!(
+                "activation refused: deadline {} passed",
+                self.cfg.deadline_label()
+            ));
+        }
+        let e0 = match equity {
+            Some(e) if e > Decimal::ZERO => e,
+            _ => return Err("activation refused: no fresh verified wallet equity".into()),
+        };
+        let mut c = Campaign::new(CampaignConfig::protect_launch(now, e0), source);
+        c.activated_source = Some(source);
+        c.events = std::mem::take(&mut self.events);
+        *self = c;
+        let data = json!({"t0": iso_ist(now), "t0_ms": now, "e0": e0, "source": source,
+            "deadline": iso_ist(self.cfg.deadline_ms), "floor": self.cfg.floor,
+            "per_trade_max_loss": self.cfg.max_loss_per_trade,
+            "campaign_loss_budget": self.cfg.max_campaign_loss,
+            "checkpoints": self.cfg.checkpoint_count()});
+        let msg = format!(
+            "campaign ACTIVATED ({source:?}): T0 {} E0 INR {} deadline {}",
+            iso_ist(now),
+            e0,
+            iso_ist(self.cfg.deadline_ms)
+        );
+        self.event(now, "activated", msg, data);
+        Ok(())
     }
 
     fn event(&mut self, now: i64, kind: &str, message: String, data: Value) {
@@ -501,8 +643,8 @@ impl Campaign {
                     self.history.remove(0);
                 }
             }
-            let h = ((now - self.cfg.start_ms) / HOUR_MS) as usize;
-            if h <= CAMPAIGN_HOURS as usize && self.checkpoint_actual[h].is_none() {
+            let h = self.cfg.checkpoint_index(now) as usize;
+            if h < self.checkpoint_actual.len() && self.checkpoint_actual[h].is_none() {
                 self.checkpoint_actual[h] = Some(e);
                 let req = self.cfg.checkpoint_required(h as u32);
                 self.event(
@@ -521,6 +663,9 @@ impl Campaign {
                 let msg = format!("target INR {} reached: exit-only", self.cfg.target);
                 self.event(now, "completed", msg, Value::Null);
             }
+        }
+        if self.drawdown() > self.max_drawdown {
+            self.max_drawdown = self.drawdown();
         }
         if let Some(m) = self.marked_equity() {
             if m <= self.cfg.floor {
@@ -543,9 +688,12 @@ impl Campaign {
 
     /// Clock tick: enters exit-only mode at the deadline.
     pub fn tick(&mut self, now: i64) {
-        if now >= self.cfg.deadline_ms && !self.exit_only {
+        if now >= self.cfg.deadline_ms && !self.exit_only && !self.awaiting_activation {
             self.exit_only = true;
-            let msg = "23:00 IST deadline: exit-only, no new entries".to_string();
+            let msg = format!(
+                "{} deadline: exit-only, no new entries",
+                self.cfg.deadline_label()
+            );
             self.event(now, "deadline", msg, Value::Null);
         }
     }
@@ -560,12 +708,17 @@ impl Campaign {
         self.tick(now);
         let r = if let Some(s) = &self.stop_reason {
             Err(format!("campaign stopped (permanent): {s}"))
+        } else if self.awaiting_activation {
+            Err("campaign not activated (T0/E0 need a fresh verified wallet read)".into())
         } else if now < self.cfg.start_ms {
             Err("campaign not started (starts 00:00 IST 24 Nov 2026)".into())
         } else if now < self.cfg.first_entry_ms {
             Err("campaign entry window opens 01:00 IST: preparation only, no entries".into())
         } else if self.expired(now) {
-            Err("campaign deadline 23:00 IST passed: exit-only".into())
+            Err(format!(
+                "campaign deadline {} passed: exit-only",
+                self.cfg.deadline_label()
+            ))
         } else if self.completed_at_ms.is_some() {
             Err("campaign target reached: exit-only".into())
         } else if self.exit_only {
@@ -666,6 +819,7 @@ impl Campaign {
 
     /// Record a closed trade's realised P&L. A loss pins the next planned loss.
     pub fn on_trade_closed(&mut self, now: i64, pnl: Decimal) {
+        self.trade_pnls.push(pnl);
         if pnl < Decimal::ZERO {
             self.last_loss_planned = self.last_planned.or(Some(self.cfg.max_loss_per_trade));
         } else {
@@ -737,6 +891,37 @@ impl Campaign {
         }
     }
 
+    /// Series statistics of closed trades (reporting only).
+    pub fn series_stats(&self) -> Value {
+        let n = self.trade_pnls.len();
+        let wins: Vec<Decimal> = self
+            .trade_pnls
+            .iter()
+            .copied()
+            .filter(|p| *p > Decimal::ZERO)
+            .collect();
+        let losses: Vec<Decimal> = self
+            .trade_pnls
+            .iter()
+            .copied()
+            .filter(|p| *p < Decimal::ZERO)
+            .collect();
+        let avg = |v: &[Decimal]| {
+            (!v.is_empty())
+                .then(|| r2(v.iter().sum::<Decimal>() / Decimal::from(v.len())).to_string())
+        };
+        json!({
+            "trades": n,
+            "wins": wins.len(),
+            "losses": losses.len(),
+            "win_rate": (n > 0).then(|| wins.len() as f64 / n as f64),
+            "avg_win_inr": avg(&wins),
+            "avg_loss_inr": avg(&losses),
+            "realised_ev_per_trade_inr": avg(&self.trade_pnls),
+            "max_drawdown_inr": r2(self.max_drawdown).to_string(),
+        })
+    }
+
     /// `(target / equity)^(1 / remaining_hours) - 1`, reported only. None when
     /// equity is unknown/non-positive or no time remains.
     pub fn required_hourly_rate(&self, now: i64) -> Option<f64> {
@@ -753,23 +938,42 @@ impl Campaign {
         if now < self.cfg.start_ms {
             return 0;
         }
-        (((now.min(self.cfg.deadline_ms) - self.cfg.start_ms) / HOUR_MS) as u32).min(CAMPAIGN_HOURS)
+        self.cfg.checkpoint_index(now)
     }
 
     /// The `/api/state.campaign` object (docs/DASHBOARD_API.md).
     pub fn to_json(&self, now: i64, open_position: Value, equity_currency_note: &str) -> Value {
         let c = &self.cfg;
+        if self.awaiting_activation {
+            return json!({
+                "launch": {"enabled": true, "activated": false, "t0": null, "e0_inr": null,
+                           "e0_source": null, "checkpoints": null},
+                "deadline": iso_ist(c.deadline_ms),
+                "remaining_secs": ((c.deadline_ms - now).max(0) / 1000),
+                "equity_inr": self.equity.map(r2).map(|x| x.to_string()),
+                "equity_source": self.equity_source,
+                "equity_currency_note": equity_currency_note,
+                "status": "awaiting_activation",
+                "stop_reason": self.stop_reason,
+                "exit_only": self.exit_only || self.expired(now),
+                "milestones": [],
+                "equity_history": [],
+                "open_position": open_position,
+                "label": "launch-time campaign: T0/E0 are set by the first fresh verified wallet read",
+            });
+        }
         let ms = |h: u32| {
             json!({"hour": h, "at": iso_ist(c.checkpoint_ms(h)),
                    "required_inr": c.checkpoint_required(h).to_string()})
         };
         let cur = self.checkpoints_done(now);
-        let next_h = (cur + 1).min(CAMPAIGN_HOURS);
-        let milestones: Vec<Value> = (0..=CAMPAIGN_HOURS)
+        let n = c.checkpoint_count();
+        let next_h = (cur + 1).min(n);
+        let milestones: Vec<Value> = (0..=n)
             .map(|h| {
                 json!({"hour": h, "at": iso_ist(c.checkpoint_ms(h)),
                        "required_inr": c.checkpoint_required(h).to_string(),
-                       "actual_inr": self.checkpoint_actual[h as usize].map(|v| r2(v).to_string())})
+                       "actual_inr": self.checkpoint_actual.get(h as usize).copied().flatten().map(|v| r2(v).to_string())})
             })
             .collect();
         let req = c.required_at(now);
@@ -780,6 +984,11 @@ impl Campaign {
             .map(|(t, e)| json!({"t": iso_ist(*t), "equity_inr": s(*e)}))
             .collect();
         json!({
+            "launch": {"enabled": c.launch, "activated": c.launch && !self.awaiting_activation,
+                       "t0": (c.launch && !self.awaiting_activation).then(|| iso_ist(c.start_ms)),
+                       "e0_inr": (c.launch && !self.awaiting_activation).then(|| c.start_equity.to_string()),
+                       "e0_source": self.activated_source,
+                       "checkpoints": n},
             "start": iso_ist(c.start_ms),
             "first_entry": iso_ist(c.first_entry_ms),
             "deadline": iso_ist(c.deadline_ms),
@@ -800,6 +1009,7 @@ impl Campaign {
             "remaining_inr": s(self.equity.map_or(c.target, |e| (c.target - e).max(Decimal::ZERO))),
             "remaining_secs": ((c.deadline_ms - now).max(0) / 1000),
             "drawdown_inr": s(self.drawdown()),
+            "series": self.series_stats(),
             "required_hourly_rate": self.required_hourly_rate(now),
             "hourly_multiplier": c.hourly_multiplier(),
             "checkpoints_done": self.checkpoints_done(now),
@@ -1404,5 +1614,153 @@ mod tests {
         let mut other = cfg();
         other.start_equity = dec!(100);
         assert!(Campaign::restore(&s, &other).is_err());
+    }
+
+    // ---- launch-time protective campaign (configs/campaign-protect.toml)
+
+    const D: i64 = LAUNCH_DEADLINE_MS;
+    /// T0 = 01:12:34 IST: 22 h 17 min 26 s before the 23:30 IST deadline.
+    const T0: i64 = D - (22 * HOUR_MS + 17 * 60_000 + 26_000);
+
+    fn launched(e0: Decimal) -> Campaign {
+        let mut c = Campaign::awaiting_launch(P);
+        c.activate(T0, Some(e0), P).unwrap();
+        c
+    }
+
+    #[test]
+    fn launch_deadline_is_2330_ist() {
+        assert_eq!(iso_ist(LAUNCH_DEADLINE_MS), "2026-11-24T23:30:00+05:30");
+        assert_eq!(launched(dec!(201.45)).cfg.deadline_label(), "23:30 IST");
+    }
+
+    #[test]
+    fn launch_limits_follow_e0() {
+        let c = CampaignConfig::protect_launch(T0, dec!(201.45));
+        assert_eq!(c.max_loss_per_trade, dec!(1));
+        assert_eq!(c.max_campaign_loss, dec!(5));
+        assert_eq!(c.floor, dec!(191.38)); // 0.95 * 201.45 = 191.3775, rounded up
+        assert!(c.floor >= dec!(0.95) * dec!(201.45));
+        assert_eq!((c.max_open_positions, c.max_hold_secs), (1, 120));
+        assert!(!c.bold_play && c.launch);
+        let small = CampaignConfig::protect_launch(T0, dec!(50));
+        assert_eq!(small.max_loss_per_trade, dec!(0.50));
+        assert_eq!(small.max_campaign_loss, dec!(2.50));
+        assert_eq!(small.floor, dec!(47.50));
+    }
+
+    #[test]
+    fn launch_target_curve_and_checkpoints() {
+        let c = launched(dec!(201.45));
+        let k = &c.cfg;
+        assert_eq!(k.start_ms, T0);
+        assert_eq!(k.first_entry_ms, T0);
+        // 22 whole hours from T0 plus the final 23:30 checkpoint
+        assert_eq!(k.checkpoint_count(), 23);
+        assert_eq!(k.checkpoint_ms(22), T0 + 22 * HOUR_MS);
+        assert_eq!(k.checkpoint_ms(23), D);
+        assert_eq!(k.checkpoint_required(0), dec!(201));
+        assert_eq!(k.checkpoint_required(23), dec!(50000));
+        assert_eq!(k.required_at(T0), dec!(201.45));
+        assert_eq!(k.required_at(D), dec!(50000.00));
+        // Target(t) = E0 * (50000/E0) ^ ((t - T0) / (D - T0))
+        let t = T0 + HOUR_MS;
+        let want = 201.45_f64 * (50000.0_f64 / 201.45).powf((t - T0) as f64 / (D - T0) as f64);
+        let got = k.target_equity_exact(k.elapsed_hours(t)).to_f64().unwrap();
+        assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+        let j = c.to_json(T0 + 1, Value::Null, "");
+        assert_eq!(j["milestones"].as_array().unwrap().len(), 24);
+        assert_eq!(j["milestones"][23]["at"], "2026-11-24T23:30:00+05:30");
+        assert_eq!(j["launch"]["activated"], true);
+        assert_eq!(j["launch"]["e0_inr"], "201.45");
+        assert_eq!(j["deadline"], "2026-11-24T23:30:00+05:30");
+    }
+
+    #[test]
+    fn activation_needs_a_fresh_read_and_happens_once() {
+        let mut c = Campaign::awaiting_launch(P);
+        assert!(c.entry_gate(T0, 0).unwrap_err().contains("not activated"));
+        assert_eq!(
+            c.to_json(T0, Value::Null, "")["status"],
+            "awaiting_activation"
+        );
+        assert!(c.activate(T0, None, P).is_err());
+        assert!(c.activate(T0, Some(Z), P).is_err());
+        assert!(c.activate(D, Some(dec!(201.45)), P).is_err());
+        assert!(c.awaiting_activation);
+        c.activate(T0, Some(dec!(201.45)), EquitySource::LiveExchange)
+            .unwrap();
+        assert_eq!(c.activated_source, Some(EquitySource::LiveExchange));
+        assert!(c.drain_events().iter().any(|e| e.kind == "activated"));
+        assert!(c.activate(T0 + 5, Some(dec!(300)), P).is_err());
+        assert_eq!(c.cfg.start_equity, dec!(201.45));
+        c.observe(T0 + 1, Some(dec!(201.45)), EquitySource::LiveExchange, Z, Z);
+        assert!(c.entry_gate(T0 + 2, 0).is_ok());
+        assert!(c.entry_gate(T0 + 2, 1).is_err());
+    }
+
+    #[test]
+    fn launch_cutoff_at_2330_is_exit_only_and_survives_restart() {
+        let mut c = launched(dec!(201.45));
+        c.observe(D - 10, Some(dec!(201.45)), P, Z, Z);
+        assert!(c.entry_gate(D - 1, 0).is_ok());
+        let e = c.entry_gate(D, 0).unwrap_err();
+        assert!(e.contains("23:30 IST"), "{e}");
+        assert!(c.exit_only);
+        let s = serde_json::to_string(&c).unwrap();
+        let probe = Campaign::awaiting_launch(P).cfg;
+        let mut r = Campaign::restore(&s, &probe).unwrap();
+        assert!(r.exit_only);
+        assert_eq!(r.cfg.start_ms, T0);
+        assert_eq!(r.cfg.start_equity, dec!(201.45));
+        // exit-only persists; never reset by a restart or by time going "back"
+        assert!(r.entry_gate(D - 1, 0).is_err());
+    }
+
+    #[test]
+    fn launch_restart_recovery_and_tamper_refusal() {
+        let probe = Campaign::awaiting_launch(P).cfg;
+        // awaiting state restores as awaiting
+        let w = serde_json::to_string(&Campaign::awaiting_launch(P)).unwrap();
+        assert!(Campaign::restore(&w, &probe).unwrap().awaiting_activation);
+        // an activated state keeps T0/E0 and its checkpoint table
+        let mut c = launched(dec!(201.45));
+        c.observe(T0 + HOUR_MS + 5, Some(dec!(202)), P, Z, Z);
+        let s = serde_json::to_string(&c).unwrap();
+        let r = Campaign::restore(&s, &probe).unwrap();
+        assert_eq!(r.checkpoint_actual[1], Some(dec!(202)));
+        assert_eq!(r.cfg, CampaignConfig::protect_launch(T0, dec!(201.45)));
+        // a loosened persisted profile is refused
+        let mut v: Value = serde_json::from_str(&s).unwrap();
+        v["cfg"]["max_loss_per_trade"] = json!("2");
+        assert!(Campaign::restore(&v.to_string(), &probe).is_err());
+        // a permanent stop survives restart
+        let mut c = launched(dec!(201.45));
+        c.observe(T0 + 5, Some(dec!(196.40)), P, Z, Z);
+        assert!(c.is_stopped(), "INR 5 budget from E0");
+        let s = serde_json::to_string(&c).unwrap();
+        let r = Campaign::restore(&s, &probe).unwrap();
+        assert!(r.is_stopped());
+        // the default 23-hour state is not accepted as a launch state
+        let old = serde_json::to_string(&at("101.45", CAMPAIGN_START_MS)).unwrap();
+        assert!(Campaign::restore(&old, &probe).is_err());
+    }
+
+    #[test]
+    fn series_stats_are_reported() {
+        let mut c = launched(dec!(201.45));
+        assert_eq!(c.series_stats()["trades"], 0);
+        assert!(c.series_stats()["win_rate"].is_null());
+        c.on_trade_closed(T0 + 1, dec!(0.30));
+        c.on_trade_closed(T0 + 2, dec!(-0.50));
+        c.on_trade_closed(T0 + 3, dec!(-0.40));
+        c.observe(T0 + 4, Some(dec!(200.85)), P, Z, Z);
+        let st = c.to_json(T0 + 5, Value::Null, "")["series"].clone();
+        assert_eq!(st["trades"], 3);
+        assert_eq!(st["wins"], 1);
+        assert_eq!(st["avg_win_inr"], "0.30");
+        assert_eq!(st["avg_loss_inr"], "-0.45");
+        assert_eq!(st["realised_ev_per_trade_inr"], "-0.20");
+        assert_eq!(st["max_drawdown_inr"], "0.60");
     }
 }

@@ -31,6 +31,10 @@ const USAGE: &str = "qe-live-check <command> [options]   (state dir: $QE_LIVE_ST
   reconcile-withdrawal --before REPORT.json --amount X [--fee F] [--currency INR] [--tolerance T]
                                            read balances after YOUR manual withdrawal and reconcile
   arm [--hours H]                          arm live (all checks recent + typed confirmation)
+  arm --hours H --first-trade-verifies-protection
+                                           arm with ProtectiveOrdersVerified / Closure120sTested
+                                           NotRun: the first genuine strategy trade verifies them
+                                           (failure: emergency close + permanent stop)
   disarm                                   disarm live
   kill [--reason TEXT]                     kill switch: disarm and block re-arming
   clear-kill                               clear the kill switch (typed confirmation; stays disarmed)";
@@ -553,11 +557,13 @@ fn arm_cmd(dir: &StateDir, args: &[String]) -> i32 {
     let hours: i64 = val(args, "--hours")
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
-    match arming::arm(dir, &mut Terminal, hours, now_ms()) {
+    let first_trade = flag(args, "--first-trade-verifies-protection");
+    match arming::arm_with(dir, &mut Terminal, hours, now_ms(), first_trade) {
         Ok(r) => {
             println!(
-                "LIVE ARMED until {} ms. The desk also needs QE_EXECUTION_MODE=live and QE_LIVE_OPERATOR_CONFIRM in its environment. Kill: `qe-live-check kill`.",
-                r.expires_at_ms
+                "LIVE ARMED until {} ms{}. The desk also needs QE_EXECUTION_MODE=live and QE_LIVE_OPERATOR_CONFIRM in its environment. Kill: `qe-live-check kill`.",
+                r.expires_at_ms,
+                if first_trade { " (FIRST-TRADE PROTECTION mode: the first live trade verifies TP/SL + isolated margin or the desk stops permanently)" } else { "" }
             );
             0
         }
