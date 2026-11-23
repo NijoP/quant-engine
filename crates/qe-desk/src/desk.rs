@@ -1302,7 +1302,14 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
                 ));
                 approved = Some(o);
             }
-            Decision::Rejected { reasons: r, .. } => reasons = r,
+            Decision::Rejected { reasons: r, .. } => {
+                // a bet the account cannot size must not outrank affordable ones
+                if gamble && r.iter().any(|x| x.starts_with("gamble:")) {
+                    d.gamble_board
+                        .remove(&(pair.to_string(), side == Side::Long));
+                }
+                reasons = r
+            }
         }
         for a in std::mem::take(&mut d.gov.audit) {
             d.store
