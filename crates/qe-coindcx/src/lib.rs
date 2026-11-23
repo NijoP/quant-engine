@@ -14,5 +14,6 @@ pub mod live;
 pub mod orders;
 pub mod private;
 pub mod types;
+pub mod ws;
 
 pub use client::PublicClient;
