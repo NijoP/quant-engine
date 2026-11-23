@@ -6,3 +6,4 @@ dist/
 audit/
 .env.*
 !.env.example
+data/
