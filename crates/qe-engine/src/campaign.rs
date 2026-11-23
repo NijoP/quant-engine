@@ -1223,7 +1223,8 @@ mod tests {
         assert_eq!(j["prev_milestone"]["hour"], 1);
         assert_eq!(j["next_milestone"]["required_inr"], "174");
         assert_eq!(j["equity_history"].as_array().unwrap().len(), 2);
-        assert_eq!(j["drawdown_inr"], "0.00");
+        // peak starts at the E0 baseline 101.45: equity 101 is 0.45 below it
+        assert_eq!(j["drawdown_inr"], "0.45");
     }
 
     #[test]
