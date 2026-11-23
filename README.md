@@ -10,13 +10,15 @@ not a CoinDCX balance.
 
 ## 24 NOVEMBER CAMPAIGN (current)
 
-One continuous campaign: **INR 100 → INR 50,000, 24 Nov 2026 00:00 → 22:00 IST** (22 h, 500x,
-no intermediate withdrawals). The hourly schedule is `target_equity(h) = 100 · 500^(h/22)`
-(+32.6418 % per hour compounded). It is a **mathematical requirement, not a trading forecast**,
+One continuous campaign: **INR 101.45 (E0, last verified account read) → INR 50,000,
+24 Nov 2026 00:00 → 23:00 IST** (23 h, first entry permitted 01:00 IST, no intermediate
+withdrawals, no resets). The hourly schedule is `target_equity(h) = E0 · (50000/E0)^(h/23)`
+(+30.9407 % per hour compounded). The earlier 22-hour schedule (INR 100 → 50,000 by 22:00 IST,
+`100 · 500^(h/22)`) is superseded. It is a **mathematical requirement, not a trading forecast**,
 and it never changes risk. Campaign risk profile: floor INR 95, at most INR 1 planned loss per
 trade (fees, slippage and stop included), at most INR 5 cumulative campaign loss, one position,
-120 s maximum hold, isolated margin, no martingale or size-up. At 22:00 IST the desk turns
-exit-only. Live execution stays owner-controlled and disabled by default. Full maths, table,
+120 s maximum hold, isolated margin, no martingale or size-up. No campaign entries before
+01:00 IST; at 23:00 IST the desk turns exit-only. Live execution stays owner-controlled and disabled by default. Full maths, table,
 rounding and deadline procedure: [docs/CAMPAIGN_24NOV.md](docs/CAMPAIGN_24NOV.md). Example
 profile: `configs/campaign-24nov.toml`.
 
@@ -75,7 +77,7 @@ DATA → MATHEMATICS → PROBABILISTIC FORECAST → STRATEGY → RISK GOVERNOR �
 | Calibration | Forecast authority comes from the s2-calib walk-forward registry (`crates/qe-research/calibration.json`, model `desk.fp.v1`, targets `tp_first_{long,short}`; `QE_CALIBRATION_FILE` overrides; reloaded every 10 s). A missing file means no authority. A live forward monitor resolves each P(TP first) on the next 120 s of 1 s prices and revokes authority when, at n ≥ 200, ECE > 0.05 or Brier ≥ climatology. With authority, the registry's recalibrated probability drives EV | live; **no model calibrated** |
 | Risk governor | `qe_risk::RiskGovernor` evaluates every candidate: kill/pause, session loss, high-water-mark floor, exit-only, data integrity, calibration, net edge, sizing from the stop-loss budget, highest exchange leverage stepped down for the liquidation buffer, min notional/quantity (rejected, never raised), margin | live |
 | Paper execution | `qe_risk::Position` lifecycle with an independent 250 ms server-side timer: taker fills at the touch + slippage + live fee, simulated protection, exits on SL/TP/edge-negative/data integrity/time (117 s lead, 120 s max), reconcile on ack timeout, flatten, kill | unit-tested; live-wired |
-| Capital / target | 24 Nov campaign schedule and controller (see [docs/CAMPAIGN_24NOV.md](docs/CAMPAIGN_24NOV.md)): reporting only in the default protective profile (INR 1/trade, INR 5 total); the owner-selected bold-play profile `configs/campaign-live.toml` sizes each bet toward the next hourly milestone above an owner floor; floor and loss-budget stop; exit-only at 22:00 IST. The older Growth → checkpoint → withdrawal → protective stage plan is historical. Trade-frequency scenarios and a seeded Monte-Carlo target simulation | paper ledger |
+| Capital / target | 24 Nov campaign schedule and controller (see [docs/CAMPAIGN_24NOV.md](docs/CAMPAIGN_24NOV.md)): reporting only in the default protective profile (INR 1/trade, INR 5 total); the owner-selected bold-play profile `configs/campaign-live.toml` sizes each bet toward the next hourly milestone above an owner floor; floor and loss-budget stop; no entries before 01:00 IST, exit-only at 23:00 IST. The older Growth → checkpoint → withdrawal → protective stage plan is historical. Trade-frequency scenarios and a seeded Monte-Carlo target simulation | paper ledger |
 | Audit | JSONL: decisions (full numeric explanation), governor, fills, closed trades, equity, incidents, audit | live |
 
 ## Crates

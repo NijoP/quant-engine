@@ -14,7 +14,7 @@ The rule: live is GO only when **every** condition below is PASS. One unresolved
 | 120 s live closure, verified flat (P0-7) | NOT TESTED | No live position ever opened |
 | Live executor (P0-8) | NOT TESTED | Mock-tested only |
 | Campaign floor, INR 1 / INR 5 caps, no size-up when behind (P0-9 to P0-11) | BLOCKED | Pending the campaign PR's green CI and review |
-| 22:00 IST exit-only and verified-flat reporting (P0-12) | BLOCKED / NOT TESTED | Desk side pending; live flatten never run for real |
+| 23:00 IST exit-only and verified-flat reporting (P0-12; 22:00 superseded) | BLOCKED / NOT TESTED | Desk side pending; live flatten never run for real |
 | Gamble mode out of the live path (P0-14) | FAIL (code) | `gamble.toml` still accepts `execution_mode = "live"` at `22fabe5` |
 
 Even if the engineering items were all PASS, P0-3 and P0-4 would keep this NO-GO: there is no

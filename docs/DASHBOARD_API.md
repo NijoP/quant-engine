@@ -74,7 +74,10 @@ State = {
 }
 // Money is a decimal string. Milestone required_inr is rounded to the whole rupee; live amounts use 2 dp.
 // The schedule is a mathematical requirement, not a forecast; no field here feeds sizing or entries.
-Campaign = { "start": iso8601, "deadline": iso8601,          // 2026-11-24T00:00+05:30 / 22:00+05:30
+Campaign = { "start": iso8601, "deadline": iso8601,          // 2026-11-24T00:00+05:30 / 23:00+05:30 (22:00 superseded)
+  "first_entry": iso8601,                                     // 2026-11-24T01:00+05:30: no campaign entries before
+  "duration_hours": 23, "entry_window_open": bool,            // window 01:00-23:00 IST; permits, never forces, a trade
+  "hourly_multiplier": number,                                // (50000/101.45)^(1/23) = 1.3094071
   "start_equity_inr": string, "target_inr": "50000",
   "equity_inr": string|null,                                  // null when no verified figure exists
   "equity_source": "live_exchange"|"paper",                   // paper is never shown as real capital

@@ -58,7 +58,7 @@ review required for any new campaign.
 > Historical. The stage plan below (checkpoint and withdrawal) is superseded by the 24 Nov
 > campaign, which has no intermediate withdrawal.
 
-`CapitalManager`: Stage 1 Growth -> at the checkpoint (22:00 IST) `AwaitingCheckpoint`
+`CapitalManager`: Stage 1 Growth -> at the checkpoint (23:00 IST; 22:00 superseded) `AwaitingCheckpoint`
 (stop entries, flatten) -> `confirm_withdrawal(amount, user_confirmed=true, confirmed_balance)`
 -> Stage 2 Protective -> Complete at the final target. An unconfirmed withdrawal is
 never recorded.

@@ -150,7 +150,7 @@ the leverage cap and the exchange minimum notional:
 - bets remaining = hours to the deadline x bets per hour. The deadline is
   `stage2_deadline_ms` from `configs/risk-limits.toml`. When this was written it
   was 17:00 IST 24 Nov, which is now **historical**: the campaign deadline is
-  22:00 IST. Bets per hour is the
+  23:00 IST (23-hour schedule; the 22:00 IST deadline is superseded). Bets per hour is the
   measured rate once >= 5 bets have closed; otherwise 20/h, which assumes one
   position and holds of 120 s or less.
 

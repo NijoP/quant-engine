@@ -1,9 +1,21 @@
-# Owner start at 00:00 IST, 24 Nov 2026 (campaign bold play, live, at your own risk)
+# Owner start, 24 Nov 2026: 23-hour campaign (campaign bold play, live, at your own risk)
+
+> **23-HOUR SCHEDULE (campaign command update, 24 Nov 2026).** Clock 00:00 IST,
+> **first campaign entry permitted 01:00 IST**, deadline **23:00 IST** (23 h),
+> baseline E0 = INR 101.45, target INR 50,000, schedule
+> `101.45 * (50000/101.45)^(h/23)` (about 30.9407 % per hour, a mathematical
+> requirement, not a forecast). The 22-hour schedule (22:00 IST, `100 * 500^(h/22)`)
+> is **superseded**: do **not** run a binary built before this change. Download the
+> fresh `qe-desk-linux-x86_64` artifact from the CI run of the updated campaign
+> branch. If `data/desk-campaign/campaign_state.json` was written by the old
+> 22-hour binary, move it aside first (the new desk refuses it and stays stopped).
+> No risk setting changed (floor, leverage, sizing, SL/TP, isolated margin, one
+> position, 120 s, kill switch, permanent stop).
 
 This file is for branch `campaign/24nov-50k-hourly-target` (PR #24).
 
 You chose to run the campaign bold-play profile live toward the hourly schedule
-`100 * 500^(h/22)`. The engineering verdict is still **NO-GO** ([LIVE_GO_NO_GO.md](LIVE_GO_NO_GO.md)):
+`101.45 * (50000/101.45)^(h/23)` (00:00 → 23:00 IST; entries from 01:00 IST). The engineering verdict is still **NO-GO** ([LIVE_GO_NO_GO.md](LIVE_GO_NO_GO.md)):
 - there is no measured edge;
 - the forecast is uncalibrated;
 - no authenticated path has ever run against your account.
@@ -66,7 +78,7 @@ Nothing is built on your machine: CI builds both binaries.
    - Keep `campaign_stake = "next_milestone"`, `stake_policy = "fixed"` and `entry = "maker"` (post-only maker entry).
    - Set `execution_mode = "live"`.
 6. **Arm (changes live state, places no order):** `qlc arm --hours 23`, then type the owner phrase. Check with `qlc status`.
-7. **Start at 00:00 IST:**
+7. **Start (00:00–01:00 IST is preparation; the desk refuses campaign entries before 01:00 IST):**
    ```sh
    QE_GAMBLE_CONFIG=configs/campaign-live.toml QE_EXECUTION_MODE=live \
    QE_LIVE_OPERATOR_CONFIRM=I-AM-THE-ACCOUNT-OWNER-AND-ACCEPT-LIVE-TRADING-RISK \
@@ -87,7 +99,7 @@ Nothing is built on your machine: CI builds both binaries.
    qlc checkpoint --kind adhoc
    ```
    If the checkpoint is not verified flat, close the position in the CoinDCX app.
-10. **22:00 IST**:
-    - The desk switches to exit-only by itself. On live it records `verified_flat=false` and raises an incident, because it never claims flat on its own.
+10. **23:00 IST** (the old 22:00 deadline is superseded):
+    - The desk switches to exit-only by itself and refuses new entries. On live it records `verified_flat=false` and raises an incident, because it never claims flat on its own.
     - Run `qlc checkpoint --kind stage2 --currency INR --expected <desk equity>`.
     - Trust "flat" only if reconciliation confirms it. On `NOT VERIFIED FLAT`, close the position in the CoinDCX app.

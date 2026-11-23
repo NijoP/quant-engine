@@ -29,7 +29,7 @@ only ever print `configured` or `not configured`.
 
 ## Before arming (finish before the campaign starts at 00:00 IST, 24 Nov)
 
-Current campaign: [CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md) (INR 100 → INR 50,000, deadline 22:00 IST 24 Nov 2026).
+Current campaign: [CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md) (INR 101.45 E0 → INR 50,000, first entry 01:00 IST, deadline 23:00 IST 24 Nov 2026; the 22:00 IST 22-hour schedule is superseded).
 
 | # | Command | What it does | Places orders? |
 | --- | --- | --- | --- |
@@ -111,7 +111,7 @@ disarmed desk can still close what it holds. The desk can call
 
 > **Historical, removed by the owner on 23 Nov 2026.** The later "INR 50,000 by
 > 17:00 IST" deadline is historical too. The current campaign has no
-> intermediate withdrawal and one final checkpoint at **22:00 IST on 24 Nov 2026**
+> intermediate withdrawal and one final checkpoint at **23:00 IST on 24 Nov 2026**
 > ([CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md)). The `stage1` tool below is kept for
 > reference only.
 
@@ -143,7 +143,7 @@ must start from.
 
 6. For Stage 2, re-run steps 2, 5 and 6 above (`readiness`, then `arm`).
 
-## 22:00 IST 24 Nov: campaign final checkpoint (was 17:00, now historical)
+## 23:00 IST 24 Nov: campaign final checkpoint (was 17:00, then 22:00; both now historical)
 
 ```sh
 qlc checkpoint --kind stage2 --currency INR --expected <desk realised equity>
