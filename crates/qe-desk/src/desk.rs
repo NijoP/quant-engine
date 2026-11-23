@@ -1900,6 +1900,13 @@ pub fn gamble_min_margin(d: &Desk) -> f64 {
     let Some(g) = d.gov.policy.gamble.as_ref() else {
         return 0.0;
     };
+    // Only with full INR metadata coverage: a partial cache would overstate the
+    // smallest bet and fire the permanent stop spuriously.
+    let inr = |k: &&String| k.ends_with(&format!("|{TRADE_MARGIN}"));
+    let cached = d.instruments.keys().filter(inr).count() + d.meta_fail.keys().filter(inr).count();
+    if d.fut_inr.is_empty() || cached < d.fut_inr.len() {
+        return 0.0;
+    }
     let fx = d.fx_usdtinr().unwrap_or(f64::NAN);
     let m = d
         .instruments
