@@ -291,12 +291,12 @@ mod tests {
         // Not armed: even with live env, opening risk is refused.
         let g = gate_from(live_env(), &d, T);
         assert!(!g.armed);
-        assert_eq!(
-            g.check_for(Purpose::OpenRisk)
-                .err()
-                .filter(|_| LiveGate::COMPILED),
-            LiveGate::COMPILED.then_some(GateError::NotArmed)
-        );
+        let want = if LiveGate::COMPILED {
+            GateError::NotArmed
+        } else {
+            GateError::FeatureNotCompiled
+        };
+        assert_eq!(g.check_for(Purpose::OpenRisk), Err(want));
         pass_all(&d, T);
         arm(&d, &mut Scripted::new(&[true]), 1, T).unwrap();
         let g = gate_from(live_env(), &d, T + 1000);

@@ -75,7 +75,7 @@ pub fn plan(i: &FuturesInstrument, reference_price: f64, leverage: u32) -> Resul
     }
     let headroom = Decimal::new(102, 2);
     let by_notional = ceil_to(min_notional * headroom / px, step);
-    let qty = ceil_to(min_qty.max(by_notional), step);
+    let qty = ceil_to(min_qty.max(by_notional), step).normalize();
     if let Some(maxq) = i.max_market_order_quantity.and_then(dec) {
         if maxq > Decimal::ZERO && qty > maxq {
             return Err(format!(
