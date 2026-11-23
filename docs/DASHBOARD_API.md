@@ -21,7 +21,7 @@ gate (`qe_coindcx::live::LiveGate`) and its checklist.
 | `/api/scanner` | `[ScannerRow]` ranked by `score` (all tracked futures). |
 | `/api/opportunities` | `[Opportunity]` newest first. |
 | `/api/instrument/{pair}?margin=USDT\|INR` | `{ "instrument": FuturesInstrument (live metadata), "capability": InstrumentCapability, "eligible": bool\|null, "eligibility": string, "features": ScannerRow, "forecast": Forecast\|null, "book": {ts, vs, bids[10], asks[10], sane}\|null, "mtf": {timeframes: {3d,2d,1d,1h,15m,5m,1m: {completed, ctx}}}\|null, "regime": [string], "decisions": [Decision] }` |
-| `/api/instrument/{pair}/candles?resolution=1\|5\|15\|60\|1D\|2D\|3D` | `[Candle]` (proxied + 15 s cache; `complete` flag; `2D` aggregated from two completed `1D`; 1 s candles are not served without a trade stream). |
+| `/api/instrument/{pair}/candles?resolution=1S\|1\|5\|15\|60\|1D\|2D\|3D` | `[Candle]` (proxied + 15 s cache; `complete` flag; `2D` aggregated from two completed `1D`; `1S` built locally from WS trades of subscribed candidates, with buy/sell volume). |
 | `/api/forecasts` | `[Forecast]` for current candidates. |
 | `/api/decisions` | `[Decision]` newest first, last 300 (every approve/reject with full numeric explanation). |
 | `/api/audit?limit=N` | `[AuditEvent]` newest first. |
@@ -41,6 +41,7 @@ gate (`qe_coindcx::live::LiveGate`) and its checklist.
 | `/api/control/cancel_entries` | cancel outstanding (paper) entry orders |
 | `/api/control/flatten` | emergency flatten all paper positions at market |
 | `/api/control/kill` | kill switch: flatten + disable entries until restart |
+| `/api/control/ws_reconnect` | force the public WebSocket to reconnect (REST fallback covers the gap) |
 | `/api/control/confirm_withdrawal` body `{ "amount": number, "confirmed_balance": number, "user_confirmed": true }` | only at the stage-1 checkpoint: records the user-confirmed withdrawal and reconciled balance, switches the paper ledger to stage 2 / protective policy (never touches a wallet) |
 
 Malformed bodies return `ok: false` with the expected shape in `message`.
@@ -57,7 +58,9 @@ State = {
   "server_time_ms": number, "mode": "paper", "live_orders_enabled": false,
   "health": { "started_ms": number, "last_universe_ms": number|null, "last_rt_ms": number|null,
               "last_spot_ticker_ms": number|null, "rt_polls": number, "errors": number,
-              "last_error": string|null, "stale": boolean },
+              "last_error": string|null, "stale": boolean,
+              "feed": "ws"|"rest-fallback", "ws_prices_fresh": boolean, "ws_live_books": number,
+              "ws": WsHealth (qe_coindcx::ws), "instruments_cached": number, "store_dir": string },
   "universe": { "futures_active": number, "futures_usdt": number, "futures_inr": number,
                 "futures_tracked": number, "spot_active": number, "spot_with_ticker": number,
                 "refreshed_ms": number|null },

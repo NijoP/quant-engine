@@ -27,8 +27,8 @@ DATA → MATHEMATICS → PROBABILISTIC FORECAST → STRATEGY → RISK GOVERNOR �
 |---|---|---|
 | Universe | Spot `markets_details` + ticker, USDT and INR futures `active_instruments` every 60 s; listing/delisting and status/exit-only change events | live, verified |
 | Instrument metadata | `data/instrument` per pair and margin (INR contracts first, 1 req/s), mapped into the qe-risk capability model: leverage per side, dynamic leverage tiers, min notional/quantity, increments, fees, order types. Records that fail to decode are rejected with the reason and retried after 10 min | live, verified |
-| Scanner | All tracked futures ranked every second from the RT price endpoint (returns, σ, z-scores, basis vs spot, anomalies) | live, REST-polled |
-| Order books | REST depth 20 for the top 6 candidates every 3 s, and every 0.5 s for open paper positions | live, REST-polled |
+| Market data | s2-ws public Socket.IO stream: `currentPrices@futures@rt` sampled at 1 Hz; sequence-checked Live order books (depth 20) and trades for the top 6 candidates and open positions. REST RT poll and REST depth 20 take over when the stream is stale | live |
+| Scanner | All tracked futures ranked every second (returns, σ, z-scores, basis vs spot, anomalies); trade-flow imbalance from WS trades; 1 s candles from trades | live |
 | Multi-timeframe | Exchange candles 1m, 5m, 15m, 1h, 1d and 3d per candidate (completed candles only); 2d aggregated from two completed 1d; per-timeframe trend z, σ, range ratio, volume z | live |
 | Regimes | Explicit numeric rules: trend/range, high/low volatility, expansion/contraction, momentum acceleration/exhaustion, potential reversal, abnormal volume, liquidity withdrawal, unstable | live |
 | Forecast | μ = 0.2·r₆₀/60 + 0.05·OBI₁₀·σ₁ₛ; horizons 1–120 s (E[r], P(up), σ_h, 90 % band); first-passage lattice P(TP first), P(SL first), P(neither), expected hit times; TP/SL = k·σ₁₂₀ (k_t 1.5, k_s 1.0) | live, **uncalibrated priors** |
@@ -51,7 +51,6 @@ DATA → MATHEMATICS → PROBABILISTIC FORECAST → STRATEGY → RISK GOVERNOR �
 
 ## Known limits (honest)
 
-- Market data is REST-polled; the WebSocket stream (s2-ws) is not yet wired in.
 - Forecast parameters are priors. Until the forward calibration gate passes, the governor rejects every entry ("forecast uncalibrated").
 - At INR 100 paper equity, a 1 % risk budget (INR 1) is below the risk at minimum order size for most contracts, so the governor rejects them rather than raising the budget.
 - Paper TP/SL is enforced by the server-side monitor; exchange-side protective orders are not used in paper.

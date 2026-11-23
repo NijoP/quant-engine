@@ -74,7 +74,8 @@ export function GlobalStatus({ state, serverNow, offline }: { state: DeskState; 
   const c = state.controls;
   const items: [string, string, "ok" | "warn" | "bad"][] = [
     ["CoinDCX REST", offline ? "desk offline" : h.errors > 0 ? `${h.errors} errors` : "ok", offline ? "bad" : h.errors > 0 ? "warn" : "ok"],
-    ["Futures feed", rtAge === null ? "no data" : `${rtAge.toFixed(1)}s ago${h.stale ? " STALE" : ""}`, rtAge === null || h.stale || rtAge > 5 ? "bad" : "ok"],
+    ["Futures feed", rtAge === null ? "no data" : `${(h as { feed?: string }).feed ?? ""} ${rtAge.toFixed(1)}s ago${h.stale ? " STALE" : ""}`, rtAge === null || h.stale || rtAge > 5 ? "bad" : (h as { feed?: string }).feed === "ws" ? "ok" : "warn"],
+    ["WebSocket", (() => { const w = (h as { ws?: { connected?: boolean; disconnects?: number } }).ws; const n = (h as { ws_live_books?: number }).ws_live_books; return w ? `${w.connected ? "connected" : "DOWN"} · ${n ?? 0} live books · ${w.disconnects ?? 0} disc.` : "not reported"; })(), (h as { ws?: { connected?: boolean } }).ws?.connected ? "ok" : "warn"],
     ["Universe scan", isNum(state.universe.refreshed_ms) ? `${ago(state.universe.refreshed_ms, serverNow)} ago` : "pending", isNum(state.universe.refreshed_ms) ? "ok" : "warn"],
     ["Forecast / strategy", c ? (c.strategy_enabled ? "evaluating" : "disabled") : "not reported", c?.strategy_enabled ? "ok" : "warn"],
     ["Agents", agents.length ? `${agents.length - bad}/${agents.length} ok` : "not reported", agents.length && !bad ? "ok" : "warn"],
@@ -253,7 +254,7 @@ export function UniverseTable({ onSelect }: { onSelect: (pair: string, margin: s
 
 /* ---------------- D/E. Instrument intelligence + forecast ---------------- */
 const RES = [
-  ["1m", "1"], ["5m", "5"], ["15m", "15"], ["1h", "60"], ["1d", "1D"], ["2d", "2D"], ["3d", "3D"],
+  ["1s", "1S"], ["1m", "1"], ["5m", "5"], ["15m", "15"], ["1h", "60"], ["1d", "1D"], ["2d", "2D"], ["3d", "3D"],
 ] as const;
 
 function CandleChart({ candles }: { candles: Candle[] }) {
@@ -306,7 +307,7 @@ export function InstrumentPanel({ sel }: { sel: { pair: string; margin: string }
             {RES.map(([l, r]) => (
               <button key={r} className={"tab " + (res === r ? "on" : "")} onClick={() => setRes(r)}>{l}</button>
             ))}
-            <span className="muted">completed candles only · 2d aggregated from two completed 1d candles · 1s view needs the trade stream</span>
+            <span className="muted">completed candles only · 2d aggregated from two completed 1d candles · 1s built from WS trades (subscribed candidates only)</span>
           </div>
           {candles.data ? <CandleChart candles={candles.data} /> : <div className="empty">{candles.error ? "Candles unavailable" : "Loading candles…"}</div>}
           {ft && (
@@ -512,6 +513,7 @@ const CONTROLS: Ctl[] = [
   { label: "Strategy eval", path: "/api/control/strategy", body: (c) => ({ enabled: !c.strategy_enabled }), on: (c) => c.strategy_enabled },
   { label: "Pause entries", path: "/api/control/pause_entries", body: (c) => ({ paused: !c.entries_paused }), on: (c) => c.entries_paused },
   { label: "Cancel entry orders", path: "/api/control/cancel_entries" },
+  { label: "Reconnect WS", path: "/api/control/ws_reconnect" },
   { label: "Emergency flatten", path: "/api/control/flatten", danger: true, confirm: "Flatten ALL paper positions at market?" },
   { label: "KILL SWITCH", path: "/api/control/kill", danger: true, confirm: "Kill: flatten and disable entries until restart?" },
 ];
