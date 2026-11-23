@@ -364,6 +364,116 @@ Champion: `desk.fp.v1` (no challenger passed the predefined out-of-sample gates;
 * `mom.fp.v1.1m`: mean cost 13.14 bps; unconditional long gross 0.01 bps, short gross 0.26 bps; EV>0 at 1× cost: 539 trades, mean realised net -13.05 bps vs predicted 4.58 bps.
 
 
+## Sprint 5: recalibration, cost-aware brackets and a liquid universe (2026-11-23)
+
+The question was whether an honest change to the TP-first/SL-first forecast can earn strategy
+authority without loosening any gate. Short answer: **no candidate did. The gates and
+thresholds are unchanged, and the champion and registry rules still deny authority.**
+
+New challengers in `qe-research challenge`. They are scored with the same purged
+chronological walk-forward, the same gates and the same nested parameter search:
+* `desk.fp.v1+platt.wide`: Platt-recalibrated champion probabilities, with the bracket
+  searched over a wider, cost-aware grid (k_s ∈ {1, 1.5, 2, 3}, k_t ∈ {1.5, 2, 3, 4}, so TP can
+  reach 4·σ₁₂₀ and is not smaller than the ~13 bps cost) plus the EV threshold. Judged on the
+  nested result only.
+* `desk.fp.v1+platt.liquid`, `logit.flow.v2.liquid`: the same models restricted to the
+  cheapest half of the pairs, ranked by **fold-0** median round-trip cost (fold 0 is never
+  scored, so choosing the universe sees no OOS data; unit-tested).
+* Isotonic and Platt recalibration fitted on past folds already existed
+  (`desk.fp.v1+iso`, `+platt`). They are the offline equivalent of recalibrating the live
+  forward monitor: each forecast is mapped using only outcomes resolved before it.
+
+Data (public endpoints only):
+* **R1** is the sprint-3 recording: 34.0 min, 8 book pairs, 5 514 rows, about 92
+  independent 120 s windows.
+* **R2** is new: 44.8 min (16:20–17:05 UTC, 21:50–22:35 IST), 10 book pairs, 9 248 rows,
+  about 154 windows, recorded through the new public client with 0 breaker opens and 4
+  transport errors.
+
+`crates/qe-research/models.json` is regenerated from R2.
+
+### Out-of-sample calibration, P(TP first) at the champion bracket (folds 1–4)
+
+| model | data | target | n_oos | base | mean p | Brier | Brier clim | skill | ECE |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `desk.fp.v1` (raw) | R1 | long | 4386 | 0.081 | 0.134 | 0.0801 | 0.0778 | −0.029 | 0.054 |
+| `desk.fp.v1` (raw) | R1 | short | 4386 | 0.228 | 0.172 | 0.1855 | 0.2210 | +0.161 | 0.076 |
+| `desk.fp.v1+platt` | R1 | long | 4386 | 0.081 | 0.122 | 0.0771 | 0.0778 | +0.009 | 0.041 |
+| `desk.fp.v1+platt` | R1 | short | 4386 | 0.228 | 0.154 | 0.2228 | 0.2210 | −0.008 | 0.204 |
+| `desk.fp.v1+platt.liquid` | R1 | long | 2192 | 0.097 | 0.145 | 0.0929 | 0.0949 | +0.021 | 0.054 |
+| `desk.fp.v1+platt.liquid` | R1 | short | 2192 | 0.271 | 0.171 | 0.2548 | 0.2502 | −0.018 | 0.234 |
+| `desk.fp.v1` (raw) | R2 | long | 7430 | 0.094 | 0.145 | 0.0940 | 0.0875 | −0.074 | 0.067 |
+| `desk.fp.v1` (raw) | R2 | short | 7430 | 0.216 | 0.164 | 0.1728 | 0.2033 | +0.150 | 0.058 |
+| `desk.fp.v1+iso` | R2 | long | 7430 | 0.094 | 0.052 | 0.0878 | 0.0875 | −0.003 | 0.042 |
+| `desk.fp.v1+platt` | R2 | long | 7430 | 0.094 | 0.053 | 0.0881 | 0.0875 | −0.007 | 0.042 |
+| `desk.fp.v1+platt` | R2 | short | 7430 | 0.216 | 0.133 | 0.2042 | 0.2033 | −0.005 | 0.178 |
+| `logit.flow.v2` | R2 | short | 7430 | 0.216 | 0.142 | 0.1945 | 0.2033 | +0.044 | 0.131 |
+| `desk.fp.v1+platt.liquid` | R2 | long | 3715 | 0.113 | 0.057 | 0.1038 | 0.1026 | −0.011 | 0.058 |
+| `logit.flow.v2.liquid` | R2 | short | 3715 | 0.202 | 0.113 | 0.1773 | 0.1915 | +0.074 | 0.129 |
+
+`desk.fp.v1+platt.wide` is identical to `+platt` at the champion bracket, by construction.
+The full tables for all four bracket targets and both recordings are in the registry.
+
+### Trading, taker/taker cost (the only scenario that can promote), judged result
+
+| model | R1 n / mean net bps | R2 n / mean net bps | R2 maker/maker bound |
+|---|---|---|---|
+| `desk.fp.v1` | 1 / −10.0 | 29 / −24.5 (t −6.2, 0/4 folds +) | −3.5 |
+| `desk.fp.v1+iso` | 3 / −11.6 | 9 / −29.1 | −4.8 |
+| `desk.fp.v1+platt` | 3 / −11.6 | 1 / +9.2 | −3.1 |
+| `desk.fp.v1+platt.wide` (nested) | 0: abstained, no past cell ≥ 10 trades | 0: abstained, best past cell net ≤ 0 | −6.1 |
+| `desk.fp.v1+platt.liquid` | 4 / −9.6 | 1 / −15.6 | −5.4 |
+| `logit.flow.v2(.liquid)`, `cond.flow.v2` | 0 | 0 | −7.2 / +0.1 / −11.2 |
+
+Per-cell (not nested, so optimistic) results of the wide grid at threshold 0: every cell
+with ≥ 2 trades is negative on R1 (best −7.4 bps, k_s 1, k_t 3). On R2 the best cell
+with ≥ 5 trades is −5.4 bps (n 24).
+
+**Findings (negative results included):**
+1. **Recalibration fixes the mean but not the skill.** Platt and isotonic bring the
+   long-side mean p from 0.145 to 0.053 against a base rate of 0.094. Brier skill is
+   still −0.003 to −0.007 on R2 and +0.009 on R1, below the 0.01 gate every time. ECE stays
+   0.04–0.20, because the base rate moves between folds: SL-first long is 0.25 in training
+   and 0.42 OOS on R1. A map fitted on the past is mis-scaled for the next 7–9 minutes.
+2. **Raw short-side TP skill (+0.15 to +0.16 on both recordings) is not usable.** It
+   comes with ECE 0.06–0.08, and the same model has negative skill on the mirror
+   long/SL targets. Recalibrating it destroys the skill (−0.005 to −0.008). That is the
+   signature of a base-rate coincidence, not information.
+3. **Wider, cost-aware brackets do not create an edge.** No grid cell is reliably positive
+   after the ~13 bps round-trip, and the nested search correctly abstains. Even the
+   maker/maker upper bound, which has no spread and perfect passive fills, is negative for
+   every searched model except `logit.flow.v2.liquid` on R2 (+0.1 bps).
+4. **Fewer, more liquid, cheaper instruments help calibration a little on R1 (long skill
+   +0.021) but not on R2 (−0.011).** The low-fee contracts (PAXG, XAU, XAG, CL at 0.0118 %
+   taker) dominate the liquid half, yet the trades they select still lose.
+5. Consequence: nothing is promotable, and the desk's calibration gate correctly keeps
+   blocking entries. More forecasting variants on half-hour recordings are unlikely to
+   change this. The data needed is hours of WS-fed recording with a paper-forward test, not
+   more models.
+
+Reproduce: `qe-research record --out R --minutes 45 --focus 10`, then
+`qe-research challenge --rec R --out models.json --stride 2`.
+
+## Public REST throttling (sprint 5)
+
+The 38 % "circuit open" rejections reported for the 30-minute paper run at 64cdd3c
+had this cause. Null-leverage instrument records failed to decode, the decode errors counted
+toward the breaker, five in a row opened it, every metadata call for 30 s then failed fast,
+and the desk stored each fast-fail as a per-instrument metadata failure. That rejected the
+pair for 10 minutes. PR #14 fixed the decoding. This sprint removes the remaining paths:
+* Decode errors and HTTP 4xx other than 429 no longer count toward the breaker. Only 429,
+  timeouts, connection errors and 5xx do.
+* After a 429, the client's request spacing doubles (125 ms → up to 2 s) and recovers by
+  5 ms per success. The cooldown honours `Retry-After` and doubles (to 5 min) on a re-open
+  within 5 min. All public clients in one process share a 12 req/s ceiling, below the
+  documented 16/s.
+* The desk's metadata loop treats a circuit-open or 429 as "wait out the cooldown". It
+  keeps the cached record and records no instrument failure. Metadata stays cached, with a
+  10-minute refresh for the top candidates.
+* Every breaker transition becomes an incident: `rest_breaker_open` and `rest_breaker_close`
+  in `incidents.jsonl` and the audit log, with the client name, reason, cooldown, time open
+  and calls refused.
+
 ## Not done / next
 * Trade-tape features are now scored (sprint 3). The tape is still REST-polled, so it can
   miss trades on busy pairs.

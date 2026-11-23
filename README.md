@@ -60,7 +60,7 @@ DATA → MATHEMATICS → PROBABILISTIC FORECAST → STRATEGY → RISK GOVERNOR �
 
 | Crate | Contents |
 |---|---|
-| `qe-coindcx` | Public REST client (8 req/s pacing, HTTP 429 + circuit breaker), wire types, HMAC signing, and (s2-live) the signed private futures client behind `LiveGate` plus the owner's `live_readiness` command. The desk does not use the private client |
+| `qe-coindcx` | Public REST client (8 req/s per client and 12 req/s per process, adaptive slow-down after HTTP 429; circuit breaker that ignores decode/4xx responses and reports every open/close, which the desk logs as `rest_breaker_open`/`rest_breaker_close` incidents), wire types, HMAC signing, and (s2-live) the signed private futures client behind `LiveGate` plus the owner's `live_readiness` command. The desk does not use the private client |
 | `qe-math` | Deterministic statistics, microstructure, first-passage lattice, bracket EV, Brier/log-loss/ECE, sizing, target controller and simulation, timeframe aggregation, features |
 | `qe-risk` | Risk governor, policies with hard ceilings, sizing, leverage selection, 120 s lifecycle state machine, paper fills, capital stages |
 | `qe-desk` | The live binary: loops, pipeline (`desk.rs`), JSONL store, HTTP/WebSocket API |
