@@ -9,7 +9,7 @@ import {
   type Position,
   type ScannerRow,
 } from "./api";
-import { AgentsPanel, ControlsPanel, DecisionsPanel, GlobalStatus, InstrumentPanel, TargetPanel, UniverseTable } from "./panels";
+import { AgentsPanel, ControlsPanel, DecisionsPanel, GlobalStatus, InstrumentPanel, ReadinessPanel, TargetPanel, UniverseTable } from "./panels";
 
 const POLL_MS = 1000;
 const DASH = "—";
@@ -126,6 +126,7 @@ export default function App() {
       {state ? (
         <>
           <GlobalStatus state={state} serverNow={serverNow} offline={offline} />
+          <ReadinessPanel state={state} />
           <ControlsPanel controls={state.controls} offline={offline} />
           <AccountStrip state={state} />
           <div className="grid2">

@@ -94,6 +94,67 @@ export function GlobalStatus({ state, serverNow, offline }: { state: DeskState; 
   );
 }
 
+/* ---------------- A2. Readiness, calibration authority, live gate ---------------- */
+export function ReadinessPanel({ state }: { state: DeskState }) {
+  const r = state.readiness ?? {};
+  const cal = state.calibration;
+  const live = state.live;
+  const flags = Object.entries(r).filter(([, v]) => typeof v === "boolean") as [string, boolean][];
+  return (
+    <section className="panel">
+      <h2>Readiness — each flag from an observed runtime condition</h2>
+      <div className="kv cols">
+        {flags.map(([k, v]) => (
+          <Fragment key={k}>
+            <span>{k}</span>
+            <b className={v ? "pos" : "neg"}>{v ? "YES" : "NO"}</b>
+          </Fragment>
+        ))}
+      </div>
+      <h2>
+        Forecast calibration (strategy authority){" "}
+        {cal && <span className={"badge " + (cal.calibrated ? "safe" : "danger")}>{cal.calibrated ? "CALIBRATED" : "UNCALIBRATED — entries denied"}</span>}
+      </h2>
+      {!cal ? (
+        <div className="empty">Calibration not reported</div>
+      ) : (
+        <>
+          <div className="kv cols">
+            <span>resolved / pending / dropped</span><b>{cal.n_resolved} / {cal.n_pending} / {cal.n_dropped_gaps}</b>
+            <span>Brier vs climatology</span><b>{num(cal.brier, 4)} vs {num(cal.brier_climatology, 4)}</b>
+            <span>ECE (10 bins)</span><b>{num(cal.ece_10bin, 4)}</b>
+            <span>mean p / hit rate</span><b>{pct(cal.mean_p, 1)} / {pct(cal.hit_rate, 1)}</b>
+          </div>
+          <div className="muted">{cal.verdict} · criteria: {cal.criteria} · {cal.method}</div>
+        </>
+      )}
+      <h2>
+        Live execution gate (s2-live){" "}
+        <span className={"badge " + (live?.gate.enabled ? "danger" : "safe")}>{live?.gate.enabled ? "OPEN" : "CLOSED"}</span>
+      </h2>
+      {!live ? (
+        <div className="empty">Live gate not reported</div>
+      ) : (
+        <>
+          <div className="kv cols">
+            <span>compiled</span><b>{String(live.gate.compiled)}</b>
+            <span>execution mode</span><b>{live.gate.execution_mode}</b>
+            <span>operator confirmed</span><b>{String(live.gate.operator_confirmed)}</b>
+            <span>blocked by</span><b>{JSON.stringify(live.gate.blocked_by)}</b>
+            {Object.entries(live.gate.readiness.items).map(([k, v]) => (
+              <Fragment key={k}>
+                <span>{k}</span>
+                <b className={v.status === "pass" ? "pos" : v.status === "fail" ? "neg" : "muted"}>{v.status}: {v.detail}</b>
+              </Fragment>
+            ))}
+          </div>
+          <div className="muted">{live.desk_live_path} · owner check: <code>{live.owner_command}</code></div>
+        </>
+      )}
+    </section>
+  );
+}
+
 /* ---------------- B. All-instrument universe ---------------- */
 type Coll = "futures" | "spot" | "events";
 const PAGE = 50;
@@ -192,7 +253,7 @@ export function UniverseTable({ onSelect }: { onSelect: (pair: string, margin: s
 
 /* ---------------- D/E. Instrument intelligence + forecast ---------------- */
 const RES = [
-  ["1m", "1"], ["5m", "5"], ["15m", "15"], ["1h", "60"], ["1d", "1D"],
+  ["1m", "1"], ["5m", "5"], ["15m", "15"], ["1h", "60"], ["1d", "1D"], ["2d", "2D"], ["3d", "3D"],
 ] as const;
 
 function CandleChart({ candles }: { candles: Candle[] }) {
@@ -245,7 +306,7 @@ export function InstrumentPanel({ sel }: { sel: { pair: string; margin: string }
             {RES.map(([l, r]) => (
               <button key={r} className={"tab " + (res === r ? "on" : "")} onClick={() => setRes(r)}>{l}</button>
             ))}
-            <span className="muted">completed candles only · 3d / 2d / 1s views not exposed by desk API v1</span>
+            <span className="muted">completed candles only · 2d aggregated from two completed 1d candles · 1s view needs the trade stream</span>
           </div>
           {candles.data ? <CandleChart candles={candles.data} /> : <div className="empty">{candles.error ? "Candles unavailable" : "Loading candles…"}</div>}
           {ft && (

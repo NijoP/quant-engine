@@ -170,6 +170,41 @@ export interface DeskState {
   agents?: AgentStatus[];
   controls?: ControlsState;
   audit: AuditEntry[];
+  readiness?: Record<string, boolean | string>;
+  calibration?: Calibration;
+  live?: LiveStatus;
+}
+
+export interface Calibration {
+  model: string;
+  target: string;
+  n_resolved: number;
+  n_pending: number;
+  n_dropped_gaps: number;
+  brier: number | null;
+  brier_climatology: number | null;
+  log_loss: number | null;
+  ece_10bin: number | null;
+  mean_p: number | null;
+  hit_rate: number | null;
+  calibrated: boolean;
+  verdict: string;
+  criteria: string;
+  method: string;
+}
+
+export interface LiveStatus {
+  gate: {
+    compiled: boolean;
+    execution_mode: string;
+    operator_confirmed: boolean;
+    credentials_configured: boolean;
+    enabled: boolean;
+    blocked_by: unknown;
+    readiness: { items: Record<string, { status: string; detail: string }> };
+  };
+  desk_live_path: string;
+  owner_command: string;
 }
 
 export interface Target {
