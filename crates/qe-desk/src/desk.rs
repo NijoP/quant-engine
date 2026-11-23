@@ -1277,6 +1277,37 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             model_version: MODEL_ID,
         });
         match crate::learn::record_decision(d, snap) {
+            Ok(()) if crate::live_exec::live_installed() => {
+                let lev = |x: f64| (x.is_finite() && x >= 1.0).then_some(x as u32);
+                let job = crate::live_exec::LiveJob {
+                    req: crate::live_exec::LiveOrderRequest {
+                        trade_id: trace.clone(),
+                        pair: o.pair.clone(),
+                        margin: TRADE_MARGIN.into(),
+                        long: o.side == Side::Long,
+                        qty: o.qty,
+                        ref_price: o.entry_price,
+                        stop_loss: o.stop_loss,
+                        take_profit: o.take_profit,
+                        governor_leverage: o.leverage.floor().max(1.0) as u32,
+                        exchange_max_leverage: lev(if o.side == Side::Long {
+                            c.max_leverage_long
+                        } else {
+                            c.max_leverage_short
+                        }),
+                        governor_approved: true,
+                    },
+                    risk_at_stop: o.risk_at_stop,
+                    risk_fraction: d.gov.policy.risk_fraction,
+                    created_ms: now,
+                };
+                if !crate::live_exec::submit(job) {
+                    d.incident(
+                        "live",
+                        format!("{trace}: live task unavailable, entry NOT sent"),
+                    );
+                }
+            }
             Ok(()) => open_paper(d, o, c, fx.unwrap(), mid, rec),
             Err(e) => d.incident(
                 "learning",
