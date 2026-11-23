@@ -33,7 +33,7 @@ DATA → MATHEMATICS → PROBABILISTIC FORECAST → STRATEGY → RISK GOVERNOR �
 | Regimes | Explicit numeric rules: trend/range, high/low volatility, expansion/contraction, momentum acceleration/exhaustion, potential reversal, abnormal volume, liquidity withdrawal, unstable | live |
 | Forecast | μ = 0.2·r₆₀/60 + 0.05·OBI₁₀·σ₁ₛ; horizons 1–120 s (E[r], P(up), σ_h, 90 % band); first-passage lattice P(TP first), P(SL first), P(neither), expected hit times; TP/SL = k·σ₁₂₀ (k_t 1.5, k_s 1.0) | live, **uncalibrated priors** |
 | Costs / EV | EV = P(TP)·W − P(SL)·L + P(neither)·E[R\|neither] − C, with C = 2 × live taker fee + spread + 2 × paper slippage | live |
-| Calibration | Every candidate's P(TP first) is resolved forward on the next 120 s of 1 s prices. It counts as calibrated only when n ≥ 200, ECE ≤ 0.05 and Brier beats climatology. Uncalibrated forecasts are denied strategy authority | live |
+| Calibration | Forecast authority comes from the s2-calib walk-forward registry (`crates/qe-research/calibration.json`, model `desk.fp.v1`, targets `tp_first_{long,short}`; `QE_CALIBRATION_FILE` overrides; reloaded every 10 s). A missing file means no authority. A live forward monitor resolves each P(TP first) on the next 120 s of 1 s prices and revokes authority when, at n ≥ 200, ECE > 0.05 or Brier ≥ climatology. With authority, the registry's recalibrated probability drives EV | live; **no model calibrated** |
 | Risk governor | `qe_risk::RiskGovernor` evaluates every candidate: kill/pause, session loss, high-water-mark floor, exit-only, data integrity, calibration, net edge, sizing from the stop-loss budget, highest exchange leverage stepped down for the liquidation buffer, min notional/quantity (rejected, never raised), margin | live |
 | Paper execution | `qe_risk::Position` lifecycle with an independent 250 ms server-side timer: taker fills at the touch + slippage + live fee, simulated protection, exits on SL/TP/edge-negative/data integrity/time (117 s lead, 120 s max), reconcile on ack timeout, flatten, kill | unit-tested; live-wired |
 | Capital / target | Growth → checkpoint (22:00 IST: pause + flatten) → user-confirmed withdrawal → protective. Trade-frequency scenarios and a seeded Monte-Carlo target simulation | live, paper ledger |
@@ -47,11 +47,12 @@ DATA → MATHEMATICS → PROBABILISTIC FORECAST → STRATEGY → RISK GOVERNOR �
 | `qe-math` | Deterministic statistics, microstructure, first-passage lattice, bracket EV, Brier/log-loss/ECE, sizing, target controller and simulation, timeframe aggregation, features |
 | `qe-risk` | Risk governor, policies with hard ceilings, sizing, leverage selection, 120 s lifecycle state machine, paper fills, capital stages |
 | `qe-desk` | The live binary: loops, pipeline (`desk.rs`), JSONL store, HTTP/WebSocket API |
+| `qe-research` | (s2-calib) recorder, historical loader, walk-forward evaluator and the calibration registry the desk gates on |
 | `qe-engine` | Reserved (empty) |
 
 ## Known limits (honest)
 
-- Forecast parameters are priors. Until the forward calibration gate passes, the governor rejects every entry ("forecast uncalibrated").
+- Forecast parameters are priors. The committed s2-calib registry calibrates no model (`desk.fp.v1`: ECE 0.080, Brier skill 0.005), so the governor rejects every entry ("forecast uncalibrated"). Release run results: [docs/RELEASE_REPORT_SPRINT2.md](docs/RELEASE_REPORT_SPRINT2.md).
 - At INR 100 paper equity, a 1 % risk budget (INR 1) is below the risk at minimum order size for most contracts, so the governor rejects them rather than raising the budget.
 - Paper TP/SL is enforced by the server-side monitor; exchange-side protective orders are not used in paper.
 - INR-margin conversion uses the spot USDTINR mid, which approximates the exchange's own conversion rate.
