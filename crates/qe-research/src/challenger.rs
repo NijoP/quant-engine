@@ -12,6 +12,12 @@
 //! * `desk.fp.v1+platt`  champion probabilities, Platt scaling per fold.
 //! * `logit.flow.v2`     ridge logistic on order-flow features, one model per target.
 //! * `cond.flow.v2`      conditional-historical frequencies in OBI5 x TFI30 x vol-regime cells.
+//! * `desk.fp.v1+platt.wide` (sprint 5) Platt-recalibrated champion probabilities with the
+//!   bracket and EV threshold searched over a wider, cost-aware grid (TP up to 4 sigma_120,
+//!   so the target is not smaller than the ~13 bps round-trip cost).
+//! * `*.liquid` (sprint 5) `desk.fp.v1+platt` and `logit.flow.v2` restricted to the
+//!   cheapest-to-trade half of the pairs, ranked by median round-trip cost on fold 0 only
+//!   (fold 0 is never scored, so the universe choice does not see OOS data).
 //!
 //! Parameter search: k_s, k_t and the EV threshold are chosen by nested walk-forward
 //! (the config for fold k is the one with the best realised net over folds 1..k-1),
@@ -43,6 +49,9 @@ const NF: usize = FEATURES.len();
 pub const K_S: [f64; 3] = [0.5, 1.0, 1.5];
 pub const K_T: [f64; 4] = [0.5, 1.0, 1.5, 2.0];
 pub const THRESH_BPS: [f64; 4] = [0.0, 1.0, 3.0, 5.0];
+/// Sprint 5 wide, cost-aware bracket grid for `desk.fp.v1+platt.wide`.
+pub const K_S_WIDE: [f64; 4] = [1.0, 1.5, 2.0, 3.0];
+pub const K_T_WIDE: [f64; 4] = [1.5, 2.0, 3.0, 4.0];
 pub const UP_H: [i64; 4] = [10, 30, 60, 120];
 pub const SCENARIOS: [&str; 3] = ["taker_taker", "maker_taker", "maker_maker"];
 const BASE_CFG: (f64, f64) = (DESK_PARAMS.k_s, DESK_PARAMS.k_t);
@@ -345,6 +354,7 @@ pub enum Kind {
     DeskPlatt,
     Logit,
     Cond,
+    DeskPlattWide,
 }
 
 impl Kind {
@@ -355,6 +365,7 @@ impl Kind {
             Kind::DeskPlatt => "desk.fp.v1+platt",
             Kind::Logit => "logit.flow.v2",
             Kind::Cond => "cond.flow.v2",
+            Kind::DeskPlattWide => "desk.fp.v1+platt.wide",
         }
     }
     fn version(self) -> &'static str {
@@ -363,17 +374,36 @@ impl Kind {
             Kind::DeskIso => "v1+iso.1",
             Kind::DeskPlatt => "v1+platt.1",
             Kind::Logit | Kind::Cond => "v2",
+            Kind::DeskPlattWide => "v1+platt.wide.1",
         }
+    }
+    /// Models whose bracket/threshold is chosen by nested walk-forward.
+    fn searched(self) -> bool {
+        matches!(self, Kind::Logit | Kind::Cond | Kind::DeskPlattWide)
+    }
+    /// The (k_s, k_t) grid searched for this model.
+    fn grid(self) -> Vec<(f64, f64)> {
+        let (ks, kt): (&[f64], &[f64]) = match self {
+            Kind::Logit | Kind::Cond => (&K_S, &K_T),
+            Kind::DeskPlattWide => (&K_S_WIDE, &K_T_WIDE),
+            _ => return vec![BASE_CFG],
+        };
+        ks.iter()
+            .flat_map(|&s| kt.iter().map(move |&t| (s, t)))
+            .collect()
     }
 }
 
-const KINDS: [Kind; 5] = [
+const KINDS: [Kind; 6] = [
     Kind::DeskRaw,
     Kind::DeskIso,
     Kind::DeskPlatt,
     Kind::Logit,
     Kind::Cond,
+    Kind::DeskPlattWide,
 ];
+/// Models re-scored on the low-cost ("liquid") pair subset.
+const LIQUID_KINDS: [Kind; 2] = [Kind::DeskPlatt, Kind::Logit];
 
 /// Raw champion probability for a target on a row at (ks, kt).
 fn desk_p(r: &Row, ks: f64, kt: f64, target: &str) -> f64 {
@@ -430,7 +460,7 @@ fn fit(kind: Kind, xs: &[[f64; NF]], praw: &[f64], y: &[bool]) -> Fit {
     match kind {
         Kind::DeskRaw => Fit::Raw,
         Kind::DeskIso => Isotonic::fit(praw, y, 10.0).map_or(clim, Fit::Iso),
-        Kind::DeskPlatt => {
+        Kind::DeskPlatt | Kind::DeskPlattWide => {
             let x: Vec<Vec<f64>> = praw.iter().map(|p| vec![logit(*p)]).collect();
             Logistic::fit(&x, y, 0.0).map_or(clim, Fit::Platt)
         }
@@ -774,6 +804,7 @@ fn kind_text(kind: Kind) -> &'static str {
         Kind::DeskRaw => "first-passage (Brownian drift lattice), uncalibrated priors",
         Kind::DeskIso => "first-passage + isotonic (PAV) recalibration, prior weight 10",
         Kind::DeskPlatt => "first-passage + Platt scaling (logistic on logit p)",
+        Kind::DeskPlattWide => "first-passage + Platt scaling; bracket (k_s, k_t up to 3 x 4 sigma_120) and EV threshold chosen by nested walk-forward",
         Kind::Logit => {
             "ridge logistic regression (IRLS, l2 = 1 on standardized features), one per target"
         }
@@ -790,14 +821,8 @@ fn trading_block(
     kind: Kind,
     bounds: &[i64],
 ) -> (Value, Value, Vec<Value>) {
-    let searched = matches!(kind, Kind::Logit | Kind::Cond);
-    let cfgs: Vec<(f64, f64)> = if searched {
-        K_S.iter()
-            .flat_map(|&s| K_T.iter().map(move |&t| (s, t)))
-            .collect()
-    } else {
-        vec![BASE_CFG]
-    };
+    let searched = kind.searched();
+    let cfgs = kind.grid();
     let preds: Vec<CfgPred> = cfgs
         .iter()
         .map(|&(s, t)| cfg_pred(rows, folds, kind, s, t, bounds))
@@ -868,6 +893,37 @@ fn trading_block(
     (Value::Object(block), judged_taker, grid)
 }
 
+fn dedup(mut v: Vec<f64>) -> Value {
+    v.sort_by(f64::total_cmp);
+    v.dedup();
+    json!(v)
+}
+
+/// The cheapest-to-trade half of the pairs (at least one), ranked by median
+/// taker/taker round-trip cost over fold 0 only, so the choice uses no data that is
+/// ever scored out of sample. Empty when fewer than 2 pairs have fold-0 rows.
+pub fn liquid_pairs(rows: &[Row]) -> Vec<String> {
+    let mut by: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for r in rows.iter().filter(|r| r.fold == 0) {
+        by.entry(&r.pair).or_default().push(r.cost[0]);
+    }
+    if by.len() < 2 {
+        return vec![];
+    }
+    let mut med: Vec<(f64, &str)> = by
+        .into_iter()
+        .map(|(p, mut c)| {
+            c.sort_by(f64::total_cmp);
+            (c[c.len() / 2], p)
+        })
+        .collect();
+    med.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
+    let keep = med.len().div_ceil(2);
+    let mut out: Vec<String> = med[..keep].iter().map(|x| x.1.to_string()).collect();
+    out.sort();
+    out
+}
+
 /// Run the full evaluation and build the registry.
 pub fn run(dir: &Path, stride_s: f64, folds: usize) -> Result<ModelRegistry> {
     let d = build_rows(dir, (stride_s * 1000.0) as i64, folds)?;
@@ -879,13 +935,24 @@ pub fn run(dir: &Path, stride_s: f64, folds: usize) -> Result<ModelRegistry> {
         .flatten()
         .filter_map(|v| v.as_i64())
         .collect();
-    let base_labels: Vec<_> = rows
+    let liquid = liquid_pairs(rows);
+    let liquid_rows: Vec<Row> = rows
         .iter()
-        .map(|r| bracket(r, BASE_CFG.0, BASE_CFG.1))
+        .filter(|r| liquid.contains(&r.pair))
+        .cloned()
         .collect();
+    let mut jobs: Vec<(Kind, &[Row], bool)> =
+        KINDS.iter().map(|&k| (k, &rows[..], false)).collect();
+    if !liquid.is_empty() && liquid_rows.len() >= 200 {
+        jobs.extend(LIQUID_KINDS.iter().map(|&k| (k, &liquid_rows[..], true)));
+    }
     let mut cards = vec![];
     let mut grid = vec![];
-    for kind in KINDS {
+    for (kind, rows, is_liquid) in jobs {
+        let base_labels: Vec<_> = rows
+            .iter()
+            .map(|r| bracket(r, BASE_CFG.0, BASE_CFG.1))
+            .collect();
         let mut cal = BTreeMap::new();
         for (k, tg) in BRACKET_TARGETS.iter().enumerate() {
             let praw: Vec<f64> = rows
@@ -909,19 +976,42 @@ pub fn run(dir: &Path, stride_s: f64, folds: usize) -> Result<ModelRegistry> {
             let o = oos(rows, folds, kind, &praw, &y, h * 1000, &bounds);
             cal.insert(tg, score(rows, &o));
         }
-        let (trading, judged, g) = trading_block(rows, folds, kind, &bounds);
+        let (trading, judged, mut g) = trading_block(rows, folds, kind, &bounds);
+        let id = if is_liquid {
+            format!("{}.liquid", kind.id())
+        } else {
+            kind.id().to_string()
+        };
+        if is_liquid {
+            for c in g.iter_mut() {
+                c["model"] = json!(id);
+            }
+        }
         grid.extend(g);
         let mut failures = calib_failures(&cal);
         failures.extend(trading_failures(&judged));
-        let searched = matches!(kind, Kind::Logit | Kind::Cond);
+        let searched = kind.searched();
+        let grid_ks: Vec<f64> = kind.grid().iter().map(|c| c.0).collect();
+        let grid_kt: Vec<f64> = kind.grid().iter().map(|c| c.1).collect();
+        let mut kind_desc = kind_text(kind).to_string();
+        if is_liquid {
+            kind_desc.push_str(&format!(
+                "; universe restricted to the cheapest half of pairs by fold-0 median round-trip cost: {liquid:?}"
+            ));
+        }
         cards.push(ModelCard {
-            id: kind.id().into(),
-            version: kind.version().into(),
-            role: if kind == Kind::DeskRaw { "champion" } else { "challenger" }.into(),
-            kind: kind_text(kind).into(),
+            id: id.clone(),
+            version: if is_liquid {
+                format!("{}.liquid.1", kind.version())
+            } else {
+                kind.version().into()
+            },
+            role: if kind == Kind::DeskRaw && !is_liquid { "champion" } else { "challenger" }.into(),
+            kind: kind_desc,
             params: json!({"desk_params": DESK_PARAMS, "l2": L2, "cond_prior": COND_PRIOR,
-                "search_k_s": if searched { json!(K_S) } else { json!([BASE_CFG.0]) },
-                "search_k_t": if searched { json!(K_T) } else { json!([BASE_CFG.1]) },
+                "universe": if is_liquid { json!(liquid) } else { json!("all recorded book pairs") },
+                "search_k_s": dedup(grid_ks),
+                "search_k_t": dedup(grid_kt),
                 "thresholds_bps": if searched { json!(THRESH_BPS) } else { json!([0.0]) }}),
             training_window: json!({"mode": "expanding chronological walk-forward",
                 "purge": "label horizon (120 s for brackets, h for up_h)",
@@ -1032,6 +1122,38 @@ mod tests {
         assert!(!oos(&rows, 2, Kind::Cond, &[0.5; 300], &y, 140_000, &b).is_empty());
         // horizon 160 s: 40 rows < 50 -> the fold abstains
         assert!(oos(&rows, 2, Kind::Cond, &[0.5; 300], &y, 160_000, &b).is_empty());
+    }
+
+    #[test]
+    fn liquid_universe_is_chosen_from_fold_zero_only() {
+        let mut rows = vec![];
+        for (i, (pair, c0, c1)) in [("A", 1e-3, 9e-3), ("B", 5e-4, 9e-3), ("C", 2e-3, 1e-5)]
+            .into_iter()
+            .enumerate()
+        {
+            for j in 0..10 {
+                let mut r = row((i * 100 + j) as i64, 0, 0.0);
+                r.pair = pair.into();
+                r.cost = [c0; 3];
+                rows.push(r.clone());
+                // later folds would rank C cheapest: they must not matter
+                r.fold = 1;
+                r.cost = [c1; 3];
+                rows.push(r);
+            }
+        }
+        assert_eq!(liquid_pairs(&rows), vec!["A".to_string(), "B".to_string()]);
+        rows.retain(|r| r.pair == "A");
+        assert!(liquid_pairs(&rows).is_empty());
+    }
+
+    #[test]
+    fn wide_model_searches_the_wide_grid() {
+        assert!(Kind::DeskPlattWide.searched());
+        assert_eq!(Kind::DeskPlattWide.grid().len(), 16);
+        assert!(Kind::DeskPlattWide.grid().contains(&(3.0, 4.0)));
+        assert_eq!(Kind::DeskPlatt.grid(), vec![BASE_CFG]);
+        assert!(!Kind::DeskPlatt.searched());
     }
 
     #[test]
