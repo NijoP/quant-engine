@@ -1,7 +1,7 @@
 # QUANT-ENGINE
 
 CoinDCX-first quantitative trading intelligence desk: Rust core and a React + TypeScript dashboard.
-**Execution mode: paper only.** The desk never reads API credentials and holds no private client;
+**Default execution mode: paper.** Live trading happens only through the owner's own arming; the canonical midnight procedure is [docs/OWNER_START_0000.md](docs/OWNER_START_0000.md) (CI artifact, no local build). Historical note: through sprint 4 the desk was The desk never reads API credentials and holds no private client;
 live order submission is refused (see `qe_coindcx::live::LiveGate`, which only the account owner
 can satisfy, and which still requires checks that have not been run).
 
@@ -32,6 +32,7 @@ Earlier targets (INR 18,000; INR 3,000 at 22:30 IST plus an INR 2,000 withdrawal
 ## Run
 
 ```bash
+# developers only; the owner's midnight path uses the CI artifact
 cargo build && cargo test
 (cd dashboard && npm ci && npm run build)
 ./target/debug/qe-desk          # http://127.0.0.1:8787  (dashboard at /, JSON API at /api/*)
@@ -74,7 +75,7 @@ DATA → MATHEMATICS → PROBABILISTIC FORECAST → STRATEGY → RISK GOVERNOR �
 | Calibration | Forecast authority comes from the s2-calib walk-forward registry (`crates/qe-research/calibration.json`, model `desk.fp.v1`, targets `tp_first_{long,short}`; `QE_CALIBRATION_FILE` overrides; reloaded every 10 s). A missing file means no authority. A live forward monitor resolves each P(TP first) on the next 120 s of 1 s prices and revokes authority when, at n ≥ 200, ECE > 0.05 or Brier ≥ climatology. With authority, the registry's recalibrated probability drives EV | live; **no model calibrated** |
 | Risk governor | `qe_risk::RiskGovernor` evaluates every candidate: kill/pause, session loss, high-water-mark floor, exit-only, data integrity, calibration, net edge, sizing from the stop-loss budget, highest exchange leverage stepped down for the liquidation buffer, min notional/quantity (rejected, never raised), margin | live |
 | Paper execution | `qe_risk::Position` lifecycle with an independent 250 ms server-side timer: taker fills at the touch + slippage + live fee, simulated protection, exits on SL/TP/edge-negative/data integrity/time (117 s lead, 120 s max), reconcile on ack timeout, flatten, kill | unit-tested; live-wired |
-| Capital / target | 24 Nov campaign schedule and controller (see [docs/CAMPAIGN_24NOV.md](docs/CAMPAIGN_24NOV.md)): reporting only, never sizes trades; floor and loss-budget stop; exit-only at 22:00 IST. The older Growth → checkpoint → withdrawal → protective stage plan is historical. Trade-frequency scenarios and a seeded Monte-Carlo target simulation | paper ledger |
+| Capital / target | 24 Nov campaign schedule and controller (see [docs/CAMPAIGN_24NOV.md](docs/CAMPAIGN_24NOV.md)): reporting only in the default protective profile (INR 1/trade, INR 5 total); the owner-selected bold-play profile `configs/campaign-live.toml` sizes each bet toward the next hourly milestone above an owner floor; floor and loss-budget stop; exit-only at 22:00 IST. The older Growth → checkpoint → withdrawal → protective stage plan is historical. Trade-frequency scenarios and a seeded Monte-Carlo target simulation | paper ledger |
 | Audit | JSONL: decisions (full numeric explanation), governor, fills, closed trades, equity, incidents, audit | live |
 
 ## Crates

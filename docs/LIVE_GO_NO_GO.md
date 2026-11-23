@@ -33,7 +33,7 @@ change this engineering verdict. Every NOT TESTED item above stays unverified un
 runs pass, and gamble mode skips the calibration and positive-EV gates (P0-3, P0-4).
 
 Facts that hold at main `22fabe5`:
-- Bold play (`target_optimal`) is refused live; only `fixed` stake runs live.
+- `target_optimal` is still refused live. Campaign bold play runs as `stake_policy = "fixed"` + `campaign_stake = "next_milestone"` (configs/campaign-live.toml, PR #24) and is allowed live under owner arming. Verdict unchanged: NO-GO.
 - Leverage is an owner number capped at the exchange max.
 - The floor is checked against the real wallet before each order.
 

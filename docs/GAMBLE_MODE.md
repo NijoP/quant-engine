@@ -157,7 +157,8 @@ the leverage cap and the exchange minimum notional:
 ### Stake policies
 
 - `fixed`: margin per bet = `stake_inr`, capped by the floor rule.
-- `target_optimal` (bold play): the largest bet the floor rule, leverage cap and
+- **24 Nov campaign bold play (current, live-capable under owner arming):** `configs/campaign-live.toml` keeps `stake_policy = "fixed"` and sets `campaign_stake = "next_milestone"`. Each bet's margin is sized so one TP win reaches the next hourly milestone, limited to the equity above the required owner floor. This is the profile in [OWNER_START_0000.md](OWNER_START_0000.md). The `target_optimal` restriction below applies only to that older policy.
+- `target_optimal` (bold play, older policy): the largest bet the floor rule, leverage cap and
   exchange limits allow, unless a smaller bet reaches the target with one win.
   In a game with negative expectation this maximises P(reach a fixed target),
   because fewer bets means less exposure to the house edge. Exception: the

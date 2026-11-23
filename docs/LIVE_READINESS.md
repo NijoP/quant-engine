@@ -13,6 +13,8 @@ responses. Until your own runs pass, treat every authenticated path as
 
 ## Build once
 
+> **Canonical midnight procedure: [OWNER_START_0000.md](OWNER_START_0000.md).** Do not build locally for the 00:00 start; download the CI artifact `qe-desk-linux-x86_64`. The build commands below are for developers only.
+
 ```sh
 cargo build --release -p qe-live-check --features live-orders
 alias qlc=./target/release/qe-live-check

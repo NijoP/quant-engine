@@ -23,14 +23,15 @@ Nothing is built on your machine: CI builds both binaries.
    ```sh
    git fetch origin && git checkout campaign/24nov-50k-hourly-target && git pull
    gh run list --branch campaign/24nov-50k-hourly-target --workflow CI --limit 1   # note the run id
-   gh run download <run-id> -n qe-desk-linux-x86_64        # unpacks target/release/{qe-desk,qe-live-check} + dashboard/dist
+   gh run download <run-id> -R NijoP/quant-engine -n qe-desk-linux-x86_64   # unpacks target/release/{qe-desk,qe-live-check} + dashboard/dist
    chmod +x target/release/qe-desk target/release/qe-live-check
+   ls -lh target/release/qe-desk target/release/qe-live-check     # both must exist
    alias qlc=./target/release/qe-live-check
    ```
    - The artifact `qe-desk-linux-x86_64` holds `qe-desk` built with `--features live` and `qe-live-check` built with `--features live-orders`. It is kept for 3 days.
    - Run both from the repository root: the desk reads `configs/`, `data/` and `dashboard/dist` from the current directory, or from `QE_REPO_ROOT` if you set it.
-2. **Keys.** Create `.env` in the repository root with `COINDCX_API_KEY=...` and `COINDCX_API_SECRET=...`, then run `chmod 600 .env`. Never commit it.
-3. **Read-only check (places nothing).**
+2. **Keys.** Create `.env` in the repository root with `COINDCX_API_KEY=...` and `COINDCX_API_SECRET=...`, then run `chmod 600 .env`. Confirm git ignores it with `git check-ignore -v .env`, which must print `.gitignore:...:.env`. Never commit it.
+3. **Read-only check (READ-ONLY: places nothing).** Run `qlc status` first (READ-ONLY: local arming and kill state), then:
    ```sh
    ./target/release/qe-desk --readonly-check
    ```
@@ -43,10 +44,18 @@ Nothing is built on your machine: CI builds both binaries.
    qlc readiness --read-account --pair <PAIR> --margin INR
    qlc governor
    ```
-   **Optional, your choice:** `qlc validate --pair <PAIR> --margin INR --leverage 1`.
+   Both are READ-ONLY.
+
+   **Choose `<PAIR>`** from the public list of active INR-margined futures (no key needed):
+   ```sh
+   curl -s 'https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments?margin_currency_short_name[]=INR' | tr ',' '\n' | head -40
+   ```
+   Pick a liquid pair from that output, e.g. `B-BTC_USDT` or `B-ETH_USDT`, only if it is listed. Its INR minimum notional is on the dashboard's instrument panel, and the desk rejects instruments whose minimum does not fit.
+
+   **OPTIONAL - REAL MONEY ORDER:** `qlc validate --pair <PAIR> --margin INR --leverage 1`.
    - It places a **real, small order with protective SL/TP orders** on your account, then closes it.
    - It costs fees and can lose money. It is the only end-to-end proof of the order path.
-   - Afterwards, run `qlc readiness --read-account --pair <PAIR> --margin INR` again to confirm you are flat.
+   - Afterwards, run a **fresh reconciliation**: `qlc readiness --read-account --pair <PAIR> --margin INR` and `./target/release/qe-desk --readonly-check`. Both must show no position and no open order.
 5. **Edit `configs/campaign-live.toml`** yourself:
    - `enabled = true`; paste `owner_ack` exactly as written in the file.
    - `floor_inr = "<your floor>"`: **required, no default**. Equity at or below it is a permanent stop.
@@ -54,7 +63,7 @@ Nothing is built on your machine: CI builds both binaries.
    - `stake_inr = "<n>"`: required by the validator, but replaced per bet by `campaign_stake = "next_milestone"`.
    - Keep `campaign_stake = "next_milestone"`, `stake_policy = "fixed"` and `entry = "maker"` (post-only maker entry).
    - Set `execution_mode = "live"`.
-6. **Arm**: `qlc arm --hours 23`, then type the owner phrase.
+6. **Arm (changes live state, places no order):** `qlc arm --hours 23`, then type the owner phrase. Check with `qlc status`.
 7. **Start at 00:00 IST:**
    ```sh
    QE_GAMBLE_CONFIG=configs/campaign-live.toml QE_EXECUTION_MODE=live \
@@ -69,7 +78,13 @@ Nothing is built on your machine: CI builds both binaries.
    - kill switch, data-integrity and minimum-notional checks (size is never raised to a minimum);
    - the floor is checked against the real wallet before every order;
    - a floor hit is a permanent stop. A restart needs `--gamble-rearm`, and `data/desk-campaign/campaign_state.json` must be archived to start a new campaign.
-9. **Stop any time**: `qlc kill --reason "..."`, then `qlc checkpoint --kind adhoc`.
+9. **Emergency stop, any time:**
+   ```sh
+   qlc status
+   qlc kill --reason "OWNER EMERGENCY STOP"
+   qlc checkpoint --kind adhoc
+   ```
+   If the checkpoint is not verified flat, close the position in the CoinDCX app.
 10. **22:00 IST**:
     - The desk switches to exit-only by itself. On live it records `verified_flat=false` and raises an incident, because it never claims flat on its own.
     - Run `qlc checkpoint --kind stage2 --currency INR --expected <desk equity>`.
