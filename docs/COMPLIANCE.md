@@ -31,13 +31,14 @@ Check the current text yourself before running anything live.
 - [ ] I keep a 5-year archive of orders, fills, fees, P&L and API usage records (clause 6.6). `audit/` is gitignored; back it up somewhere private.
 - [ ] I will not redistribute CoinDCX market data, or dashboards and analytics derived from it, to third parties (clause 2.3(c)). The dashboard stays private.
 - [ ] I understand that futures with leverage can lose more than the planned stop distance through gaps, slippage or liquidation, and that no forecast in this system is a guarantee.
-- [ ] I ran `cargo run -p qe-coindcx --bin live_readiness -- --read-account --pair <PAIR> --margin <USDT|INR>` myself, and every item is PASS.
+- [ ] I ran the `qe-live-check` sequence in `docs/LIVE_READINESS.md` myself (readiness, governor, supervised `validate`, readiness, `arm`), and every item is PASS.
 - [ ] I flattened all positions and cancelled all orders before the first live session (the readiness check fails while exposure exists).
 - [ ] I alone set `QE_EXECUTION_MODE=live` and `QE_LIVE_OPERATOR_CONFIRM`. No automated process sets them.
-- [ ] I know how to stop everything: kill the process, then use the CoinDCX app to cancel orders and exit positions.
+- [ ] I know how to stop everything: `qe-live-check kill`, then `qe-live-check checkpoint --kind adhoc`. If that cannot confirm flat, use the CoinDCX app to cancel orders and exit positions.
+- [ ] I do the 22:30 and 17:00 checkpoints with `qe-live-check checkpoint`, I withdraw only manually in the CoinDCX app, and I confirm the result with `qe-live-check reconcile-withdrawal`. `data/live/` (audit log and reports) is part of my 5-year archive.
 
 ## Engineering commitments in this repository
 
-* No withdrawal, wallet transfer or add-margin endpoint is implemented.
+* No withdrawal, wallet transfer or add-margin endpoint is implemented. `qe-live-check` only reads balances around the owner's manual withdrawal.
 * Paper equity is always labelled as paper. No balance is ever fabricated.
 * Risk ceilings: see `docs/RISK_POLICY.md`; the live gate never relaxes them.

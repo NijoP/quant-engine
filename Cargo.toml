@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/qe-coindcx", "crates/qe-math", "crates/qe-engine", "crates/qe-desk", "crates/qe-risk", "crates/qe-research", "crates/qe-learn"]
+members = ["crates/qe-coindcx", "crates/qe-math", "crates/qe-engine", "crates/qe-desk", "crates/qe-risk", "crates/qe-research", "crates/qe-learn", "crates/qe-live-check"]
 
 [workspace.package]
 version = "0.1.0"

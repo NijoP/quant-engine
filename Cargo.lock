@@ -819,6 +819,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "qe-live-check"
+version = "0.1.0"
+dependencies = [
+ "qe-coindcx",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "qe-math"
 version = "0.1.0"
 dependencies = [
