@@ -1,9 +1,9 @@
 # 24 NOV 2026 CAMPAIGN - BOLD PLAY profile (owner instruction 23 Nov 2026 23:21 IST).
 # Run: QE_GAMBLE_CONFIG=configs/campaign-live.toml qe-desk --profile gamble
 # PAPER by default. Live needs QE_EXECUTION_MODE=live, a `--features live` build
+# and the existing owner arming (qe-live-check); this file alone never trades live.
 # Docs: docs/CAMPAIGN_24NOV.md, docs/OWNER_START_0000.md, docs/LIVE_GO_NO_GO.md (engineering verdict: NO-GO).
 # The protective INR 1 / INR 5 alternative is configs/campaign-24nov.toml (desk default).
-# and the existing owner arming (qe-live-check); this file alone never trades live.
 #
 # Stake: each bet's margin is sized so ONE take-profit win (net of round-trip
 # cost) lifts equity to the NEXT hourly milestone (100 * 500^(h/22)), capped by
