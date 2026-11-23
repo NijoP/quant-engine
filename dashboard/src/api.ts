@@ -9,10 +9,13 @@ export interface Health {
   rt_polls: number;
   errors: number;
   last_error: string | null;
+  stale?: boolean;
 }
 
 export interface Universe {
   futures_active: number;
+  futures_usdt?: number;
+  futures_inr?: number;
   futures_tracked: number;
   spot_active: number;
   spot_with_ticker: number;
@@ -21,6 +24,8 @@ export interface Universe {
 
 export interface ScannerRow {
   pair: string;
+  margin?: "USDT" | "INR";
+  regime?: string | null;
   last: number;
   mark: number | null;
   funding_rate: number | null;
@@ -47,6 +52,9 @@ export interface Opportunity {
   side: Side;
   p_win: number;
   p_up_horizon: number;
+  p_stop?: number;
+  p_neither?: number;
+  calibrated?: boolean;
   tp_pct: number;
   sl_pct: number;
   ev_gross_bps: number;
@@ -77,6 +85,7 @@ export interface Position {
   time_left_s: number;
   unrealized_pnl: number;
   fees_paid: number;
+  state?: string;
 }
 
 export interface Fill {
@@ -120,6 +129,10 @@ export interface Policy {
 }
 
 export interface Account {
+  currency?: string;
+  paper?: boolean;
+  used_margin?: number;
+  available?: number;
   starting_equity: number;
   equity: number;
   realized_pnl: number;
@@ -153,7 +166,121 @@ export interface DeskState {
   fills: Fill[];
   closed: ClosedTrade[];
   account: Account;
+  target?: Target;
+  agents?: AgentStatus[];
+  controls?: ControlsState;
   audit: AuditEntry[];
+}
+
+export interface Target {
+  stage: number;
+  start_equity: number;
+  target_equity: number;
+  deadline_ms: number;
+  hours_remaining: number;
+  growth_required: number;
+  scenarios: { trades_per_hour: number; required_return_per_trade: number }[];
+  actual_trades_per_hour: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  expectancy: number | null;
+  geometric_growth: number | null;
+  simulation: {
+    p_reach_target: number;
+    p_session_loss_first: number;
+    p_floor_breach: number;
+    p_losing_streak: number;
+    p_unrecovered_drawdown: number;
+  } | null;
+}
+
+export interface AgentStatus {
+  id: string;
+  name: string;
+  status: "ok" | "degraded" | "stopped" | "error";
+  last_run_ms: number | null;
+  last_ok_ms: number | null;
+  duration_ms: number | null;
+  runs: number;
+  errors: number;
+  last_output: string | null;
+  last_error: string | null;
+}
+
+export interface ControlsState {
+  scanner_running: boolean;
+  paper_running: boolean;
+  strategy_enabled: boolean;
+  entries_paused: boolean;
+  killed: boolean;
+}
+
+export interface Forecast {
+  pair: string;
+  ts_ms: number;
+  mu_per_s: number;
+  sigma_per_s: number;
+  horizons: { h_s: number; exp_ret: number; p_up: number; p_down: number; sigma_h: number }[];
+  first_passage: { p_target: number; p_stop: number; p_neither: number; e_t_target: number; e_t_stop: number };
+  model: string;
+  calibrated: boolean;
+}
+
+export interface Candle {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  complete: boolean;
+}
+
+/** Universe rows are passed through as loosely-typed records: the contract does not pin their fields. */
+export type UniverseRecord = Record<string, unknown>;
+export interface UniverseResp {
+  spot: UniverseRecord[];
+  futures: UniverseRecord[];
+  events: UniverseRecord[];
+}
+
+export interface InstrumentResp {
+  instrument: UniverseRecord;
+  features: ScannerRow | null;
+  forecast: Forecast | null;
+  book: unknown;
+}
+
+export interface ControlResp {
+  ok: boolean;
+  message: string;
+  state: ControlsState;
+}
+
+export async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(path, { cache: "no-store", signal });
+  if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`);
+  return (await res.json()) as T;
+}
+
+export async function postControl(path: string, body?: unknown): Promise<ControlResp> {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await res.text();
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    /* non-JSON body */
+  }
+  if (!res.ok) {
+    const msg = parsed && typeof parsed === "object" && "message" in parsed ? String((parsed as { message: unknown }).message) : text;
+    throw new Error(`HTTP ${res.status}${msg ? ": " + msg : ""}`);
+  }
+  return parsed as ControlResp;
 }
 
 export async function fetchState(signal?: AbortSignal): Promise<DeskState> {

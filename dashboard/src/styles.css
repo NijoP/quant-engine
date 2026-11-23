@@ -97,3 +97,33 @@ tr.anomaly td { background: #2a2010; }
 .bar { flex: 1; height: 8px; background: #1c2430; border-radius: 4px; overflow: hidden; }
 .bar .fill { height: 100%; background: var(--accent); transition: width 0.2s linear; }
 .bar .fill.urgent { background: var(--neg); }
+
+.status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; }
+.st { border-left: 3px solid var(--muted); padding: 2px 8px; min-width: 0; }
+.st .label { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.st .value { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-ok { border-color: var(--pos); }
+.st-warn { border-color: var(--warn); }
+.st-bad { border-color: var(--neg); }
+.st-bad .value { color: var(--neg); }
+.toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0 6px; }
+button, select, input {
+  background: #1a2230; color: var(--text); border: 1px solid var(--border); border-radius: 3px;
+  padding: 3px 8px; font: inherit;
+}
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.tab.on, button.ctl.on { background: #1d3557; border-color: var(--accent); color: var(--accent); }
+button.ctl.danger { border-color: var(--neg); color: var(--neg); font-weight: 700; }
+input { width: 140px; }
+.errline { color: var(--warn); padding: 2px 0; }
+th.sortable { cursor: pointer; }
+tr.click { cursor: pointer; }
+.kv.cols { grid-template-columns: repeat(auto-fit, minmax(110px, auto) minmax(0, 1fr)); margin: 6px 0; }
+.chart { width: 100%; height: 200px; background: #0e131b; border: 1px solid var(--border); }
+.chart .cu line, .chart .cu rect { stroke: var(--pos); fill: var(--pos); }
+.chart .cd line, .chart .cd rect { stroke: var(--neg); fill: var(--neg); }
+.chart .axis { fill: var(--muted); font-size: 10px; }
+pre.book { max-height: 200px; overflow: auto; background: #0e131b; padding: 6px; margin: 0; color: var(--muted); white-space: pre-wrap; word-break: break-all; }
+.ag-ok { color: var(--pos); } .ag-degraded { color: var(--warn); } .ag-error { color: var(--neg); } .ag-stopped { color: var(--muted); }
