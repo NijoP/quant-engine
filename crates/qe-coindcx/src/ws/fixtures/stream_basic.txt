@@ -1,0 +1,7 @@
+0{"sid":"eE_1adGbuHNcZGSSAKTS","upgrades":[],"pingInterval":25000,"pingTimeout":20000,"maxPayload":1000000}
+40{"sid":"9Pnx6663Mhl_bW6FAIUB"}
+42["new-trade",{"event":"new-trade","data":"{\"T\":1795429310010,\"RT\":1795429364303.1023,\"p\":\"61334.9\",\"q\":\"0.041\",\"m\":1,\"s\":\"B-BTC_USDT\",\"pr\":\"f\"}"}]
+42["new-trade",{"event":"new-trade","data":"{\"T\":1795429309766,\"RT\":1795429364059.0999,\"p\":\"61335\",\"q\":\"0.016\",\"m\":0,\"s\":\"B-BTC_USDT\",\"pr\":\"f\"}"}]
+42["price-change",{"event":"price-change","data":"{\"T\":1795429309766,\"p\":\"61335\",\"pr\":\"f\"}"}]
+42["candlestick",{"event":"candlestick","data":"{\"data\":[{\"open\":\"61337.60\",\"close\":\"61335.00\",\"high\":\"61337.70\",\"low\":\"61324.40\",\"volume\":\"36.531\",\"open_time\":1795429260,\"close_time\":1795429319.999,\"pair\":\"B-BTC_USDT\",\"duration\":\"1m\",\"symbol\":\"BTCUSDT\",\"quote_volume\":\"2240569.78900\"}],\"ecode\":\"B\",\"Ets\":1795429309766,\"pts\":1795429309843,\"i\":\"1m\",\"channel\":\"B-BTC_USDT_1m-futures\",\"pr\":\"futures\"}"}]
+42["new-trade",{"event":"new-trade","data":"{\"T\":1795429310160,\"RT\":1795429364453.1038,\"p\":\"1720.98\",\"q\":\"0.165\",\"m\":0,\"s\":\"B-ETH_USDT\",\"pr\":\"f\"}"}]

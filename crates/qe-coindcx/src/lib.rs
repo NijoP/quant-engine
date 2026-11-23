@@ -9,5 +9,6 @@ pub mod auth;
 pub mod client;
 pub mod orders;
 pub mod types;
+pub mod ws;
 
 pub use client::PublicClient;
