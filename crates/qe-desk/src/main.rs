@@ -61,7 +61,7 @@ fn requested_profile() -> Option<String> {
 
 fn load_settings() -> anyhow::Result<Settings> {
     let mut st = Settings::default();
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let dir = repo_root().join("configs");
     let read = |f: &str| -> Option<toml::Table> {
         std::fs::read_to_string(dir.join(f))
             .ok()?
@@ -185,9 +185,7 @@ fn load_settings() -> anyhow::Result<Settings> {
         }
         if std::env::var_os("QE_DATA_DIR").is_none() {
             if let Some(dd) = t.get("data_dir").and_then(|v| v.as_str()) {
-                let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../..")
-                    .join(dd);
+                let p = repo_root().join(dd);
                 std::env::set_var("QE_DATA_DIR", p);
             }
         }
@@ -249,9 +247,7 @@ fn load_settings() -> anyhow::Result<Settings> {
                 .get("data_dir")
                 .and_then(|v| v.as_str())
                 .unwrap_or("data/desk-gamble");
-            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join(dd);
+            let p = repo_root().join(dd);
             std::env::set_var("QE_DATA_DIR", p);
         }
         let dir = std::path::PathBuf::from(std::env::var("QE_DATA_DIR").unwrap_or_default());
@@ -302,9 +298,7 @@ fn load_gamble(
 ) -> anyhow::Result<(toml::Table, qe_risk::gamble::GambleParams)> {
     let path = std::env::var("QE_GAMBLE_CONFIG")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/gamble.toml")
-        });
+        .unwrap_or_else(|_| repo_root().join("configs/gamble.toml"));
     let t: toml::Table = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("gamble profile: {}: {e}", path.display()))?
         .parse()
@@ -1624,7 +1618,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(breaker_incident_loop(vec![c.clone(), meta], s.clone()));
     tokio::spawn(mtf_loop(c.clone(), s.clone()));
     tokio::spawn(monitor_loop(c.clone(), s.clone()));
-    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/dist");
+    let dist = repo_root().join("dashboard/dist");
     let app = Router::new()
         .route("/api/state", get(h_state))
         .route("/api/status", get(h_status))

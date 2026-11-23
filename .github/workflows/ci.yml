@@ -53,6 +53,7 @@ jobs:
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - run: cargo build --release -p qe-desk --features live
+      - run: cargo build --release -p qe-live-check --features live-orders
       - run: npm ci && npm run build
         working-directory: dashboard
       - uses: actions/upload-artifact@v4
@@ -60,6 +61,7 @@ jobs:
           name: qe-desk-linux-x86_64
           path: |
             target/release/qe-desk
+            target/release/qe-live-check
             dashboard/dist
           retention-days: 3
   secrets:

@@ -93,6 +93,19 @@ pub fn experiment_guard(
     Ok(())
 }
 
+/// Repository root for configs, data, calibration and the dashboard: `QE_REPO_ROOT`,
+/// else the current directory when it holds `configs/` (a prebuilt CI artifact run
+/// from a checkout), else the compile-time source tree.
+pub fn repo_root() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("QE_REPO_ROOT") {
+        return p.into();
+    }
+    if std::path::Path::new("configs").is_dir() {
+        return ".".into();
+    }
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
 pub fn now_ms() -> i64 {
     qe_coindcx::auth::request_timestamp_ms()
 }
@@ -450,10 +463,7 @@ impl Desk {
     pub fn load_calibration(&mut self) {
         let path = std::env::var("QE_CALIBRATION_FILE")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../qe-research/calibration.json")
-            });
+            .unwrap_or_else(|_| repo_root().join("crates/qe-research/calibration.json"));
         self.calib_report_src = path.display().to_string();
         match qe_research::calibration::CalibrationReport::load(&path) {
             Ok(r) => {

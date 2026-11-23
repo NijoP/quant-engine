@@ -298,9 +298,7 @@ pub fn resolve(d: &mut Desk, now: i64) {
 pub fn learning_json(d: &Desk) -> Value {
     let models = std::env::var("QE_MODELS_FILE")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../qe-research/models.json")
-        });
+        .unwrap_or_else(|_| crate::desk::repo_root().join("crates/qe-research/models.json"));
     let reg = qe_research::registry::ModelRegistry::load_or_default(&models);
     let promotable: Vec<&str> = reg.promotable().map(|m| m.id.as_str()).collect();
     let dash = d.learn.engine.as_ref().map(|e| {
