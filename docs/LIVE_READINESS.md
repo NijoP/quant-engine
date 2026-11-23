@@ -47,7 +47,7 @@ Current campaign: [CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md) (INR 100 → INR 50,000
 | --- | --- |
 | Credentials, signing self-test, account reconciled | 15 min |
 | Instrument requirements | 6 h |
-| Protective orders verified, 120 s closure tested, risk-governor acceptance | 24 h |
+| Protective orders verified, fill-to-flat within 120 s during validation (immediate close), risk-governor acceptance | 24 h |
 
 Arming snapshots the checks. While the arm record is valid (at most 24 h,
 default 3 h), the gate does not re-expire on account-check age. Expiry, `disarm`
@@ -64,13 +64,24 @@ or `kill` closes it.
    max(min_quantity, min_notional x 1.02 / price), rounded up to the
    quantity increment. After that there are no further prompts, so an open
    position never waits on a keyboard:
-4. it waits for the fill, sends `create_tpsl` (`take_profit_market` and
+4. it waits for the fill and reads the exchange's own position response for
+   the pair. Its `margin_type` must be `isolated`. If it is `crossed`, missing
+   or anything else, the tool sends no TP/SL, runs the emergency flatten,
+   verifies flat and stops (protective orders: FAIL). The reported margin type
+   is logged as its own `margin_type` step in the report and as a
+   `validation_margin_type` audit event. Then it sends `create_tpsl` (`take_profit_market` and
    `stop_market` at +/-1 % of the fill, on the price grid), and requires both
    legs to be accepted **and** listed as untriggered orders;
 5. it sends `cancel_all_open_orders_for_position` and checks that the legs are gone;
 6. it sends `positions/exit`, then `cancel_all_open_orders`, and checks that
    the account is flat. It measures the time from fill to flat, which must be
-   120 s or less.
+   120 s or less. This check (key `closure120s_tested`) is **fill-to-flat
+   within 120 s during validation (immediate close)**: the tool closes the
+   position itself at once.
+
+> **Not proven by `validate`:** the desk's automatic 120 s holding-time
+> enforcement. Desk 120 s holding-time enforcement: unit-tested only, not
+> proven live. `qlc status` and `qlc readiness` print this as a separate note.
 
 Every step is printed, audited to `data/live/audit.jsonl` and written to
 `data/live/reports/validation-<ms>.json`. If anything fails after the entry

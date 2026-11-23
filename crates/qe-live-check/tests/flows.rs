@@ -34,6 +34,8 @@ struct Mock {
     exit_does_nothing: bool,
     futures_inr: f64,
     spot_inr: f64,
+    /// `margin_type` the mock exchange reports on positions it opens.
+    margin_type: Option<String>,
 }
 
 impl Mock {
@@ -42,6 +44,7 @@ impl Mock {
             fill_price: 100.0,
             futures_inr: 2950.5,
             spot_inr: 100.0,
+            margin_type: Some("isolated".into()),
             ..Default::default()
         }
     }
@@ -57,6 +60,7 @@ impl Mock {
             pair: Some(pair.into()),
             active_pos: Some(qty),
             avg_price: Some(self.fill_price),
+            margin_type: self.margin_type.clone(),
             margin_currency_short_name: Some("INR".into()),
             ..Default::default()
         });
@@ -212,6 +216,16 @@ async fn validation_happy_path_verifies_protection_and_closure() {
     assert!(out.flat_at_end);
     assert!(out.closure_ms.unwrap() <= validate::MAX_CLOSURE_MS);
     assert!(out.protective_status().is_pass() && out.closure_status().is_pass());
+    assert_eq!(out.margin_type.as_deref(), Some("isolated"));
+    assert!(out.margin_type_verified);
+    let mt = out.steps.iter().find(|s| s.name == "margin_type").unwrap();
+    assert!(mt.ok && mt.detail.contains("isolated"), "{mt:?}");
+    // The closure result names what it proves and disclaims the desk timer.
+    let CheckStatus::Pass(txt) = out.closure_status() else {
+        panic!("closure should pass")
+    };
+    assert!(txt.contains(validate::CLOSURE_CHECK_LABEL));
+    assert!(txt.contains("Does NOT prove the desk's automatic 120 s holding-time enforcement"));
     assert_eq!(
         c.asked,
         vec!["LEVERAGE B-ETH_INR 1x", "BUY 2.55 B-ETH_INR REAL"]
@@ -228,6 +242,88 @@ async fn validation_happy_path_verifies_protection_and_closure() {
             "exit_position",
             "cancel_all_open_orders"
         ]
+    );
+}
+
+async fn non_isolated_position_is_flattened_without_tpsl(margin_type: Option<&str>) {
+    let m = Mock {
+        margin_type: margin_type.map(String::from),
+        ..Mock::new()
+    };
+    let plan = validate::plan(&instrument(), 100.0, 10).unwrap();
+    let out = validate::run(
+        &m,
+        &mut Scripted::new(&[true, true]),
+        plan,
+        Poll::IMMEDIATE,
+        &clock(),
+        false,
+    )
+    .await;
+    assert!(out.entry_sent);
+    assert!(!out.margin_type_verified);
+    assert_eq!(out.margin_type.as_deref(), margin_type);
+    let mt = out.steps.iter().find(|s| s.name == "margin_type").unwrap();
+    assert!(!mt.ok, "{mt:?}");
+    let calls = m.calls();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("create_tpsl")),
+        "no TP/SL after a non-isolated position: {calls:?}"
+    );
+    assert!(calls.iter().any(|c| c.starts_with("exit_position")));
+    assert!(out.flat_at_end, "emergency flatten must verify flat");
+    assert!(out.emergency.as_ref().is_some_and(|e| e.flat));
+    assert!(out
+        .steps
+        .iter()
+        .any(|s| s.name == "emergency_flatten" && s.ok));
+    assert!(
+        matches!(out.protective_status(), CheckStatus::Fail(ref s) if s.contains("margin_type"))
+    );
+    assert!(matches!(out.closure_status(), CheckStatus::Fail(_)));
+}
+
+#[tokio::test]
+async fn crossed_margin_position_triggers_emergency_flatten() {
+    non_isolated_position_is_flattened_without_tpsl(Some("crossed")).await;
+}
+
+#[tokio::test]
+async fn missing_margin_type_triggers_emergency_flatten() {
+    non_isolated_position_is_flattened_without_tpsl(None).await;
+}
+
+#[tokio::test]
+async fn unexpected_margin_type_triggers_emergency_flatten() {
+    non_isolated_position_is_flattened_without_tpsl(Some("portfolio")).await;
+}
+
+#[test]
+fn margin_type_must_be_exactly_isolated() {
+    assert!(validate::is_isolated(Some("isolated")));
+    assert!(validate::is_isolated(Some("ISOLATED")));
+    assert!(!validate::is_isolated(Some("crossed")));
+    assert!(!validate::is_isolated(Some("")));
+    assert!(!validate::is_isolated(Some("isolated_cross")));
+    assert!(!validate::is_isolated(None));
+}
+
+#[test]
+fn closure_label_does_not_claim_desk_hold_enforcement() {
+    use qe_coindcx::live::CheckItem;
+    let l = qe_live_check::readiness::check_label(CheckItem::Closure120sTested);
+    assert_eq!(
+        l,
+        "fill-to-flat within 120 s during validation (immediate close)"
+    );
+    assert_eq!(
+        validate::DESK_HOLD_ENFORCEMENT_NOTE,
+        "desk 120 s holding-time enforcement: unit-tested only, not proven live"
+    );
+    // The serialized key stays the same for checks.json / armed.json.
+    assert_eq!(
+        serde_json::to_value(CheckItem::Closure120sTested).unwrap(),
+        serde_json::json!("closure120s_tested")
     );
 }
 

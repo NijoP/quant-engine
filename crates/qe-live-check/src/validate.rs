@@ -6,10 +6,15 @@
 //! 3. typed confirmation of the WHOLE sequence, then a market entry of the
 //!    minimum quantity, immediately followed (no further prompt, so the
 //!    position is never left waiting on a keyboard) by:
-//! 4. wait for the fill, `create_tpsl` (take_profit_market + stop_market),
+//! 4. wait for the fill, read the exchange's position for the pair and require
+//!    `margin_type == "isolated"` (anything else or missing: emergency flatten,
+//!    verify flat, stop; no TP/SL is placed), then `create_tpsl` (take_profit_market + stop_market),
 //!    verify both legs accepted AND listed as untriggered orders;
 //! 5. `cancel_all_open_orders_for_position`, verify the legs are gone;
 //! 6. `positions/exit`, verify flat, measure fill -> flat (must be <= 120 s);
+//!    this is "fill-to-flat within 120 s during validation (immediate close)"
+//!    only: it does NOT prove the desk's automatic 120 s holding-time
+//!    enforcement, which is unit-tested only and not proven live;
 //! 7. `cancel_all_open_orders` and a final flat check.
 //!
 //! Any failure after the entry was sent runs the emergency flatten
@@ -30,6 +35,16 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 
 pub const MAX_CLOSURE_MS: i64 = 120_000;
+/// The only margin type the validation accepts on the opened position.
+pub const REQUIRED_MARGIN_TYPE: &str = "isolated";
+/// What the `Closure120sTested` check proves (the serialized key is kept for
+/// `checks.json` / `armed.json` compatibility).
+pub const CLOSURE_CHECK_LABEL: &str =
+    "fill-to-flat within 120 s during validation (immediate close)";
+/// Stated wherever the closure check is shown: the validation closes at once,
+/// so it never exercises the desk's own 120 s holding-time exit.
+pub const DESK_HOLD_ENFORCEMENT_NOTE: &str =
+    "desk 120 s holding-time enforcement: unit-tested only, not proven live";
 /// TP/SL distance from the fill for the test (1 %): far enough not to trigger
 /// during a test lasting seconds, close enough to be accepted.
 pub const TEST_BRACKET_PCT: Decimal = Decimal::from_parts(1, 0, 0, false, 2);
@@ -123,6 +138,11 @@ pub struct Outcome {
     pub flat_at_end: bool,
     pub emergency: Option<FlattenReport>,
     pub aborted_by_owner: bool,
+    /// `margin_type` the exchange reported for the opened position (`None`
+    /// when no position was observed or the field was missing).
+    pub margin_type: Option<String>,
+    /// True only when that value is `isolated`.
+    pub margin_type_verified: bool,
 }
 
 impl Outcome {
@@ -141,12 +161,12 @@ impl Outcome {
     pub fn closure_status(&self) -> CheckStatus {
         match (self.flat_at_end, self.closure_ms) {
             (true, Some(ms)) if ms <= MAX_CLOSURE_MS => CheckStatus::Pass(format!(
-                "{} fill -> verified flat in {ms} ms (limit {MAX_CLOSURE_MS})",
+                "{CLOSURE_CHECK_LABEL}: {} verified flat {ms} ms after fill (limit {MAX_CLOSURE_MS} ms). Does NOT prove the desk's automatic 120 s holding-time enforcement ({DESK_HOLD_ENFORCEMENT_NOTE})",
                 self.plan.pair
             )),
-            (true, Some(ms)) => {
-                CheckStatus::Fail(format!("flat only after {ms} ms (> {MAX_CLOSURE_MS})"))
-            }
+            (true, Some(ms)) => CheckStatus::Fail(format!(
+                "{CLOSURE_CHECK_LABEL}: flat only after {ms} ms (> {MAX_CLOSURE_MS} ms)"
+            )),
             _ if !self.entry_sent => {
                 CheckStatus::NotRun("validation stopped before the entry order".into())
             }
@@ -199,6 +219,11 @@ impl Run<'_> {
     }
 }
 
+/// True only for the exact margin type `isolated` (ASCII case ignored).
+pub fn is_isolated(margin_type: Option<&str>) -> bool {
+    margin_type.is_some_and(|m| m.trim().eq_ignore_ascii_case(REQUIRED_MARGIN_TYPE))
+}
+
 fn find_open<'p>(ps: &'p [FuturesPosition], pair: &str) -> Option<&'p FuturesPosition> {
     ps.iter()
         .find(|p| p.pair.as_deref() == Some(pair) && p.is_open())
@@ -231,6 +256,8 @@ pub async fn run<A: AccountApi, C: Confirm>(
                 flat_at_end,
                 emergency,
                 aborted_by_owner: aborted,
+                margin_type: None,
+                margin_type_verified: false,
             }
         };
 
@@ -354,7 +381,46 @@ pub async fn run<A: AccountApi, C: Confirm>(
         ),
     );
 
-    // 4. protection
+    // 4a. margin type, from the exchange's own position response for the pair
+    // (the positions read that observed the fill). Anything but isolated:
+    // no TP/SL, emergency flatten, verify flat, stop.
+    let margin_type = pos.margin_type.clone();
+    let isolated = is_isolated(margin_type.as_deref());
+    let margin_seen = (margin_type.clone(), isolated);
+    r.step(
+        "margin_type",
+        isolated,
+        match (&margin_type, isolated) {
+            (Some(m), true) => format!("exchange reports margin_type {m:?} for {pos_id} (verified isolated)"),
+            (Some(m), false) => format!(
+                "exchange reports margin_type {m:?} for {pos_id}, expected {REQUIRED_MARGIN_TYPE:?}: stopping, emergency flatten"
+            ),
+            (None, _) => format!(
+                "exchange position {pos_id} has no margin_type, expected {REQUIRED_MARGIN_TYPE:?}: stopping, emergency flatten"
+            ),
+        },
+    );
+    if !isolated {
+        let em = flatten_all(api, &margins, poll).await;
+        let flat = em.flat;
+        r.step(
+            "emergency_flatten",
+            flat,
+            if flat {
+                format!("verified flat; errors={:?}", em.errors)
+            } else {
+                format!(
+                    "NOT FLAT: {:?} errors {:?} - CHECK THE COINDCX APP NOW",
+                    em.residual, em.errors
+                )
+            },
+        );
+        let mut o = out(r, true, false, None, flat, Some(em), false);
+        (o.margin_type, o.margin_type_verified) = margin_seen;
+        return o;
+    }
+
+    // 4b. protection
     let (tp, sl) = bracket(plan.side, fill_px, plan.price_increment);
     let mut protective = false;
     match api
@@ -467,5 +533,7 @@ pub async fn run<A: AccountApi, C: Confirm>(
     );
     let flat = fin.flat;
     let emergency = (!protective || ex.is_err()).then_some(fin);
-    out(r, true, protective, closure, flat, emergency, false)
+    let mut o = out(r, true, protective, closure, flat, emergency, false);
+    (o.margin_type, o.margin_type_verified) = margin_seen;
+    o
 }

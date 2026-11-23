@@ -55,6 +55,8 @@ Nothing is built on your machine: CI builds both binaries.
    **OPTIONAL - REAL MONEY ORDER:** `qlc validate --pair <PAIR> --margin INR --leverage 1`.
    - It places a **real, small order with protective SL/TP orders** on your account, then closes it.
    - It costs fees and can lose money. It is the only end-to-end proof of the order path.
+   - Right after the fill it reads the position from the exchange and requires `margin_type` = `isolated`. Otherwise it places no TP/SL, flattens, verifies flat and stops. The margin type it saw is printed and audited.
+   - Its 120 s result is **fill-to-flat within 120 s during validation (immediate close)**. It does **not** prove the desk's automatic 120 s holding-time enforcement, which is unit-tested only and not proven live.
    - Afterwards, run a **fresh reconciliation**: `qlc readiness --read-account --pair <PAIR> --margin INR` and `./target/release/qe-desk --readonly-check`. Both must show no position and no open order.
 5. **Edit `configs/campaign-live.toml`** yourself:
    - `enabled = true`; paste `owner_ack` exactly as written in the file.
@@ -74,7 +76,7 @@ Nothing is built on your machine: CI builds both binaries.
    - The dashboard is at http://127.0.0.1:8787, in the **24 NOVEMBER CAMPAIGN** section. Its equity source must read `live_exchange` with a number, not `null`.
 8. **Kept regardless:**
    - one position at a time; exchange SL and TP on every entry (flatten if protection is not confirmed); SL inside liquidation;
-   - 120 **second** maximum hold;
+   - 120 **second** maximum hold (desk 120 s holding-time enforcement: unit-tested only, not proven live; `validate` does not prove it);
    - kill switch, data-integrity and minimum-notional checks (size is never raised to a minimum);
    - the floor is checked against the real wallet before every order;
    - a floor hit is a permanent stop. A restart needs `--gamble-rearm`, and `data/desk-campaign/campaign_state.json` must be archived to start a new campaign.
