@@ -861,7 +861,7 @@ fn live_status() -> Value {
         ),
     );
     json!({"gate": gate.status(), "live_executor_installed": live_exec::live_installed(),
-        "live_trades": live_exec::recent_reports(),
+        "live_trades": live_exec::recent_reports(), "live_stale_proposals_dropped": live_exec::stale_dropped(),
         "desk_live_path": if live_exec::live_installed() { "armed: governor-approved entries execute on CoinDCX via live_exec" } else { "paper: live executor not installed (not armed at start-up)" },
         "owner_command": "cargo run -p qe-coindcx --bin live_readiness"})
 }

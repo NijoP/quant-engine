@@ -525,6 +525,12 @@ pub fn submit(job: LiveJob) -> bool {
     LIVE_TX.get().is_some_and(|tx| tx.send(job).is_ok())
 }
 
+static STALE_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn stale_dropped() -> u64 {
+    STALE_DROPPED.load(Ordering::Relaxed)
+}
+
 pub fn live_installed() -> bool {
     LIVE_TX.get().is_some()
 }
@@ -584,14 +590,14 @@ pub fn install_if_armed(state: qe_live_check::state::StateDir) -> Result<(), Str
     });
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            let age = crate::desk::now_ms() - job.created_ms;
+            // Proposals queued behind an open trade are stale: drop without
+            // touching the exchange (counted, not stored as trade reports).
+            if crate::desk::now_ms() - job.created_ms > MAX_JOB_AGE_MS {
+                STALE_DROPPED.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let bal = exec.balance(&job.req.margin).await;
-            let checked = if age > MAX_JOB_AGE_MS {
-                Err(format!("proposal stale ({age} ms old)"))
-            } else {
-                risk_fits_real_equity(&job, bal)
-            };
-            let r = match checked {
+            let r = match risk_fits_real_equity(&job, bal) {
                 Ok(()) => exec.execute(&job.req).await,
                 Err(why) => {
                     let mut r = exec.refused(&job.req);
