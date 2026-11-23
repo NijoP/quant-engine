@@ -1,7 +1,7 @@
 # QUANT-ENGINE
 
 CoinDCX-first quantitative trading intelligence desk: Rust core and a React + TypeScript dashboard.
-**Default execution mode: paper.** Live trading happens only through the owner's own arming; the canonical midnight procedure is [docs/OWNER_START_0000.md](docs/OWNER_START_0000.md) (CI artifact, no local build). Historical note: through sprint 4 the desk was The desk never reads API credentials and holds no private client;
+**Default execution mode: paper.** Live trading happens only through the owner's own arming; the canonical midnight procedure is [docs/OWNER_START_0000.md](docs/OWNER_START_0000.md) (CI artifact, no local build). Paper mode never reads API credentials or uses a private client, and
 live order submission is refused (see `qe_coindcx::live::LiveGate`, which only the account owner
 can satisfy, and which still requires checks that have not been run).
 
