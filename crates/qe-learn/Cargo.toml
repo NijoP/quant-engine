@@ -1,0 +1,14 @@
+[package]
+name = "qe-learn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qe-math = { path = "../qe-math" }
+serde = { workspace = true }
+# float_roundtrip: journal replay re-hashes parsed records, so f64 must round-trip exactly
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rust_decimal = { workspace = true }

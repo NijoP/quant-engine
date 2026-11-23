@@ -815,6 +815,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "qe-learn"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "qe-math",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "qe-math"
 version = "0.1.0"
 dependencies = [
