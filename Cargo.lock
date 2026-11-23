@@ -736,12 +736,6 @@ dependencies = [
 [[package]]
 name = "qe-engine"
 version = "0.1.0"
-dependencies = [
- "qe-coindcx",
- "qe-math",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "qe-math"
