@@ -77,11 +77,22 @@ QE_LIVE_OPERATOR_CONFIRM=I-AM-THE-ACCOUNT-OWNER-AND-ACCEPT-LIVE-TRADING-RISK \
 ./target/release/qe-desk
 ```
 
-> **Current limitation (sprint 4):** the live executor
-> (`crates/qe-desk/src/live_exec.rs`) is built and tested against a mock
-> exchange, but the desk loop does not call it yet. Until that wiring lands,
-> the desk keeps trading on paper even when armed. Its status endpoint says so
-> in `live.desk_live_path`.
+At start-up the desk prints `[live] ARMED: ...` or `[live] not armed, staying
+on paper: <reason>`. It installs the live executor
+(`crates/qe-desk/src/live_exec.rs`) only when the gate is fully open. It re-reads
+the arm record and the kill switch every second, so `qlc disarm`, `qlc kill` and
+arm expiry take effect while it runs. Arming happens only at start-up: after
+re-arming, restart the desk.
+
+Before each order it reads the **real** futures wallet balance. It refuses the
+order if the governor's risk at stop exceeds the per-trade fraction of that real
+balance. It also drops any proposal more than 2 s old (for example, one queued
+behind an open trade).
+
+> Not yet verified: none of this has run against the real exchange. Desk
+> equity, the capital controller and the dashboard still show the desk's own
+> (paper) accounting. Live results appear in `live.live_trades` on
+> `/api/status`. The wallet balance there is the real figure.
 
 What the executor does with each proposal the governor approved:
 

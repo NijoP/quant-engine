@@ -9,8 +9,7 @@
 //! multi-timeframe candles (per candidate, every 2 min) and the system monitor (10 s).
 mod desk;
 mod learn;
-// Real-money executor; the desk loop does not call it yet (see docs/GO_LIVE.md).
-#[allow(dead_code)]
+// Real-money executor, installed only when armed (see docs/GO_LIVE.md).
 mod live_exec;
 mod store;
 
@@ -861,7 +860,9 @@ fn live_status() -> Value {
             "the desk never reads credentials; the owner runs the live_readiness command".into(),
         ),
     );
-    json!({"gate": gate.status(), "desk_live_path": "live_exec::LiveExecutor implemented and mock-tested; not yet invoked by the desk loop, so live orders are still refused",
+    json!({"gate": gate.status(), "live_executor_installed": live_exec::live_installed(),
+        "live_trades": live_exec::recent_reports(),
+        "desk_live_path": if live_exec::live_installed() { "armed: governor-approved entries execute on CoinDCX via live_exec" } else { "paper: live executor not installed (not armed at start-up)" },
         "owner_command": "cargo run -p qe-coindcx --bin live_readiness"})
 }
 
@@ -1401,6 +1402,19 @@ async fn main() -> anyhow::Result<()> {
     };
     if settings.is_experiment() {
         eprintln!("*** {EXPERIMENT_BANNER} *** (paper only; configs/experiment-max-leverage.toml)");
+    }
+    // Live only when the owner armed it (qe-live-check arm) and mode is live;
+    // otherwise, and on any failure, the desk stays on paper.
+    let env_live = std::env::var(qe_coindcx::live::ENV_EXECUTION_MODE)
+        .map(|m| {
+            qe_coindcx::live::ExecutionMode::parse(&m) == qe_coindcx::live::ExecutionMode::Live
+        })
+        .unwrap_or(false);
+    if env_live && !settings.is_experiment() {
+        match live_exec::install_if_armed(qe_live_check::state::StateDir::from_env()) {
+            Ok(()) => eprintln!("[live] ARMED: governor-approved entries go to CoinDCX"),
+            Err(e) => eprintln!("[live] not armed, staying on paper: {e}"),
+        }
     }
     let mut desk = Desk::new(settings);
     desk.load_calibration();

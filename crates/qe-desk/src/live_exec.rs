@@ -230,23 +230,8 @@ impl<V: Venue> LiveExecutor<V> {
 
     /// Run one trade end to end. Never opens a second position concurrently.
     pub async fn execute(&self, req: &LiveOrderRequest) -> LiveTradeReport {
-        let coid = format!("qe-{}", req.trade_id);
-        let mut r = LiveTradeReport {
-            trade_id: req.trade_id.clone(),
-            client_order_id: coid.clone(),
-            state: LiveState::Refused,
-            exit_reason: None,
-            leverage: None,
-            requested_qty: req.qty,
-            filled_qty: 0.0,
-            avg_entry: None,
-            fill_confirmed_ms_after_submit: None,
-            held_ms: None,
-            flat_verified: false,
-            wallet_balance_after: None,
-            incidents: vec![],
-            events: vec![],
-        };
+        let mut r = self.refused(req);
+        let coid = r.client_order_id.clone();
         if let Some(why) = self.refusal(req) {
             r.events.push(format!("refused: {why}"));
             return r;
@@ -259,6 +244,25 @@ impl<V: Venue> LiveExecutor<V> {
         self.run(req, &coid, &mut r).await;
         self.busy.store(false, Ordering::SeqCst);
         r
+    }
+
+    fn refused(&self, req: &LiveOrderRequest) -> LiveTradeReport {
+        LiveTradeReport {
+            trade_id: req.trade_id.clone(),
+            client_order_id: format!("qe-{}", req.trade_id),
+            state: LiveState::Refused,
+            exit_reason: None,
+            leverage: None,
+            requested_qty: req.qty,
+            filled_qty: 0.0,
+            avg_entry: None,
+            fill_confirmed_ms_after_submit: None,
+            held_ms: None,
+            flat_verified: false,
+            wallet_balance_after: None,
+            incidents: vec![],
+            events: vec![],
+        }
     }
 
     fn refusal(&self, req: &LiveOrderRequest) -> Option<&'static str> {
@@ -494,6 +498,119 @@ impl<V: Venue> LiveExecutor<V> {
     }
 }
 
+// ------------------------------------------------------------ desk wiring
+
+/// One governor-approved order handed from the (sync) desk loop to the live task.
+#[derive(Debug, Clone)]
+pub struct LiveJob {
+    pub req: LiveOrderRequest,
+    /// Risk at stop in the margin currency, as sized by the governor.
+    pub risk_at_stop: f64,
+    /// Governor's per-trade risk fraction (1% growth / 0.5% protective).
+    pub risk_fraction: f64,
+    /// When the governor approved it; older than [`MAX_JOB_AGE_MS`] is dropped.
+    pub created_ms: i64,
+}
+
+/// A proposal queued behind an open trade is stale by the time it is read.
+pub const MAX_JOB_AGE_MS: i64 = 2_000;
+
+static LIVE_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<LiveJob>> =
+    std::sync::OnceLock::new();
+static LIVE_REPORTS: std::sync::Mutex<Vec<LiveTradeReport>> = std::sync::Mutex::new(Vec::new());
+
+/// Hand an approved order to the live executor. Returns `false` (the caller
+/// keeps the paper path) unless the live task was installed at start-up.
+pub fn submit(job: LiveJob) -> bool {
+    LIVE_TX.get().is_some_and(|tx| tx.send(job).is_ok())
+}
+
+pub fn live_installed() -> bool {
+    LIVE_TX.get().is_some()
+}
+
+pub fn recent_reports() -> Vec<LiveTradeReport> {
+    LIVE_REPORTS.lock().map(|r| r.clone()).unwrap_or_default()
+}
+
+/// Real-equity guard: the governor sized from desk equity, so re-check the
+/// risk against the REAL wallet balance before any order. Never enlarges.
+pub fn risk_fits_real_equity(job: &LiveJob, real_balance: Option<f64>) -> Result<(), String> {
+    let bal = real_balance.ok_or("real wallet balance unavailable")?;
+    if !(bal.is_finite() && bal > 0.0) {
+        return Err(format!("real wallet balance {bal} not positive"));
+    }
+    let cap = bal * job.risk_fraction;
+    if !(job.risk_at_stop.is_finite() && job.risk_at_stop <= cap) {
+        return Err(format!(
+            "risk at stop {:.4} exceeds {:.2}% of real balance {:.4}",
+            job.risk_at_stop,
+            job.risk_fraction * 100.0,
+            bal
+        ));
+    }
+    Ok(())
+}
+
+/// Install the live task when the gate is open at start-up. The gate and the
+/// kill switch are re-read from the owner's arm state every second, so expiry,
+/// `qlc disarm` and `qlc kill` take effect while running.
+pub fn install_if_armed(state: qe_live_check::state::StateDir) -> Result<(), String> {
+    let (creds, status) = qe_coindcx::auth::load_credentials();
+    let gate =
+        qe_live_check::arming::gate_for_desk(&state, status.configured, crate::desk::now_ms());
+    gate.check().map_err(|e| e.to_string())?;
+    let creds = creds.ok_or("credentials not configured")?;
+    let exec = Arc::new(LiveExecutor::new(
+        PrivateClient::new(creds, gate),
+        ExecConfig::default(),
+    ));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LiveJob>();
+    LIVE_TX.set(tx).map_err(|_| "live task already installed")?;
+    let (ex_gate, kill) = (exec.clone(), exec.kill_switch());
+    tokio::spawn(async move {
+        loop {
+            let now = crate::desk::now_ms();
+            if qe_live_check::arming::killed(&state).is_some() {
+                kill.store(true, Ordering::SeqCst);
+            }
+            ex_gate.venue.set_gate(qe_live_check::arming::gate_for_desk(
+                &state,
+                status.configured,
+                now,
+            ));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            let age = crate::desk::now_ms() - job.created_ms;
+            let bal = exec.balance(&job.req.margin).await;
+            let checked = if age > MAX_JOB_AGE_MS {
+                Err(format!("proposal stale ({age} ms old)"))
+            } else {
+                risk_fits_real_equity(&job, bal)
+            };
+            let r = match checked {
+                Ok(()) => exec.execute(&job.req).await,
+                Err(why) => {
+                    let mut r = exec.refused(&job.req);
+                    r.events.push(format!("refused: {why}"));
+                    r
+                }
+            };
+            if let Ok(mut v) = LIVE_REPORTS.lock() {
+                v.push(r);
+                let n = v.len();
+                if n > 50 {
+                    v.drain(..n - 50);
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,6 +768,24 @@ mod tests {
             exchange_max_leverage: Some(10),
             governor_approved: true,
         }
+    }
+
+    #[test]
+    fn real_equity_guard_refuses_oversized_risk() {
+        let job = |risk| LiveJob {
+            req: req(),
+            risk_at_stop: risk,
+            risk_fraction: 0.01,
+            created_ms: 0,
+        };
+        assert!(risk_fits_real_equity(&job(0.5), Some(100.0)).is_ok());
+        assert!(risk_fits_real_equity(&job(1.5), Some(100.0)).is_err());
+        assert!(risk_fits_real_equity(&job(0.5), None).is_err());
+        assert!(risk_fits_real_equity(&job(0.5), Some(0.0)).is_err());
+        assert!(
+            !submit(job(0.1)),
+            "no live task installed in tests: paper path kept"
+        );
     }
 
     #[test]
