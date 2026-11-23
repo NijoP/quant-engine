@@ -676,7 +676,6 @@ dependencies = [
  "anyhow",
  "axum",
  "qe-coindcx",
- "qe-engine",
  "qe-math",
  "reqwest",
  "serde",

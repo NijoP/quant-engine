@@ -124,8 +124,9 @@ pub struct InstrumentEnvelope {
 /// One entry of GET public.coindcx.com/market_data/v3/current_prices/futures/rt
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RtPrice {
-    /// last traded price
-    pub ls: f64,
+    /// last traded price (absent for some entries in live data)
+    #[serde(default)]
+    pub ls: Option<f64>,
     /// mark price
     #[serde(default)]
     pub mp: Option<f64>,
