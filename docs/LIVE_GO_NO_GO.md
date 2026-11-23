@@ -22,6 +22,23 @@ measured edge. Under the INR 1 per-trade cap with a ~INR 625 minimum notional, a
 candidate is correctly rejected. The INR 50,000 schedule is a mathematical requirement, not an
 expectation, and nothing may raise risk to chase it.
 
+## Owner override (recorded 23 Nov 2026, ~23:20 IST)
+
+The owner chose to trade **live from 00:00 IST** in gamble mode (`configs/campaign-live.toml`):
+- bold play toward the hourly ~33 % demand, at the highest leverage the exchange allows, on any instrument, with a 120 s hold;
+- the INR 1 / INR 5 caps are replaced by an owner-set floor.
+
+That is the owner's decision, at the owner's own risk, with the owner's own money. It does **not**
+change this engineering verdict. Every NOT TESTED item above stays unverified until the owner's own
+runs pass, and gamble mode skips the calibration and positive-EV gates (P0-3, P0-4).
+
+Facts that hold at main `22fabe5`:
+- Bold play (`target_optimal`) is refused live; only `fixed` stake runs live.
+- Leverage is an owner number capped at the exchange max.
+- The floor is checked against the real wallet before each order.
+
+Steps: [OWNER_START_0000.md](OWNER_START_0000.md). No agent arms live trading.
+
 ## What would change this
 
 1. A model meets the fixed promotion criteria in [CALIBRATION.md](CALIBRATION.md) with positive

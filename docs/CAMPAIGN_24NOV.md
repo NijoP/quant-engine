@@ -162,7 +162,19 @@ reaching INR 50,000 under these limits needs a sustained measured edge that the
 forecast does not have today (see "Known state" below). The schedule records the
 gap. It does not close it.
 
-## The hourly target never controls risk
+## Owner override: live gamble profile
+
+On 23 Nov 2026 the owner chose a live gamble profile from 00:00 IST:
+- bold play toward the schedule, at max leverage, with a 120 s hold;
+- an owner-set floor in place of the INR 1 / INR 5 caps.
+
+It is set up in `configs/campaign-live.toml`, shipped off and on paper, with steps in
+[OWNER_START_0000.md](OWNER_START_0000.md). The engineering verdict stays **NO-GO**
+([LIVE_GO_NO_GO.md](LIVE_GO_NO_GO.md)). The rules below describe the engineering-recommended
+profile (`configs/campaign-24nov.toml`). Under the owner's gamble profile the schedule *does* inform
+stake size, by the owner's choice.
+
+## The hourly target never controls risk (recommended profile)
 
 When the campaign is behind schedule, the controller **only reports** the gap
 and the catch-up rate. It never:

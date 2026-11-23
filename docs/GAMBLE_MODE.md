@@ -4,6 +4,10 @@ Gamble mode is an execution profile only the account owner can turn on. It
 places bets without waiting for the forecast to prove a calibrated edge. It is
 **off by default**. No target, schedule or agent can enable it.
 
+> **Owner override (23 Nov 2026):** the owner chose to run gamble mode live for the 24 Nov campaign
+> via `configs/campaign-live.toml` ([OWNER_START_0000.md](OWNER_START_0000.md)). The engineering
+> verdict is NO-GO ([LIVE_GO_NO_GO.md](LIVE_GO_NO_GO.md)). The note below is the engineering recommendation.
+>
 > **Paper / research profile.** Gamble mode relaxes model authority: it skips the
 > calibration and positive-net-EV gates. It is therefore **not** part of the
 > 24 Nov campaign's live execution path ([CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md)),

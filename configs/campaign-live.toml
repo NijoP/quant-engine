@@ -1,0 +1,21 @@
+# 24 NOV CAMPAIGN - OWNER-SELECTED GAMBLE PROFILE (gamble.toml format; load with
+# QE_GAMBLE_CONFIG=configs/campaign-live.toml qe-desk --profile gamble).
+# See docs/OWNER_START_0000.md and docs/LIVE_GO_NO_GO.md.
+#
+# The owner chose (23 Nov 2026) to run gamble mode on the live path from 00:00 IST.
+# The INR 1 per-trade and INR 5 campaign loss caps of configs/campaign-24nov.toml are
+# replaced by the owner floor below. Engineering verdict: NO-GO. The forecast has no
+# measured edge, and most bets have negative EV after ~13-16 bps of cost.
+#
+# Shipped OFF and on PAPER. Only the owner edits enabled, owner_ack, floor_inr and
+# execution_mode, and only the owner arms (qe-live-check arm). No agent does.
+enabled = false
+# owner_ack = "I ACCEPT: gamble mode has no proven edge and can lose my stake down to the floor"
+# floor_inr = "<owner sets>"  # permanent stop. Required: there is no default
+# leverage = <owner sets>     # whole number; the desk caps it at the exchange max per side and tier
+# stake_inr = "<owner sets>"  # margin per bet (fixed policy). Required
+stake_policy = "fixed"        # "target_optimal" (bold play) is REFUSED live at main 22fabe5 (paper-only)
+execution_mode = "paper"      # owner changes to "live"; it must match QE_EXECUTION_MODE=live
+paper_start_equity_inr = 100.0
+paper_slippage_bps = 2.0
+data_dir = "data/desk-gamble"
