@@ -53,6 +53,14 @@ pub const CALIB_MAX_ECE: f64 = 0.05;
 pub const EXPERIMENT_PROFILE: &str = "experiment-max-leverage";
 pub const EXPERIMENT_BANNER: &str = "PAPER EXPERIMENT - UNGATED, MAX LEVERAGE";
 
+/// Owner-armed gamble profile (configs/gamble.toml, docs/GAMBLE_MODE.md).
+pub const GAMBLE_PROFILE: &str = "gamble";
+pub const GAMBLE_BANNER: &str = "GAMBLE MODE - owner armed, no proven edge";
+/// Marker written when the floor stop fires; startup refuses while it exists.
+pub const GAMBLE_STOP_FILE: &str = "gamble-stopped.json";
+/// Candidates older than this drop off the gamble ranking board.
+pub const GAMBLE_BOARD_MS: i64 = 15_000;
+
 /// Startup guard for the experiment profile: it may only run in paper mode.
 /// Every execution-mode source must say paper (an absent env var means paper);
 /// anything else refuses startup.
@@ -102,6 +110,8 @@ pub struct Settings {
     pub paper_slippage_bps: f64,
     pub growth: RiskPolicy,
     pub protective: RiskPolicy,
+    /// Owner gamble parameters (Some only for the gamble profile).
+    pub gamble: Option<qe_risk::gamble::GambleParams>,
 }
 
 impl Default for Settings {
@@ -119,6 +129,7 @@ impl Default for Settings {
             paper_slippage_bps: 2.0,
             growth: RiskPolicy::growth(),
             protective: RiskPolicy::protective(),
+            gamble: None,
         }
     }
 }
@@ -176,6 +187,8 @@ pub struct Calib {
     pub resolved: VecDeque<(f64, bool)>,
     pub last_sample: HashMap<String, i64>,
     pub dropped: u64,
+    /// Resolved forward samples per (pair, long): the empirical bet win rate.
+    pub by_key: HashMap<(String, bool), qe_risk::gamble::HitCounts>,
 }
 
 impl Calib {
@@ -232,6 +245,10 @@ impl Calib {
                     break;
                 }
             }
+            let k = self.by_key.entry((p.pair.clone(), p.long)).or_default();
+            k.n += 1;
+            k.hits += y as u32;
+            k.sum_p += p.p;
             self.resolved.push_back((p.p, y));
             while self.resolved.len() > 5_000 {
                 self.resolved.pop_front();
@@ -359,6 +376,12 @@ pub struct Desk {
     pub calib_report: qe_research::calibration::CalibrationReport,
     pub calib_report_src: String,
     pub calib_report_err: Option<String>,
+    /// Gamble ranking board: latest estimate per (pair, side).
+    pub gamble_board: HashMap<(String, bool), qe_risk::gamble::BetEstimate>,
+    /// Realised gamble bets per (pair, long).
+    pub gamble_trades: HashMap<(String, bool), qe_risk::gamble::HitCounts>,
+    /// Latest target-probability Monte Carlo (refreshed by the monitor loop).
+    pub gamble_sim: Option<Value>,
 }
 
 pub type WsPrice = (i64, f64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
@@ -507,6 +530,9 @@ impl Settings {
     pub fn is_experiment(&self) -> bool {
         self.profile == EXPERIMENT_PROFILE
     }
+    pub fn is_gamble(&self) -> bool {
+        self.profile == GAMBLE_PROFILE && self.gamble.is_some()
+    }
     /// The two-stage capital plan from these settings.
     pub fn plan(&self) -> CapitalPlan {
         CapitalPlan {
@@ -529,6 +555,8 @@ impl Desk {
         let cap = CapitalController::new(s.plan(), dec(s.paper_start_equity_inr), true, now as u64);
         let policy = if s.is_experiment() && s.execution_mode == "paper" {
             RiskPolicy::experiment_max_leverage()
+        } else if let (true, Some(g)) = (s.is_gamble(), s.gamble.clone()) {
+            RiskPolicy::gamble(g)
         } else {
             s.growth.clone()
         };
@@ -613,6 +641,9 @@ impl Desk {
             calib_report: Default::default(),
             calib_report_src: String::new(),
             calib_report_err: None,
+            gamble_board: HashMap::new(),
+            gamble_trades: HashMap::new(),
+            gamble_sim: None,
         };
         desk.learn = crate::learn::LearnCtx::open(&desk.store.dir);
         if let Some(e) = desk.learn.error.clone() {
@@ -1095,19 +1126,64 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             "label": "estimate, not a fact"}),
     );
 
-    let best = if sides[0].3 >= sides[1].3 { 0 } else { 1 };
+    let gamble = d.gov.policy.is_gamble();
+    let mut gamble_skip: Option<String> = None;
+    let mut gamble_est: Option<qe_risk::gamble::BetEstimate> = None;
+    let mut best = if sides[0].3 >= sides[1].3 { 0 } else { 1 };
+    if gamble {
+        // Rank by the best available estimate of P(win) and payoff after costs.
+        let g = global_counts(&d.calib);
+        let ests: Vec<qe_risk::gamble::BetEstimate> = sides
+            .iter()
+            .map(|(s, f, _, _)| {
+                let long = *s == Side::Long;
+                let key = (pair.to_string(), long);
+                let pw = qe_risk::gamble::win_prob(
+                    f.p_target,
+                    g,
+                    d.calib.by_key.get(&key).copied().unwrap_or_default(),
+                    d.gamble_trades.get(&key).copied().unwrap_or_default(),
+                );
+                qe_risk::gamble::BetEstimate::new(
+                    pair,
+                    long,
+                    now,
+                    f.p_target,
+                    pw,
+                    f.p_neither,
+                    f.e_ret_neither,
+                    tp,
+                    sl,
+                    cost,
+                )
+            })
+            .collect();
+        best = if ests[0].score >= ests[1].score { 0 } else { 1 };
+        let me = ests[best].clone();
+        d.gamble_board
+            .retain(|_, b| now - b.ts_ms <= GAMBLE_BOARD_MS && b.pair != pair);
+        let board: Vec<_> = d.gamble_board.values().cloned().collect();
+        gamble_skip = qe_risk::gamble::skip_reason(&me, &board);
+        d.gamble_board
+            .insert((pair.to_string(), me.long), me.clone());
+        gamble_est = Some(me);
+    }
     let (side, fp, _gross, mut net) = sides[best];
-    let side_auth = if side == Side::Long {
-        auth_long
-    } else {
-        auth_short
-    };
+    if let Some(e) = &gamble_est {
+        net = e.ev_frac;
+    }
+    let side_auth = !gamble
+        && if side == Side::Long {
+            auth_long
+        } else {
+            auth_short
+        };
     // With authority, the registry's recalibrated P(TP first) replaces the raw
     // lattice probability in the EV (P(neither) kept; P(SL) = 1 - P(TP) - P(neither)).
     let p_recal = d
         .calib_report
         .recalibrate(REGISTRY_MODEL, side_target(side), fp.p_target);
-    if side_auth {
+    if side_auth && !gamble {
         if let Some(pt) = p_recal {
             let ps = (1.0 - pt - fp.p_neither).max(0.0);
             net = pt * tp - ps * sl + fp.p_neither * fp.e_ret_neither - cost;
@@ -1173,6 +1249,8 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
         ));
     } else if fx.is_none() {
         reasons.push("USDTINR fx unavailable".into());
+    } else if let Some(why) = gamble_skip.clone() {
+        reasons.push(why);
     } else if !d.cap.entries_allowed() {
         reasons.push(format!(
             "capital stage {:?}: no new entries (checkpoint workflow / complete)",
@@ -1188,10 +1266,10 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             stop_loss: sl_price,
             take_profit: tp_price,
             expected_net_edge: net,
-            p_tp_first: if side_auth {
-                p_recal.unwrap_or(fp.p_target)
-            } else {
-                fp.p_target
+            p_tp_first: match &gamble_est {
+                Some(e) => e.p_win,
+                None if side_auth => p_recal.unwrap_or(fp.p_target),
+                None => fp.p_target,
             },
             calibrated: side_auth,
             data_healthy: data_ok && !gated_regime,
@@ -1240,7 +1318,9 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
         d.opportunities.push_front(opp);
     }
     d.opportunities.truncate(100);
-    let rec = json!({"ts_ms": now, "trace_id": trace, "pair": pair, "side": side, "decision": decision,
+    let mode = if gamble { "gamble" } else { "standard" };
+    let rec = json!({"ts_ms": now, "trace_id": trace, "pair": pair, "side": side, "decision": decision, "mode": mode,
+        "gamble_estimate": gamble_est,
         "reason": reason, "entry": entry, "tp_price": tp_price, "sl_price": sl_price, "ev_net_bps": net * 1e4,
         "approved_order": approved, "instrument": cap, "explanation": explanation});
     d.store.append("decisions", &rec);
@@ -1275,6 +1355,7 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             calibrated: side_auth,
             order: &o,
             model_version: MODEL_ID,
+            gamble,
         });
         match crate::learn::record_decision(d, snap) {
             Ok(()) if crate::live_exec::live_installed() => {
@@ -1300,6 +1381,8 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
                     risk_at_stop: o.risk_at_stop,
                     risk_fraction: d.gov.policy.risk_fraction,
                     created_ms: now,
+                    gamble_floor: d.gov.policy.gamble.as_ref().map(|g| g.floor()),
+                    margin: o.margin_account,
                 };
                 if !crate::live_exec::submit(job) {
                     d.incident(
@@ -1550,7 +1633,17 @@ fn close_trade(d: &mut Desk, idx: usize, pnl: f64, exit_price: f64, reason: &str
     let rec = json!({"id": p.order.trace_id, "pair": p.order.pair, "side": if s > 0.0 {"long"} else {"short"},
         "entry_price": p.avg_entry, "exit_price": exit_price, "qty": p.exited_qty, "gross_pnl": gross,
         "fees": fees, "net_pnl": pnl, "held_s": held, "exit_reason": reason, "closed_ms": now,
-        "leverage": p.order.leverage, "currency": "INR", "paper": true, "equity_after": eq});
+        "leverage": p.order.leverage, "currency": "INR", "paper": true, "equity_after": eq,
+        "notional": p.order.notional_account,
+        "mode": if d.gov.policy.is_gamble() { "gamble" } else { "standard" }});
+    if d.gov.policy.is_gamble() {
+        let k = d
+            .gamble_trades
+            .entry((p.order.pair.clone(), p.order.side == Side::Long))
+            .or_default();
+        k.n += 1;
+        k.hits += (pnl > 0.0) as u32;
+    }
     let msg = format!(
         "paper {} {} closed ({reason}) net INR {pnl:.4} held {held:.1}s",
         rec["side"], p.order.pair
@@ -1566,6 +1659,7 @@ fn close_trade(d: &mut Desk, idx: usize, pnl: f64, exit_price: f64, reason: &str
     d.closed.truncate(200);
     crate::learn::on_closed(d, idx, exit_price, reason, now);
     experiment_stop_check(d);
+    gamble_stop_check(d);
 }
 
 /// Drop closed/rejected positions; a rejected entry frees its governor slot.
@@ -1633,12 +1727,19 @@ pub fn lifecycle_tick(d: &mut Desk) {
             Some(b) => {
                 let (bid, ask) = (b.best_bid().unwrap(), b.best_ask().unwrap());
                 d.positions[idx].mark = micro::mid(bid, ask);
-                if d.gov.policy.is_experiment() && d.positions[idx].pos.liquidation_hit(bid, ask) {
+                if (d.gov.policy.is_experiment() || d.gov.policy.is_gamble())
+                    && d.positions[idx].pos.liquidation_hit(bid, ask)
+                {
                     liquidate(d, idx);
                     continue;
                 }
                 let data_ok = now - b.ts < 3_000;
-                let edge = hold_edge(d, &d.positions[idx], now);
+                // gamble bets are pure brackets: SL / TP / 120 s, no edge exit
+                let edge = if d.gov.policy.is_gamble() {
+                    0.0
+                } else {
+                    hold_edge(d, &d.positions[idx], now)
+                };
                 d.positions[idx]
                     .pos
                     .on_market_tick(bid, ask, edge, data_ok, now as u64)
@@ -1650,6 +1751,7 @@ pub fn lifecycle_tick(d: &mut Desk) {
         }
     }
     sweep(d);
+    gamble_stop_check(d);
     capital_tick(d, now);
     report_tick(d, now);
     crate::learn::resolve(d, now);
@@ -1783,6 +1885,237 @@ fn experiment_stop_check(d: &mut Desk) {
     }
 }
 
+/// Forward-monitor totals for the global recalibration of P(win).
+pub fn global_counts(c: &Calib) -> qe_risk::gamble::HitCounts {
+    qe_risk::gamble::HitCounts {
+        n: c.resolved.len() as u32,
+        hits: c.resolved.iter().filter(|x| x.1).count() as u32,
+        sum_p: c.resolved.iter().map(|x| x.0).sum(),
+    }
+}
+
+/// Smallest margin (INR) a bet needs at the owner leverage over cached,
+/// tradable INR-margined instruments.
+pub fn gamble_min_margin(d: &Desk) -> f64 {
+    let Some(g) = d.gov.policy.gamble.as_ref() else {
+        return 0.0;
+    };
+    let fx = d.fx_usdtinr().unwrap_or(f64::NAN);
+    let m = d
+        .instruments
+        .values()
+        .filter(|(_, i)| i.margin_currency_short_name == TRADE_MARGIN && i.is_tradable())
+        .map(|(_, i)| {
+            let c = capability(i);
+            let lev = (g.leverage as f64)
+                .min(c.max_leverage_long.max(c.max_leverage_short))
+                .max(1.0);
+            c.min_notional * fx / lev
+        })
+        .filter(|x| x.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    if m.is_finite() {
+        m
+    } else {
+        0.0
+    }
+}
+
+/// Gamble floor stop: permanent until the owner re-arms (marker file).
+pub fn gamble_stop_check(d: &mut Desk) {
+    if !d.gov.policy.is_gamble() {
+        return;
+    }
+    let eq = d.cap.equity_f64();
+    let min_margin = if crate::live_exec::gamble_floor_hit() {
+        f64::INFINITY // a live bet hit or would breach the real-balance floor
+    } else {
+        gamble_min_margin(d)
+    };
+    if let Some(why) = d.gov.gamble_floor_check(eq, min_margin, now_ms() as u64) {
+        d.controls.entries_paused = true;
+        let path = d.store.dir.join(GAMBLE_STOP_FILE);
+        let rec = json!({"ts_ms": now_ms(), "reason": why, "equity": eq});
+        if let Err(e) = std::fs::write(&path, rec.to_string()) {
+            d.incident("gamble", format!("floor marker {}: {e}", path.display()));
+        }
+        d.audit(
+            "capital",
+            format!("{GAMBLE_BANNER}: floor stop - {why}; stopped until the owner re-arms"),
+            rec,
+        );
+    }
+}
+
+/// Epoch ms -> ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn iso_utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, sod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // civil-from-days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + (month <= 2) as i64;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        sod / 3600,
+        sod % 3600 / 60,
+        sod % 60
+    )
+}
+
+/// Closed gamble bets: (trades, wins, losses, net P&L INR, per-notional returns).
+fn gamble_closed(d: &Desk) -> (usize, usize, usize, f64, Vec<f64>) {
+    let g: Vec<&Value> = d.closed.iter().filter(|c| c["mode"] == "gamble").collect();
+    let pnl = |c: &Value| c["net_pnl"].as_f64().unwrap_or(0.0);
+    let rets = g
+        .iter()
+        .filter_map(|c| Some(pnl(c) / c["notional"].as_f64().filter(|n| *n > 0.0)?))
+        .collect();
+    (
+        g.len(),
+        g.iter().filter(|c| pnl(c) > 0.0).count(),
+        g.iter().filter(|c| pnl(c) < 0.0).count(),
+        g.iter().map(|c| pnl(c)).sum(),
+        rets,
+    )
+}
+
+/// Target-probability Monte Carlo for the dashboard: P(reach the target before
+/// the deadline) and P(hit the floor) under the owner's stake policy. Outcomes
+/// are bootstrapped from realised gamble bets once >= 10 exist, otherwise the
+/// best fresh candidate's estimated P(win) and payoff after costs.
+pub fn refresh_gamble_sim(d: &mut Desk, now: i64) {
+    let Some(params) = d.gov.policy.gamble.clone() else {
+        return;
+    };
+    let (n, _, _, _, rets) = gamble_closed(d);
+    let best = d
+        .gamble_board
+        .values()
+        .filter(|b| now - b.ts_ms <= GAMBLE_BOARD_MS)
+        .max_by(|a, b| a.score.total_cmp(&b.score))
+        .cloned();
+    let (outcomes, source, cost) = if n >= 10 {
+        let c = best.as_ref().map_or(0.0015, |b| b.cost_frac);
+        (
+            qe_risk::gamble::Outcomes::Empirical(rets),
+            format!("bootstrap of {n} realised gamble bets"),
+            c,
+        )
+    } else if let Some(b) = &best {
+        (
+            qe_risk::gamble::Outcomes::Model {
+                p_win: b.p_win,
+                win: b.win_frac,
+                p_stop: b.p_stop,
+                loss: b.loss_frac,
+                neither: b.neither_frac,
+            },
+            format!(
+                "estimate for the best current bet {} {} (fewer than 10 realised bets)",
+                b.pair,
+                if b.long { "long" } else { "short" }
+            ),
+            b.cost_frac,
+        )
+    } else {
+        d.gamble_sim = Some(json!({"p_target": null, "p_floor": null,
+            "source": "no candidate estimate yet", "computed_ms": now}));
+        return;
+    };
+    let hours = ((d.settings.stage2_deadline_ms - now) as f64 / 3.6e6).max(0.0);
+    let el_h = ((now - d.started_ms) as f64 / 3.6e6).max(1e-9);
+    // one position at a time, each held <= 120 s: measured rate once >= 5 bets
+    let bph = if n >= 5 {
+        (n as f64 / el_h).min(30.0)
+    } else {
+        20.0
+    };
+    let fx = d.fx_usdtinr().unwrap_or(f64::NAN);
+    let min_notional = d
+        .instruments
+        .values()
+        .filter(|(_, i)| i.margin_currency_short_name == TRADE_MARGIN && i.is_tradable())
+        .map(|(_, i)| i.min_notional * fx)
+        .filter(|x| x.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let min_notional = if min_notional.is_finite() {
+        min_notional
+    } else {
+        0.0
+    };
+    let input = qe_risk::gamble::TargetSimInput {
+        equity: d.cap.equity_f64(),
+        target: d.settings.stage1_target_inr,
+        hours_remaining: hours,
+        bets_per_hour: bph,
+        leverage: params.leverage as f64,
+        params,
+        cost_frac: cost,
+        min_notional,
+        max_notional: f64::INFINITY,
+        outcomes,
+        paths: 2_000,
+        seed: 42,
+    };
+    let r = qe_risk::gamble::simulate_target(&input);
+    d.gamble_sim = Some(
+        json!({"p_target": r.p_reach_target, "p_floor": r.p_hit_floor,
+        "p_deadline": r.p_deadline, "median_final_equity": r.median_final_equity,
+        "mean_bets": r.mean_bets, "max_bets": r.max_bets, "paths": r.paths, "seed": 42,
+        "bets_per_hour": bph, "hours_remaining": hours, "ev_per_bet_frac": r.ev_per_bet_frac,
+        "source": source, "computed_ms": now}),
+    );
+}
+
+/// `/api/state.gamble` (docs/DASHBOARD_API.md): null unless gamble mode runs.
+pub fn gamble_json(d: &Desk) -> Value {
+    let Some(g) = d
+        .gov
+        .policy
+        .gamble
+        .as_ref()
+        .filter(|_| d.gov.policy.is_gamble())
+    else {
+        return Value::Null;
+    };
+    let (trades, wins, losses, net, _) = gamble_closed(d);
+    let eq = d.cap.equity_f64();
+    let sim = d.gamble_sim.clone().unwrap_or(Value::Null);
+    let now = now_ms();
+    let mut board: Vec<&qe_risk::gamble::BetEstimate> = d
+        .gamble_board
+        .values()
+        .filter(|b| now - b.ts_ms <= GAMBLE_BOARD_MS)
+        .collect();
+    board.sort_by(|a, b| b.score.total_cmp(&a.score));
+    json!({
+        "enabled": d.gov.gamble_stopped.is_none() && !d.gov.killed,
+        "policy": match g.stake_policy { qe_risk::gamble::StakePolicy::Fixed => "fixed",
+            qe_risk::gamble::StakePolicy::TargetOptimal => "bold_play" },
+        "stake_inr": g.stake_inr.to_string(), "leverage": g.leverage.to_string(),
+        "floor_inr": g.floor_inr.to_string(), "equity_inr": format!("{:.4}", eq),
+        "target_inr": format!("{}", d.settings.stage1_target_inr),
+        "deadline": iso_utc(d.settings.stage2_deadline_ms),
+        "trades": trades, "wins": wins, "losses": losses,
+        "win_rate": if trades > 0 { Some(wins as f64 / trades as f64) } else { None },
+        "net_pnl_inr": format!("{net:.4}"),
+        "distance_to_floor_inr": format!("{:.4}", eq - g.floor()),
+        "p_target": sim["p_target"], "p_floor": sim["p_floor"],
+        "stopped_reason": d.gov.gamble_stopped.clone().or_else(|| d.gov.killed.then(|| "kill switch engaged".to_string())),
+        "paper": !crate::live_exec::live_installed(),
+        "simulation": sim,
+        "candidates": board.iter().take(8).collect::<Vec<_>>(),
+        "ev_note": "Each bet's estimated expected value after costs is shown per candidate; it is usually negative (round trip ~13-16 bps, no measured edge). Gamble mode bets anyway by the owner's choice; the ranking only picks the least-bad bet.",
+    })
+}
+
 pub fn flatten(d: &mut Desk, why: &str) -> usize {
     let now = now_ms() as u64;
     let mut n = 0;
@@ -1823,6 +2156,14 @@ pub fn position_json(pp: &PaperPos, now: i64) -> Value {
 /// Active profile for the dashboard/status: the experiment banner is set only
 /// when the opt-in paper experiment is running.
 pub fn profile_json(d: &Desk) -> Value {
+    if d.gov.policy.is_gamble() {
+        return json!({"name": GAMBLE_PROFILE, "experiment": false, "gamble": true,
+            "banner": GAMBLE_BANNER,
+            "rules": ["owner armed (configs/gamble.toml)", "calibration and net-EV gates skipped",
+                "owner stake / leverage (exchange-capped) / floor", "floor is a permanent stop",
+                "one position, SL + TP, 120 s time exit, kill switch", "no size increase after a loss",
+                "best-ranked bet only (estimated P(win) and payoff after costs)"]});
+    }
     let exp = d.gov.policy.is_experiment();
     json!({"name": d.settings.profile, "experiment": exp,
         "banner": if exp { json!(EXPERIMENT_BANNER) } else { Value::Null },
