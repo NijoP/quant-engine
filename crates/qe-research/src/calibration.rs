@@ -12,8 +12,10 @@
 //! * `uncalibrated` — no OOS observations.
 //! * `calibrating`  — OOS observations exist but at least one gate fails.
 //! * `calibrated`   — n_oos >= [`MIN_OOS`], >= 3 OOS folds, ECE of the
-//!   published (recalibrated) mapping <= [`MAX_ECE`], and positive Brier skill
-//!   against the training-fold climatology.
+//!   published (recalibrated) mapping <= [`MAX_ECE`], Brier skill of that
+//!   mapping against the training-fold climatology >= [`MIN_SKILL`], and skill
+//!   > 0 in at least 2/3 of the OOS folds (walk-forward stability). A model that
+//!   is merely as good as the base rate is *not* calibrated for authority.
 //!
 //! Only `calibrated` grants forecast authority ([`CalibrationReport::grants_authority`]).
 use qe_math::prob::{brier, ece, log_loss};
@@ -21,6 +23,8 @@ use serde::{Deserialize, Serialize};
 
 pub const MIN_OOS: usize = 1_000;
 pub const MAX_ECE: f64 = 0.03;
+/// minimum OOS Brier skill (1 - Brier / Brier_climatology) of the recalibrated mapping
+pub const MIN_SKILL: f64 = 0.01;
 pub const BINS: usize = 10;
 /// pseudo-count shrinking each recalibration bin toward the training base rate
 pub const SHRINK: f64 = 5.0;
@@ -88,6 +92,16 @@ pub struct FoldMetrics {
     pub log_loss_recal: f64,
     pub ece_raw: f64,
     pub ece_recal: f64,
+}
+
+impl FoldMetrics {
+    pub fn skill_recal(&self) -> f64 {
+        if self.brier_clim > 0.0 {
+            1.0 - self.brier_recal / self.brier_clim
+        } else {
+            f64::NAN
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -288,10 +302,17 @@ impl CalibrationEntry {
                 if !(w.ece_recal <= MAX_ECE) {
                     reasons.push(format!("ECE(recal) {:.4} > {MAX_ECE}", w.ece_recal));
                 }
-                if !(w.brier_skill_recal > 0.0) {
+                if !(w.brier_skill_recal >= MIN_SKILL) {
                     reasons.push(format!(
-                        "Brier skill vs climatology {:.5} <= 0 (no information beyond base rate)",
+                        "Brier skill vs climatology {:.5} < {MIN_SKILL} (little or no information beyond base rate)",
                         w.brier_skill_recal
+                    ));
+                }
+                let pos = w.folds.iter().filter(|f| f.skill_recal() > 0.0).count();
+                if 3 * pos < 2 * w.folds.len() {
+                    reasons.push(format!(
+                        "unstable: skill > 0 in only {pos}/{} OOS folds",
+                        w.folds.len()
                     ));
                 }
                 if reasons.is_empty() {
