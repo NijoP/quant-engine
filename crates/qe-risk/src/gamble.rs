@@ -17,6 +17,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+pub mod payoff;
+
 /// Text the owner must copy into `configs/gamble.toml` as `owner_ack`.
 pub const OWNER_ACK: &str =
     "I ACCEPT: gamble mode has no proven edge and can lose my stake down to the floor";
