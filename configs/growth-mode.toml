@@ -1,0 +1,12 @@
+# Growth mode (Stage 1). Hard ceilings: RiskPolicy::clamped() never lets these loosen.
+mode = "Growth"
+risk_fraction = 0.01               # max 1% of current equity at stop per trade
+max_session_loss_fraction = 0.05   # 5% of stage starting equity
+max_drawdown_from_hwm = 0.05
+loss_step_down = 0.5               # risk fraction halves per consecutive loss (no escalation)
+min_expected_net_edge = 0.0
+max_open_positions = 1
+liquidation_buffer = 1.5           # liquidation must be >= 1.5x stop distance away
+exit_lead_ms = 3000                # time exit fires at 117 s so closure completes by 120 s
+entry_ack_timeout_ms = 2000
+exit_ack_timeout_ms = 2000
