@@ -9,6 +9,9 @@
 //! multi-timeframe candles (per candidate, every 2 min) and the system monitor (10 s).
 mod desk;
 mod learn;
+// Real-money executor; the desk loop does not call it yet (see docs/GO_LIVE.md).
+#[allow(dead_code)]
+mod live_exec;
 mod store;
 
 use axum::{
@@ -858,7 +861,7 @@ fn live_status() -> Value {
             "the desk never reads credentials; the owner runs the live_readiness command".into(),
         ),
     );
-    json!({"gate": gate.status(), "desk_live_path": "none: qe-desk holds no private client; live orders refused",
+    json!({"gate": gate.status(), "desk_live_path": "live_exec::LiveExecutor implemented and mock-tested; not yet invoked by the desk loop, so live orders are still refused",
         "owner_command": "cargo run -p qe-coindcx --bin live_readiness"})
 }
 
