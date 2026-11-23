@@ -502,7 +502,9 @@ mod tests {
         assert_eq!(skip_reason(&b, &board), None);
         // a TP that cannot pay the costs is never taken
         let bad = BetEstimate::new("C", true, 0, 0.9, 0.9, 0.0, 0.0, 0.001, 0.001, 0.0015);
-        assert!(skip_reason(&bad, &[bad.clone()]).unwrap().contains("cost"));
+        assert!(skip_reason(&bad, std::slice::from_ref(&bad))
+            .unwrap()
+            .contains("cost"));
         // EV = p W - p_s L + p_n N
         let want = 0.3 * 0.0035 - 0.4 * 0.0048 + 0.3 * -0.0015;
         assert!((a.ev_frac - want).abs() < 1e-12);
