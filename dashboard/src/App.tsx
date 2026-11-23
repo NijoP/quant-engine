@@ -156,7 +156,15 @@ export default function App() {
 function Header({ state, serverNow }: { state: DeskState | null; serverNow: number }) {
   const h = state?.health;
   const rtAge = h && isNum(h.last_rt_ms) ? (serverNow - h.last_rt_ms) / 1000 : null;
+  const exp = state?.profile?.experiment ? state.profile : null;
   return (
+    <>
+    {exp && (
+      <div className="experiment-banner" role="alert" title={exp.rules.join(" · ")}>
+        {exp.banner ?? "PAPER EXPERIMENT - UNGATED, MAX LEVERAGE"}
+        <span className="rules">{exp.rules.join(" · ")}</span>
+      </div>
+    )}
     <header className="header">
       <h1>QUANT-ENGINE desk</h1>
       {state && <span className="badge mode">{state.mode.toUpperCase()}</span>}
@@ -181,6 +189,7 @@ function Header({ state, serverNow }: { state: DeskState | null; serverNow: numb
         </span>
       )}
     </header>
+    </>
   );
 }
 

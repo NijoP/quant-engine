@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/qe-coindcx", "crates/qe-math", "crates/qe-engine", "crates/qe-desk", "crates/qe-risk", "crates/qe-research", "crates/qe-live-check"]
+members = ["crates/qe-coindcx", "crates/qe-math", "crates/qe-engine", "crates/qe-desk", "crates/qe-risk", "crates/qe-research", "crates/qe-learn", "crates/qe-live-check"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,4 +19,5 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

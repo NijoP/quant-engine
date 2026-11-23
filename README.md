@@ -19,6 +19,23 @@ cargo build && cargo test
 `QE_DESK_ADDR` overrides the listen address; `QE_DATA_DIR` overrides the append-only audit
 store (default `data/desk/`, gitignored). API reference: [docs/DASHBOARD_API.md](docs/DASHBOARD_API.md).
 
+### Paper experiment profile (opt-in): PAPER EXPERIMENT - UNGATED, MAX LEVERAGE
+
+```bash
+./target/debug/qe-desk --profile experiment     # or QE_PROFILE=experiment
+```
+
+Loads `configs/experiment-max-leverage.toml`. Startup refuses (exit 2) unless every execution-mode
+source is `paper` (the profile file, `risk-limits.toml`, `QE_EXECUTION_MODE`). The dashboard and
+`/api/state` / `/api/status` (`profile`) show the banner. Rules: calibration gate and
+session-loss / high-water-mark stops off; all paper equity committed as margin at the highest
+exchange-permitted leverage for the side and notional tier (quantity rounded down, below min
+notional rejected); one position at a time, compounded. Kept: raw EV > 0 after fees, spread and
+slippage; model SL/TP; 120 s time stop; fees on every fill; audit trail; liquidation modelling (a
+position whose touch reaches the estimated liquidation price closes as `liquidated`, margin lost).
+Trading stops when equity is below the minimum tradable notional at max leverage. Audit store
+defaults to `data/desk-experiment/`. The default profile is unchanged.
+
 ## Pipeline (what actually runs in `qe-desk`)
 
 DATA → MATHEMATICS → PROBABILISTIC FORECAST → STRATEGY → RISK GOVERNOR → (paper) EXECUTION → FEEDBACK

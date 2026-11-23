@@ -807,6 +807,18 @@ name = "qe-engine"
 version = "0.1.0"
 
 [[package]]
+name = "qe-learn"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "qe-math",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "qe-live-check"
 version = "0.1.0"
 dependencies = [
