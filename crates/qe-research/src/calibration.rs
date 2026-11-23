@@ -446,6 +446,17 @@ mod tests {
     }
 
     #[test]
+    fn committed_report_parses_and_grants_no_authority() {
+        // crates/qe-research/calibration.json is the artefact s2-desk loads
+        let r: CalibrationReport =
+            serde_json::from_str(include_str!("../calibration.json")).unwrap();
+        assert!(!r.entries.is_empty());
+        assert!(r.entries.iter().all(|e| e.status != Status::Calibrated));
+        assert!(!r.grants_authority("desk.fp.v1", "tp_first_long"));
+        assert!(r.recalibrate("desk.fp.v1", "tp_first_long", 0.2).is_none());
+    }
+
+    #[test]
     fn small_sample_is_calibrating() {
         let pts: Vec<Point> = (0..100)
             .map(|i| Point {
