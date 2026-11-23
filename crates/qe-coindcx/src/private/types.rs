@@ -32,6 +32,11 @@ pub const PATH_CANCEL_ALL_FOR_POSITION: &str =
     "/exchange/v1/derivatives/futures/positions/cancel_all_open_orders_for_position";
 
 /// Every status the list-orders endpoint documents.
+pub const PATH_CANCEL_ALL_OPEN_ORDERS: &str =
+    "/exchange/v1/derivatives/futures/positions/cancel_all_open_orders";
+/// Spot wallet balances (read-only use: withdrawal reconciliation).
+pub const PATH_SPOT_BALANCES: &str = "/exchange/v1/users/balances";
+
 pub const ALL_ORDER_STATUSES: &str =
     "open,filled,partially_filled,partially_cancelled,cancelled,rejected,untriggered";
 
@@ -189,6 +194,12 @@ pub struct CreateOrderBody {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CancelAllBody {
+    pub timestamp: i64,
+    pub margin_currency_short_name: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct IdBody {
     pub timestamp: i64,
     pub id: String,
@@ -262,6 +273,17 @@ impl FuturesWallet {
     pub fn total(&self) -> Option<f64> {
         Some(self.balance? + self.locked_balance.unwrap_or(0.0))
     }
+}
+
+/// Docs example: `[{"currency":"BTC","balance":1.167,"locked_balance":2.1}]`.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct SpotBalance {
+    #[serde(default, deserialize_with = "de_str")]
+    pub currency: Option<String>,
+    #[serde(default, deserialize_with = "de_num")]
+    pub balance: Option<f64>,
+    #[serde(default, deserialize_with = "de_num")]
+    pub locked_balance: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
