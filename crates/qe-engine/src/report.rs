@@ -1,5 +1,6 @@
-//! Report generator: 8 PM paper report, 22:30 Stage 1 + withdrawal reconciliation
-//! report, hourly Stage 2 reports and the final report.
+//! Report generator: 8 PM paper report, hourly reports while trading toward the
+//! single INR 50,000 target (17:00 IST 24 Nov) and the final report. The Stage 1
+//! checkpoint report kind is legacy: the 22:30 checkpoint was removed.
 //!
 //! Every report keeps these sections apart and in this order: actual measured P&L,
 //! target-implied requirements, hypothetical scenarios, forecasts, uncalibrated

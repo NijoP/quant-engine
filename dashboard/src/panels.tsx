@@ -465,14 +465,14 @@ export function TargetPanel({ state }: { state: DeskState }) {
   return (
     <section className="panel">
       <h2>
-        Capital & target — stage {t.stage} · {a.policy.tier} mode {a.paper !== false && <span className="badge mode">PAPER EQUITY</span>}
+        Capital & target — single target {money(t.target_equity)} by {new Date(t.deadline_ms).toLocaleString()} (from actual equity) · {t.stage === 0 ? "stage 0 paper" : "trading stage"} · {a.policy.tier} mode {a.paper !== false && <span className="badge mode">PAPER EQUITY</span>}
       </h2>
       <div className="kv cols">
         <span>start equity</span><b>{money(t.start_equity)}</b>
         <span>actual equity</span><b>{money(a.equity)}</b>
         <span>available</span><b>{money(a.available)}</b>
         <span>used margin</span><b>{money(a.used_margin)}</b>
-        <span>stage target</span><b>{money(t.target_equity)}</b>
+        <span>target (single)</span><b>{money(t.target_equity)}</b>
         <span>remaining</span><b>{money(t.target_equity - a.equity)}</b>
         <span>growth required</span><b>{num(t.growth_required, 2)}×</b>
         <span>hours remaining</span><b>{num(t.hours_remaining, 2)}</b>

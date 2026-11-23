@@ -165,6 +165,11 @@ function Header({ state, serverNow }: { state: DeskState | null; serverNow: numb
         <span className="rules">{exp.rules.join(" · ")}</span>
       </div>
     )}
+    {state && (
+      <div className={"experiment-banner"} role="status" style={{ background: state.live_orders_enabled ? "#b91c1c" : "#1d4ed8" }}>
+        {state.live_orders_enabled ? "LIVE — real orders enabled by the owner" : "PAPER — simulated orders only; paper P&L is not real equity"}
+      </div>
+    )}
     <header className="header">
       <h1>QUANT-ENGINE desk</h1>
       {state && <span className="badge mode">{state.mode.toUpperCase()}</span>}

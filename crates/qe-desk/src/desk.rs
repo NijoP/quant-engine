@@ -111,9 +111,9 @@ impl Default for Settings {
             profile: "standard".into(),
             paper_start_equity_inr: 100.0,
             stage0_end_ms: qe_engine::capital::STAGE0_END_MS as i64,
-            stage1_target_inr: 3_000.0,
-            stage1_checkpoint_ms: qe_engine::capital::STAGE1_CHECKPOINT_MS as i64,
-            withdrawal_inr: 2_000.0,
+            stage1_target_inr: 50_000.0,
+            stage1_checkpoint_ms: qe_engine::capital::STAGE2_DEADLINE_MS as i64,
+            withdrawal_inr: 0.0,
             stage2_target_inr: 50_000.0,
             stage2_deadline_ms: qe_engine::capital::STAGE2_DEADLINE_MS as i64,
             paper_slippage_bps: 2.0,
@@ -515,7 +515,7 @@ impl Settings {
             stage1_target_inr: dec(self.stage1_target_inr),
             stage1_checkpoint_ms: self.stage1_checkpoint_ms as u64,
             withdrawal_inr: dec(self.withdrawal_inr),
-            stage2_expected_start_inr: dec(1_000.0),
+            stage2_expected_start_inr: dec(0.0),
             stage2_target_inr: dec(self.stage2_target_inr),
             stage2_deadline_ms: self.stage2_deadline_ms as u64,
         }
@@ -1968,12 +1968,7 @@ pub fn coverage_json(d: &Desk) -> Value {
     let elig = |m: &str| {
         d.instruments
             .iter()
-            .filter(|(k, (_, i))| {
-                k.ends_with(&format!("|{m}")) && {
-                    let c = capability(i);
-                    c.active && !c.exit_only
-                }
-            })
+            .filter(|(k, (_, i))| k.ends_with(&format!("|{m}")) && i.is_tradable())
             .count()
     };
     let now = now_ms();
@@ -1986,6 +1981,9 @@ pub fn coverage_json(d: &Desk) -> Value {
                  "subscribed_prices_1hz": d.fut_usdt.len()},
         "inr_futures": {"discovered": d.fut_inr.len(), "eligible": elig("INR"),
                  "metadata_rejected": d.meta_fail.keys().filter(|k| k.ends_with("|INR")).count(),
+                 "metadata_cached": d.instruments.keys().filter(|k| k.ends_with("|INR")).count(),
+                 "ineligible_null_leverage": d.instruments.iter()
+                     .filter(|(k, (_, i))| k.ends_with("|INR") && !i.leverage_known()).count(),
                  "subscribed_prices_1hz": d.fut_inr.len()},
         "order_books_subscribed": d.ws_book_ms.len(), "order_books_fresh_10s": books_live,
         "trade_streams_subscribed": d.trades.len(),
@@ -2115,8 +2113,8 @@ pub fn live_json() -> Value {
         "note": "only the account owner arms live, with qe-live-check, after the validation workflows pass"})
 }
 
-/// Scheduled reports: 20:00 paper, Stage 1 checkpoint once reconciled, hourly in
-/// Stage 2, final at the final checkpoint (then the plan completes). Written as
+/// Scheduled reports: 20:00 paper, hourly while trading toward the single INR 50,000
+/// target, final at the 17:00 IST final checkpoint (then the plan completes). Written as
 /// markdown under `<data dir>/reports/`.
 pub fn report_tick(d: &mut Desk, now: i64) {
     use qe_engine::report::ReportKind as K;
@@ -2135,7 +2133,7 @@ pub fn report_tick(d: &mut Desk, now: i64) {
     {
         due.push((K::Stage1Checkpoint, "stage1-checkpoint".to_string()));
     }
-    if d.cap.stage == Stage::Stage2Protective {
+    if matches!(d.cap.stage, Stage::Stage1Growth | Stage::Stage2Protective) {
         let h = (now - d.cap.stage_started_ms as i64) / 3_600_000;
         if h >= 1 && !d.reports_done.contains(&format!("stage2-h{h}")) {
             due.push((K::Stage2Hourly, format!("stage2-h{h}")));

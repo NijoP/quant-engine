@@ -945,11 +945,8 @@ fn eligibility(d: &Desk, pair: &str, m: &str) -> (Option<bool>, String) {
         }
         return (None, "metadata not fetched yet".into());
     };
-    if !i.is_tradable() {
-        return (
-            Some(false),
-            format!("status {} exit_only {}", i.status, i.exit_only),
-        );
+    if let Some(why) = i.ineligibility_reason() {
+        return (Some(false), why);
     }
     if m != TRADE_MARGIN {
         return (
@@ -1314,45 +1311,6 @@ async fn c_kill(a: AxState<App>) -> Json<Value> {
     let n = flatten(&mut d, "kill switch");
     ctl(&mut d, r.ok, format!("{}; {n} exit action(s)", r.message))
 }
-/// Record a withdrawal at the stage-1 checkpoint only with explicit user
-/// confirmation and the reconciled remaining balance. Paper: this moves the paper
-/// ledger to stage 2; it never touches a CoinDCX wallet.
-async fn c_withdrawal(a: AxState<App>, b: Bytes) -> Json<Value> {
-    let v = body(&b);
-    let mut d = a.s.write().await;
-    let (Some(amount), Some(bal)) = (v["amount"].as_f64(), v["confirmed_balance"].as_f64()) else {
-        return ctl(
-            &mut d,
-            false,
-            "body must be {amount, confirmed_balance, user_confirmed}".into(),
-        );
-    };
-    let confirmed = v["user_confirmed"].as_bool().unwrap_or(false);
-    match d.cap.confirm_withdrawal(
-        crate::desk::dec(amount),
-        confirmed,
-        crate::desk::dec(bal),
-        now_ms() as u64,
-    ) {
-        Ok(eq) => {
-            let (paused, killed) = (d.gov.entries_paused, d.gov.killed);
-            let pol = d.settings.protective.clone();
-            let t2 = d.settings.stage2_target_inr;
-            let eq = crate::desk::dec_f64(eq);
-            d.gov = qe_risk::RiskGovernor::new(pol, eq, t2);
-            d.gov.entries_paused = paused;
-            d.gov.killed = killed;
-            d.equity_curve.push((now_ms(), eq));
-            ctl(
-                &mut d,
-                true,
-                format!("withdrawal INR {amount} recorded; stage 2 protective from INR {eq} (paper ledger); entries remain paused until resumed"),
-            )
-        }
-        Err(e) => ctl(&mut d, false, e),
-    }
-}
-
 async fn c_ws_reconnect(a: AxState<App>) -> Json<Value> {
     let r = a.w.reconnect();
     let mut d = a.s.write().await;
@@ -1459,7 +1417,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/control/cancel_entries", post(c_cancel))
         .route("/api/control/flatten", post(c_flatten))
         .route("/api/control/kill", post(c_kill))
-        .route("/api/control/confirm_withdrawal", post(c_withdrawal))
         .route("/api/control/ws_reconnect", post(c_ws_reconnect))
         .route("/ws", get(h_ws))
         .fallback_service(tower_http::services::ServeDir::new(dist))

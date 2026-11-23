@@ -42,7 +42,6 @@ gate (`qe_coindcx::live::LiveGate`) and its checklist.
 | `/api/control/flatten` | emergency flatten all paper positions at market |
 | `/api/control/kill` | kill switch: flatten + disable entries until restart |
 | `/api/control/ws_reconnect` | force the public WebSocket to reconnect (REST fallback covers the gap) |
-| `/api/control/confirm_withdrawal` body `{ "amount": number, "confirmed_balance": number, "user_confirmed": true }` | only at the stage-1 checkpoint: records the user-confirmed withdrawal and reconciled balance, switches the paper ledger to stage 2 / protective policy (never touches a wallet) |
 
 Malformed bodies return `ok: false` with the expected shape in `message`.
 
