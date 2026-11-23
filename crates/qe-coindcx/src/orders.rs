@@ -9,11 +9,10 @@
 //!    stop_loss:{stop_price, order_type:"stop_market"}}
 //!   (docs table: only take_profit_market / stop_market supported; examples differ.)
 //!
-//! Live submission requires ALL of: the `live-orders` cargo feature, an explicit
-//! operator flag, and credentials. Even then `submit` refuses in this build,
-//! because exchange-side behaviour has not been validated. Nothing in the desk
-//! calls these paths.
-use crate::auth::{request_timestamp_ms, Credentials};
+//! These sprint-1 body builders are kept for compatibility; the signed client
+//! that actually sends orders is `crate::private::PrivateClient`, and every
+//! mutation there passes `crate::live::LiveGate::check()` first.
+use crate::auth::request_timestamp_ms;
 use serde::Serialize;
 
 pub const PATH_CREATE_ORDER: &str = "/exchange/v1/derivatives/futures/orders/create";
@@ -115,63 +114,13 @@ pub fn client_order_id(strategy: &str, pair: &str, seq: u64) -> String {
     format!("qe-{h:016x}")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GateError {
-    FeatureNotCompiled,
-    OperatorFlagMissing,
-    CredentialsMissing,
-    NotValidatedInThisBuild,
-}
-
-/// Live-execution gate. Default: everything off.
-#[derive(Debug, Default)]
-pub struct LiveGate {
-    pub operator_flag: bool,
-    pub credentials: Option<Credentials>,
-}
-
-impl LiveGate {
-    pub const COMPILED: bool = cfg!(feature = "live-orders");
-
-    pub fn check(&self) -> Result<(), GateError> {
-        if !Self::COMPILED {
-            return Err(GateError::FeatureNotCompiled);
-        }
-        if !self.operator_flag {
-            return Err(GateError::OperatorFlagMissing);
-        }
-        if self.credentials.is_none() {
-            return Err(GateError::CredentialsMissing);
-        }
-        Ok(())
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.check().is_ok()
-    }
-
-    /// Would submit a signed request. Refuses in every configuration of this build.
-    pub fn submit(&self, _path: &str, _body: &str) -> Result<(), GateError> {
-        self.check()?;
-        Err(GateError::NotValidatedInThisBuild)
-    }
-}
+/// The live gate moved to `crate::live` (owned by the live-execution work);
+/// re-exported here so existing callers keep compiling.
+pub use crate::live::{GateError, LiveGate};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn gate_refuses_by_default() {
-        let g = LiveGate::default();
-        assert!(!g.enabled());
-        assert!(g.submit(PATH_CREATE_ORDER, "{}").is_err());
-        let g2 = LiveGate {
-            operator_flag: true,
-            credentials: Credentials::new("a".into(), "b".into()),
-        };
-        // without the cargo feature the gate still refuses; with it, submit still refuses
-        assert!(g2.submit(PATH_CREATE_ORDER, "{}").is_err());
-    }
     #[test]
     fn deterministic_ids() {
         assert_eq!(
