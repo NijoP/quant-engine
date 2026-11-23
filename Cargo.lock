@@ -738,6 +738,7 @@ dependencies = [
  "axum",
  "qe-coindcx",
  "qe-math",
+ "qe-research",
  "qe-risk",
  "reqwest",
  "serde",

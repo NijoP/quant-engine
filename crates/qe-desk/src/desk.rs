@@ -295,11 +295,97 @@ pub struct Desk {
     /// WS trades per pair, last 300 s (event time), aggressor from the feed
     pub trades: HashMap<String, VecDeque<timeframe::Trade>>,
     pub ws_health: Value,
+    /// s2-calib walk-forward registry: the source of forecast authority
+    pub calib_report: qe_research::calibration::CalibrationReport,
+    pub calib_report_src: String,
+    pub calib_report_err: Option<String>,
 }
 
 pub type WsPrice = (i64, f64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
 
+pub const REGISTRY_MODEL: &str = qe_research::report::MODEL_DESK;
+
+pub fn side_target(side: Side) -> &'static str {
+    match side {
+        Side::Long => "tp_first_long",
+        Side::Short => "tp_first_short",
+    }
+}
+
 impl Desk {
+    /// (Re)load the s2-calib calibration registry. A missing or unreadable file
+    /// leaves every model uncalibrated (no authority), never the reverse.
+    pub fn load_calibration(&mut self) {
+        let path = std::env::var("QE_CALIBRATION_FILE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../qe-research/calibration.json")
+            });
+        self.calib_report_src = path.display().to_string();
+        match qe_research::calibration::CalibrationReport::load(&path) {
+            Ok(r) => {
+                self.calib_report = r;
+                self.calib_report_err = None;
+            }
+            Err(e) => {
+                self.calib_report = Default::default();
+                self.calib_report_err = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Forecast authority for one side: the walk-forward registry must grant it
+    /// AND the live forward monitor must not contradict it (once it has >= 200
+    /// resolved samples, a failing forward check revokes authority).
+    pub fn authority(&self, side: Side) -> bool {
+        let fwd = self.calib.status();
+        let fwd_fail = fwd["n_resolved"].as_u64().unwrap_or(0) as usize >= CALIB_MIN_N
+            && !fwd["calibrated"].as_bool().unwrap_or(false);
+        self.calib_report
+            .grants_authority(REGISTRY_MODEL, side_target(side))
+            && !fwd_fail
+    }
+
+    /// Calibration view served to the dashboard: authority per side from the
+    /// registry, plus the forward monitor's live metrics at the top level.
+    pub fn calibration_json(&self) -> Value {
+        let mut v = self.calib.status();
+        v["forward_calibrated"] = v["calibrated"].clone();
+        let (al, ash) = (self.authority(Side::Long), self.authority(Side::Short));
+        v["calibrated"] = json!(al || ash);
+        v["authority"] = json!({"long": al, "short": ash});
+        let reg: serde_json::Map<String, Value> = [
+            "tp_first_long",
+            "tp_first_short",
+            "sl_first_long",
+            "sl_first_short",
+        ]
+        .iter()
+        .map(|t| {
+            let e = self.calib_report.entry(REGISTRY_MODEL, t);
+            (
+                t.to_string(),
+                json!({"status": self.calib_report.status(REGISTRY_MODEL, t),
+                    "n_oos": e.map(|x| x.n_oos), "reasons": e.map(|x| x.reasons.clone())}),
+            )
+        })
+        .collect();
+        v["registry"] = json!({"source": "qe-research walk-forward registry (s2-calib)", "model": REGISTRY_MODEL,
+            "file": self.calib_report_src, "load_error": self.calib_report_err,
+            "generated_ms": self.calib_report.generated_ms, "targets": reg});
+        let reg_verdict = if al || ash {
+            "registry grants authority"
+        } else {
+            "registry denies authority"
+        };
+        v["verdict"] = json!(format!(
+            "{reg_verdict}; forward monitor: {}",
+            v["verdict"].as_str().unwrap_or("")
+        ));
+        v
+    }
+
     /// True when the WS currentPrices stream delivered within 3 s.
     pub fn ws_prices_fresh(&self) -> bool {
         self.ws_cp_ms.is_some_and(|t| now_ms() - t <= 3_000)
@@ -445,6 +531,9 @@ impl Desk {
             ws_book_ms: HashMap::new(),
             trades: HashMap::new(),
             ws_health: Value::Null,
+            calib_report: Default::default(),
+            calib_report_src: String::new(),
+            calib_report_err: None,
         }
     }
 
@@ -855,7 +944,9 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     let mu = LAMBDA_MOM * m60 + GAMMA_OBI * obi * sig;
     let s120 = sig * HORIZON_S.sqrt();
     let (tp, sl) = (K_TARGET * s120, K_STOP * s120);
-    let calibrated = d.calib.calibrated();
+    let auth_long = d.authority(Side::Long);
+    let auth_short = d.authority(Side::Short);
+    let calibrated = auth_long || auth_short;
     let horizons: Vec<Value> = HORIZONS
         .iter()
         .map(|&hs| {
@@ -911,7 +1002,23 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     );
 
     let best = if sides[0].3 >= sides[1].3 { 0 } else { 1 };
-    let (side, fp, _gross, net) = sides[best];
+    let (side, fp, _gross, mut net) = sides[best];
+    let side_auth = if side == Side::Long {
+        auth_long
+    } else {
+        auth_short
+    };
+    // With authority, the registry's recalibrated P(TP first) replaces the raw
+    // lattice probability in the EV (P(neither) kept; P(SL) = 1 - P(TP) - P(neither)).
+    let p_recal = d
+        .calib_report
+        .recalibrate(REGISTRY_MODEL, side_target(side), fp.p_target);
+    if side_auth {
+        if let Some(pt) = p_recal {
+            let ps = (1.0 - pt - fp.p_neither).max(0.0);
+            net = pt * tp - ps * sl + fp.p_neither * fp.e_ret_neither - cost;
+        }
+    }
     let entry = if side == Side::Long { ask } else { bid };
     let dir = if side == Side::Long { 1.0 } else { -1.0 };
     let inc = cap.as_ref().map_or(0.0, |c| c.price_increment);
@@ -938,6 +1045,8 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             "p_neither": f.p_neither, "e_t_target": f.e_t_target, "e_t_stop": f.e_t_stop,
             "e_ret_neither": f.e_ret_neither, "ev_gross": g, "ev_net": n})).collect::<Vec<_>>(),
         "regime": reg, "data_ok": data_ok, "calibrated": calibrated,
+        "authority": {"long": auth_long, "short": auth_short, "source": "qe-research registry + forward monitor",
+            "registry_model": REGISTRY_MODEL, "p_target_recalibrated": p_recal, "ev_net_used": net},
         "trade_flow_ws": tflow,
         "book_source": if d.ws_book_fresh(pair, 5_000) { "ws (sequence-checked Live book)" } else { "rest depth 20" },
     });
@@ -975,8 +1084,12 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             stop_loss: sl_price,
             take_profit: tp_price,
             expected_net_edge: net,
-            p_tp_first: fp.p_target,
-            calibrated,
+            p_tp_first: if side_auth {
+                p_recal.unwrap_or(fp.p_target)
+            } else {
+                fp.p_target
+            },
+            calibrated: side_auth,
             data_healthy: data_ok && !gated_regime,
             cost_per_unit: cost * entry,
             fx_to_account: fx.unwrap(),
@@ -1019,7 +1132,7 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             "leverage": if is_best { lev } else { 0.0 },
             "decision": if is_best { decision } else { "rejected" },
             "reason": if is_best { reason.clone() } else { "lower net EV than the opposite side".to_string() },
-            "calibrated": calibrated, "ts_ms": now, "trace_id": trace});
+            "calibrated": if *s == Side::Long { auth_long } else { auth_short }, "ts_ms": now, "trace_id": trace});
         d.opportunities.push_front(opp);
     }
     d.opportunities.truncate(100);
@@ -1688,6 +1801,26 @@ mod tests {
         assert!(n > 0);
         assert!(d.positions.is_empty());
         assert_eq!(d.closed[0]["exit_reason"], "flatten");
+    }
+
+    #[test]
+    fn no_registry_means_no_authority() {
+        let mut d = Desk::new(Settings::default());
+        std::env::set_var("QE_CALIBRATION_FILE", "/nonexistent/calibration.json");
+        d.load_calibration();
+        std::env::remove_var("QE_CALIBRATION_FILE");
+        assert!(d.calib_report_err.is_some());
+        assert!(!d.authority(Side::Long) && !d.authority(Side::Short));
+        assert_eq!(d.calibration_json()["calibrated"], false);
+    }
+
+    #[test]
+    fn committed_registry_denies_desk_model() {
+        let mut d = Desk::new(Settings::default());
+        d.load_calibration();
+        assert!(d.calib_report_err.is_none(), "{:?}", d.calib_report_err);
+        // s2-calib measured: desk.fp.v1 is not calibrated
+        assert!(!d.authority(Side::Long) && !d.authority(Side::Short));
     }
 
     #[test]

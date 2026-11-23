@@ -591,7 +591,8 @@ async fn monitor_loop(c: PublicClient, s: S) {
         let mut d = s.write().await;
         let now = now_ms();
         refresh_sim(&mut d, now);
-        let st = d.calib.status();
+        d.load_calibration(); // pick up a regenerated registry without restart
+        let st = d.calibration_json();
         let calib_msg = format!(
             "calibration n={} brier={} ece={}: {}",
             st["n_resolved"],
@@ -816,7 +817,7 @@ fn readiness(d: &Desk) -> Value {
         "ALL_INSTRUMENT_SCANNER_READY": fut > 0 && d.scanner.len() * 10 >= fut * 9,
         "MULTI_TIMEFRAME_ENGINE_READY": mtf_full,
         "FORECAST_ENGINE_READY": !d.forecasts.is_empty(),
-        "FORECAST_CALIBRATED": d.calib.calibrated(),
+        "FORECAST_CALIBRATED": d.authority(qe_risk::Side::Long) || d.authority(qe_risk::Side::Short),
         "MATHEMATICAL_DECISION_ENGINE_READY": !d.decisions.is_empty(),
         "RISK_GOVERNOR_READY": gov_seen,
         "PAPER_EXECUTION_READY": d.agents.get("execution_manager").is_some_and(|a| a.status == "ok"),
@@ -840,7 +841,7 @@ fn state_json(d: &Desk) -> Value {
         "closed": d.closed.iter().take(50).collect::<Vec<_>>(),
         "account": account_json(d), "target": target_json(d, now),
         "agents": d.agents.values().collect::<Vec<_>>(), "controls": controls_json(d),
-        "calibration": d.calib.status(), "readiness": readiness(d),
+        "calibration": d.calibration_json(), "readiness": readiness(d),
         "audit": d.audit,
     })
 }
@@ -853,7 +854,7 @@ async fn h_status(a: AxState<App>) -> Json<Value> {
     let d = a.s.read().await;
     Json(json!({"health": health_json(&d), "mode": "paper",
         "live_orders_enabled": false, "live": live_status(),
-        "readiness": readiness(&d), "calibration": d.calib.status(), "controls": controls_json(&d)}))
+        "readiness": readiness(&d), "calibration": d.calibration_json(), "controls": controls_json(&d)}))
 }
 
 fn eligibility(d: &Desk, pair: &str, m: &str) -> (Option<bool>, String) {
@@ -957,7 +958,7 @@ async fn h_forecasts(a: AxState<App>) -> Json<Value> {
     Json(json!(v))
 }
 async fn h_calibration(a: AxState<App>) -> Json<Value> {
-    Json(a.s.read().await.calib.status())
+    Json(a.s.read().await.calibration_json())
 }
 async fn h_decisions(a: AxState<App>) -> Json<Value> {
     Json(json!(a.s.read().await.decisions))
@@ -1275,7 +1276,9 @@ async fn ws_push(mut sock: WebSocket, a: App) {
 async fn main() -> anyhow::Result<()> {
     let addr = std::env::var("QE_DESK_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
     let settings = load_settings();
-    let s: S = Arc::new(RwLock::new(Desk::new(settings)));
+    let mut desk = Desk::new(settings);
+    desk.load_calibration();
+    let s: S = Arc::new(RwLock::new(desk));
     {
         let mut d = s.write().await;
         let st = serde_json::to_value(&d.settings).unwrap_or_default();
@@ -1300,7 +1303,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(book_loop(c.clone(), s.clone()));
     tokio::spawn(position_book_loop(c.clone(), s.clone()));
     tokio::spawn(lifecycle_loop(s.clone()));
-    tokio::spawn(meta_loop(c.clone(), s.clone()));
+    // Metadata gets its own client (own 8 req/s pacing and breaker; the loop makes
+    // 1 req/s): instrument records the exchange returns with null fields fail to
+    // decode, and those must not open the market-data client's circuit breaker.
+    tokio::spawn(meta_loop(PublicClient::new(), s.clone()));
     tokio::spawn(mtf_loop(c.clone(), s.clone()));
     tokio::spawn(monitor_loop(c.clone(), s.clone()));
     let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/dist");

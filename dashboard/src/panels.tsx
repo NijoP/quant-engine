@@ -126,7 +126,23 @@ export function ReadinessPanel({ state }: { state: DeskState }) {
             <span>ECE (10 bins)</span><b>{num(cal.ece_10bin, 4)}</b>
             <span>mean p / hit rate</span><b>{pct(cal.mean_p, 1)} / {pct(cal.hit_rate, 1)}</b>
           </div>
-          <div className="muted">{cal.verdict} · criteria: {cal.criteria} · {cal.method}</div>
+          <div className="muted">{cal.verdict} · forward-monitor criteria: {cal.criteria} · {cal.method}</div>
+          {(() => {
+            const reg = (cal as unknown as { registry?: { model: string; generated_ms: number | null; load_error: string | null;
+              targets: Record<string, { status: string; n_oos: number | null; reasons: string[] | null }> } }).registry;
+            if (!reg) return null;
+            return (
+              <div className="kv cols">
+                <span>registry model</span><b>{reg.model}{reg.load_error ? ` (load error: ${reg.load_error})` : ""}</b>
+                {Object.entries(reg.targets).map(([t, e]) => (
+                  <Fragment key={t}>
+                    <span>{t}</span>
+                    <b className={e.status === "calibrated" ? "pos" : "neg"}>{e.status} · n_oos {e.n_oos ?? "—"} · {(e.reasons ?? []).join("; ")}</b>
+                  </Fragment>
+                ))}
+              </div>
+            );
+          })()}
         </>
       )}
       <h2>
