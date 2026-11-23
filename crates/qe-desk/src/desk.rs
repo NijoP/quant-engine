@@ -335,6 +335,7 @@ pub struct Desk {
     pub latency: qe_engine::paper::LatencyStats,
     pub risk_events: VecDeque<String>,
     pub reports_done: HashSet<String>,
+    pub learn: crate::learn::LearnCtx,
     pub positions: Vec<PaperPos>,
     pub closed: VecDeque<Value>,
     pub fills: VecDeque<Value>,
@@ -548,7 +549,7 @@ impl Desk {
             })
             .collect();
         let start = s.paper_start_equity_inr;
-        Self {
+        let mut desk = Self {
             settings,
             started_ms: now,
             last_universe_ms: None,
@@ -592,6 +593,7 @@ impl Desk {
             latency: Default::default(),
             risk_events: VecDeque::new(),
             reports_done: HashSet::new(),
+            learn: crate::learn::LearnCtx::default(),
             positions: vec![],
             closed: VecDeque::new(),
             fills: VecDeque::new(),
@@ -611,7 +613,12 @@ impl Desk {
             calib_report: Default::default(),
             calib_report_src: String::new(),
             calib_report_err: None,
+        };
+        desk.learn = crate::learn::LearnCtx::open(&desk.store.dir);
+        if let Some(e) = desk.learn.error.clone() {
+            desk.incident("learning", e);
         }
+        desk
     }
 
     pub fn audit(&mut self, kind: &str, msg: String, data: Value) {
@@ -1230,7 +1237,42 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     d.decisions.push_front(rec.clone());
     d.decisions.truncate(300);
     if let Some(o) = approved {
-        open_paper(d, o, cap.unwrap(), fx.unwrap(), mid, rec);
+        let c = cap.unwrap();
+        let p_sl = fp.p_stop;
+        let snap = crate::learn::snapshot(&crate::learn::DecisionCtx {
+            trace: &trace,
+            pair,
+            ts_ms: now,
+            side,
+            mu: if side == Side::Long { mu } else { -mu },
+            sigma_1s: sig,
+            obi,
+            spread_bps,
+            book_age_ms: book_age,
+            data_ok,
+            regimes: &reg,
+            p_tp: if side_auth {
+                p_recal.unwrap_or(fp.p_target)
+            } else {
+                fp.p_target
+            },
+            p_sl,
+            tp_frac: tp,
+            sl_frac: sl,
+            fee: c.taker_fee,
+            slip,
+            mid,
+            calibrated: side_auth,
+            order: &o,
+            model_version: MODEL_ID,
+        });
+        match crate::learn::record_decision(d, snap) {
+            Ok(()) => open_paper(d, o, c, fx.unwrap(), mid, rec),
+            Err(e) => d.incident(
+                "learning",
+                format!("{trace}: decision snapshot not journaled, entry NOT sent: {e}"),
+            ),
+        }
     }
 }
 
@@ -1481,6 +1523,7 @@ fn close_trade(d: &mut Desk, idx: usize, pnl: f64, exit_price: f64, reason: &str
     d.audit("trade", msg, rec.clone());
     d.closed.push_front(rec);
     d.closed.truncate(200);
+    crate::learn::on_closed(d, idx, exit_price, reason, now);
     experiment_stop_check(d);
 }
 
@@ -1568,6 +1611,7 @@ pub fn lifecycle_tick(d: &mut Desk) {
     sweep(d);
     capital_tick(d, now);
     report_tick(d, now);
+    crate::learn::resolve(d, now);
 }
 
 /// Drive the capital plan: stage transitions and the checkpoint workflow
@@ -2060,10 +2104,15 @@ pub fn simulate_target(d: &Desk, now: i64) -> qe_engine::frequency::SimSummary {
     })
 }
 
-/// Learning-engine view. Filled by the s3-learn integration; until then it says so.
-pub fn learning_json(d: &Desk) -> Value {
-    let _ = d;
-    json!({"status": "not wired", "note": "s3-learn decision snapshots / outcomes / mistake classification not integrated in this build"})
+pub use crate::learn::learning_json;
+
+/// Owner live-readiness / arm status (s3-live). Read-only local state, secret-free;
+/// the desk itself never trades live.
+pub fn live_json() -> Value {
+    let dir = qe_live_check::state::StateDir::from_env();
+    json!({"arm_status": qe_live_check::arming::arm_status(&dir, now_ms()),
+        "desk_execution": "paper only: this desk build holds no private client",
+        "note": "only the account owner arms live, with qe-live-check, after the validation workflows pass"})
 }
 
 /// Scheduled reports: 20:00 paper, Stage 1 checkpoint once reconciled, hourly in

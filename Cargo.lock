@@ -792,6 +792,8 @@ dependencies = [
  "axum",
  "qe-coindcx",
  "qe-engine",
+ "qe-learn",
+ "qe-live-check",
  "qe-math",
  "qe-research",
  "qe-risk",

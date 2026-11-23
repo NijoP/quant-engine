@@ -8,6 +8,7 @@
 //! lifecycle timer (250 ms), instrument metadata (1 s, one instrument per tick),
 //! multi-timeframe candles (per candidate, every 2 min) and the system monitor (10 s).
 mod desk;
+mod learn;
 mod store;
 
 use axum::{
@@ -1095,7 +1096,7 @@ async fn h_plan(a: AxState<App>) -> Json<Value> {
     Json(
         json!({"target": target_json(&d, now), "simulation": simulate_target(&d, now),
         "coverage": coverage_json(&d), "execution": execution_json(&d), "learning": learning_json(&d),
-        "risk_events": d.risk_events, "reports_written": d.reports_done}),
+        "risk_events": d.risk_events, "reports_written": d.reports_done, "live": live_json()}),
     )
 }
 async fn h_agents(a: AxState<App>) -> Json<Value> {
