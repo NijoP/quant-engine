@@ -124,7 +124,9 @@ impl CampaignConfig {
 
     /// `(target/start)^(1/hours)`: the constant hourly multiplier (1.326418...).
     pub fn hourly_multiplier(&self) -> f64 {
-        let m = (self.target / self.start_equity).to_f64().unwrap_or(f64::NAN);
+        let m = (self.target / self.start_equity)
+            .to_f64()
+            .unwrap_or(f64::NAN);
         m.powf(1.0 / self.duration_hours())
     }
 
@@ -138,7 +140,9 @@ impl CampaignConfig {
         if h >= hh {
             return self.target;
         }
-        let m = (self.target / self.start_equity).to_f64().unwrap_or(f64::NAN);
+        let m = (self.target / self.start_equity)
+            .to_f64()
+            .unwrap_or(f64::NAN);
         let s = self.start_equity.to_f64().unwrap_or(f64::NAN);
         Decimal::from_f64(s * m.powf(h / hh)).unwrap_or(self.start_equity)
     }
@@ -301,10 +305,12 @@ impl Campaign {
     /// Restore persisted state. A stopped campaign stays stopped; a corrupt or
     /// foreign (different schedule) state is refused rather than reset silently.
     pub fn restore(json: &str, cfg: &CampaignConfig) -> Result<Self, String> {
-        let c: Campaign =
-            serde_json::from_str(json).map_err(|e| format!("campaign state: {e}"))?;
+        let c: Campaign = serde_json::from_str(json).map_err(|e| format!("campaign state: {e}"))?;
         if &c.cfg != cfg {
-            return Err("persisted campaign has a different schedule/risk profile: owner review required".into());
+            return Err(
+                "persisted campaign has a different schedule/risk profile: owner review required"
+                    .into(),
+            );
         }
         if c.checkpoint_actual.len() != CAMPAIGN_HOURS as usize + 1 {
             return Err("persisted campaign checkpoint table is malformed".into());
@@ -368,7 +374,9 @@ impl Campaign {
         self.event(
             now,
             "campaign_stop",
-            format!("PERMANENT campaign stop: {reason}; owner review required to start a new campaign"),
+            format!(
+                "PERMANENT campaign stop: {reason}; owner review required to start a new campaign"
+            ),
             data,
         );
     }
@@ -586,10 +594,7 @@ impl Campaign {
 
     /// Record a deadline-workflow step (performed by the desk / live executor).
     pub fn record_step(&mut self, now: i64, step: DeadlineStep, ok: bool, detail: String) {
-        let msg = format!(
-            "{step:?}: {} ({detail})",
-            if ok { "ok" } else { "FAILED" }
-        );
+        let msg = format!("{step:?}: {} ({detail})", if ok { "ok" } else { "FAILED" });
         self.event(now, "deadline_step", msg, Value::Null);
         self.deadline_steps.push(StepRecord {
             step,
@@ -620,7 +625,8 @@ impl Campaign {
             flat_source: flat_source.into(),
             result: result.clone(),
         });
-        let msg = format!("campaign final: {result}; verified flat: {verified_flat} ({flat_source})");
+        let msg =
+            format!("campaign final: {result}; verified flat: {verified_flat} ({flat_source})");
         self.event(now, "final", msg, Value::Null);
     }
 
@@ -664,8 +670,7 @@ impl Campaign {
         if now < self.cfg.start_ms {
             return 0;
         }
-        (((now.min(self.cfg.deadline_ms) - self.cfg.start_ms) / HOUR_MS) as u32)
-            .min(CAMPAIGN_HOURS)
+        (((now.min(self.cfg.deadline_ms) - self.cfg.start_ms) / HOUR_MS) as u32).min(CAMPAIGN_HOURS)
     }
 
     /// The `/api/state.campaign` object (docs/DASHBOARD_API.md).
@@ -766,8 +771,8 @@ mod tests {
         9181, 12178, 16153, 21425, 28419, 37696, 50000,
     ];
     const INCREASES: [u32; 22] = [
-        33, 43, 57, 77, 101, 134, 177, 236, 313, 415, 550, 730, 968, 1284, 1704, 2259, 2997,
-        3975, 5272, 6994, 9277, 12304,
+        33, 43, 57, 77, 101, 134, 177, 236, 313, 415, 550, 730, 968, 1284, 1704, 2259, 2997, 3975,
+        5272, 6994, 9277, 12304,
     ];
 
     fn cfg() -> CampaignConfig {
@@ -777,7 +782,13 @@ mod tests {
     fn at(eq: &str, now: i64) -> Campaign {
         let mut c = Campaign::new(cfg(), EquitySource::Paper);
         let e: Decimal = eq.parse().unwrap();
-        c.observe(now, Some(e), EquitySource::Paper, Decimal::ZERO, Decimal::ZERO);
+        c.observe(
+            now,
+            Some(e),
+            EquitySource::Paper,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
         c
     }
 
@@ -804,10 +815,18 @@ mod tests {
     fn all_23_checkpoints_match_the_table() {
         let c = cfg();
         for (h, v) in TABLE.iter().enumerate() {
-            assert_eq!(c.checkpoint_required(h as u32), Decimal::from(*v), "hour {h}");
+            assert_eq!(
+                c.checkpoint_required(h as u32),
+                Decimal::from(*v),
+                "hour {h}"
+            );
         }
         for h in 1..=22usize {
-            assert_eq!(TABLE[h] - TABLE[h - 1], INCREASES[h - 1], "increase hour {h}");
+            assert_eq!(
+                TABLE[h] - TABLE[h - 1],
+                INCREASES[h - 1],
+                "increase hour {h}"
+            );
         }
     }
 
@@ -861,8 +880,14 @@ mod tests {
     fn ist_handling() {
         assert_eq!(iso_ist(CAMPAIGN_START_MS), "2026-11-24T00:00:00+05:30");
         assert_eq!(iso_ist(CAMPAIGN_DEADLINE_MS), "2026-11-24T22:00:00+05:30");
-        assert_eq!(iso_ist(cfg().checkpoint_ms(17)), "2026-11-24T17:00:00+05:30");
-        assert_eq!(iso_ist(CAMPAIGN_START_MS - 1000), "2026-11-23T23:59:59+05:30");
+        assert_eq!(
+            iso_ist(cfg().checkpoint_ms(17)),
+            "2026-11-24T17:00:00+05:30"
+        );
+        assert_eq!(
+            iso_ist(CAMPAIGN_START_MS - 1000),
+            "2026-11-23T23:59:59+05:30"
+        );
         assert_eq!(CAMPAIGN_DEADLINE_MS - CAMPAIGN_START_MS, 22 * HOUR_MS);
         // 2026-11-23T18:30:00Z
         assert_eq!(CAMPAIGN_START_MS / 1000 % 86_400, 18 * 3600 + 1800);
@@ -916,7 +941,13 @@ mod tests {
     #[test]
     fn open_loss_counts_toward_floor() {
         let mut c = at("100", CAMPAIGN_START_MS);
-        c.observe(CAMPAIGN_START_MS + 1, Some(dec!(99)), P, dec!(-1), dec!(-4.2));
+        c.observe(
+            CAMPAIGN_START_MS + 1,
+            Some(dec!(99)),
+            P,
+            dec!(-1),
+            dec!(-4.2),
+        );
         assert!(c.is_stopped(), "marked 94.8 is below the floor");
     }
 
@@ -925,7 +956,9 @@ mod tests {
         let mut c = at("100", CAMPAIGN_START_MS);
         let now = CAMPAIGN_START_MS + 1;
         assert!(c.check_trade(now, &check("0.80", "0.15", "0.05")).is_ok()); // = 1.00
-        let e = c.check_trade(now, &check("0.80", "0.15", "0.06")).unwrap_err();
+        let e = c
+            .check_trade(now, &check("0.80", "0.15", "0.06"))
+            .unwrap_err();
         assert!(e.contains("exceeds campaign budget"), "{e}");
     }
 
@@ -973,9 +1006,13 @@ mod tests {
         assert!(c.check_trade(now, &check("0.4", "0.05", "0.05")).is_ok()); // 0.50
         c.on_trade_closed(now + 1, dec!(-0.5));
         c.observe(now + 2, Some(dec!(99.5)), P, dec!(-0.5), Z);
-        let e = c.check_trade(now + 3, &check("0.6", "0.05", "0.05")).unwrap_err();
+        let e = c
+            .check_trade(now + 3, &check("0.6", "0.05", "0.05"))
+            .unwrap_err();
         assert!(e.contains("no size increase"), "{e}");
-        assert!(c.check_trade(now + 3, &check("0.4", "0.05", "0.05")).is_ok());
+        assert!(c
+            .check_trade(now + 3, &check("0.4", "0.05", "0.05"))
+            .is_ok());
     }
 
     #[test]
@@ -1013,13 +1050,21 @@ mod tests {
         c.tick(t);
         assert!(c.exit_only);
         c.record_step(t, DeadlineStep::StopEntries, true, "entries closed".into());
-        c.record_step(t, DeadlineStep::Flatten, false, "live close path not verified".into());
+        c.record_step(
+            t,
+            DeadlineStep::Flatten,
+            false,
+            "live close path not verified".into(),
+        );
         c.finalize(t, false, "live close path not verified: owner alerted");
         let f = c.final_record.clone().unwrap();
         assert!(!f.verified_flat);
         assert_eq!(f.result, "target not reached");
         c.finalize(t + 1, true, "ignored");
-        assert!(!c.final_record.unwrap().verified_flat, "final record is written once");
+        assert!(
+            !c.final_record.unwrap().verified_flat,
+            "final record is written once"
+        );
     }
 
     #[test]
@@ -1032,7 +1077,10 @@ mod tests {
         assert_eq!(r.checkpoint_actual[0], Some(dec!(100)));
         let mut other = cfg();
         other.max_loss_per_trade = dec!(10);
-        assert!(Campaign::restore(&s, &other).is_err(), "changed limits need owner review");
+        assert!(
+            Campaign::restore(&s, &other).is_err(),
+            "changed limits need owner review"
+        );
         assert!(Campaign::restore("{not json", &cfg()).is_err());
     }
 

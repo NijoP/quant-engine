@@ -1,5 +1,5 @@
 //! Report generator: 8 PM paper report, hourly reports while trading toward the
-//! single INR 50,000 target (17:00 IST 24 Nov) and the final report. The Stage 1
+//! single INR 50,000 target (22:00 IST 24 Nov) and the final report. The Stage 1
 //! checkpoint report kind is legacy: the 22:30 checkpoint was removed.
 //!
 //! Every report keeps these sections apart and in this order: actual measured P&L,
@@ -38,7 +38,7 @@ impl ReportKind {
                 "Stage 1 checkpoint and withdrawal reconciliation report (22:30 IST)"
             }
             Self::Stage2Hourly => "Stage 2 hourly report",
-            Self::Final => "Final trading and learning report (17:00 IST 24 Nov)",
+            Self::Final => "Final trading and learning report (22:00 IST 24 Nov)",
         }
     }
     pub fn slug(self) -> &'static str {

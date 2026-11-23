@@ -1117,6 +1117,7 @@ fn state_json(d: &Desk) -> Value {
         "agents": d.agents.values().collect::<Vec<_>>(), "controls": controls_json(d),
         "calibration": d.calibration_json(), "readiness": readiness(d),
         "gamble": gamble_json(d),
+        "campaign": campaign_json(d, now),
         "audit": d.audit,
     })
 }

@@ -1,7 +1,7 @@
 //! Single-target capital plan and checkpoint workflow. Money is `Decimal`.
 //!
 //! Stage 0 (paper) until 20:00 IST 23 Nov 2026 -> one trading stage from the actual
-//! equity to the single target of INR 50,000 by 17:00 IST 24 Nov 2026 -> final
+//! equity to the single target of INR 50,000 by 22:00 IST 24 Nov 2026 -> final
 //! checkpoint (stop entries, flatten, cancel entry orders, verify flat, query balance,
 //! reconcile, final reports) -> complete. The former 22:30 IST Stage 1 target
 //! (INR 3,000) and its INR 2,000 withdrawal checkpoint were removed by the owner on
@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 
 /// 2026-11-23 20:00 IST.
 pub const STAGE0_END_MS: u64 = 1_795_444_200_000;
-/// 2026-11-24 17:00 IST: the single target deadline and final checkpoint.
-pub const STAGE2_DEADLINE_MS: u64 = 1_795_519_800_000;
+/// 2026-11-24 22:00 IST: the campaign deadline and final checkpoint (was 22:00 IST
+/// before the 24 Nov campaign spec; see `campaign::CAMPAIGN_DEADLINE_MS`).
+pub const STAGE2_DEADLINE_MS: u64 = 1_795_537_800_000;
 /// The trading stage ends at the final deadline (no 22:30 IST checkpoint any more).
 pub const STAGE1_CHECKPOINT_MS: u64 = STAGE2_DEADLINE_MS;
 /// The single capital target (INR).
@@ -339,19 +340,19 @@ impl CapitalController {
         let before = self.history.len();
         match self.stage {
             Stage::Stage0Paper if now_ms >= self.plan.stage1_checkpoint_ms => {
-                self.begin_checkpoint(CheckpointKind::Final, now_ms, "17:00 IST final checkpoint")
+                self.begin_checkpoint(CheckpointKind::Final, now_ms, "22:00 IST final checkpoint")
             }
             Stage::Stage0Paper if now_ms >= self.plan.stage0_end_ms => self.transition(
                 Stage::Stage1Growth,
                 now_ms,
                 if self.paper {
-                    "20:00 IST: trading toward INR 50,000 by 17:00 IST 24 Nov (PAPER: live not armed)"
+                    "20:00 IST: trading toward INR 50,000 by 22:00 IST 24 Nov (PAPER: live not armed)"
                 } else {
-                    "20:00 IST: trading toward INR 50,000 by 17:00 IST 24 Nov"
+                    "20:00 IST: trading toward INR 50,000 by 22:00 IST 24 Nov"
                 },
             ),
             Stage::Stage1Growth if now_ms >= self.plan.stage1_checkpoint_ms => {
-                self.begin_checkpoint(CheckpointKind::Final, now_ms, "17:00 IST final checkpoint")
+                self.begin_checkpoint(CheckpointKind::Final, now_ms, "22:00 IST final checkpoint")
             }
             Stage::Stage1Growth if self.equity >= self.plan.stage1_target_inr => self
                 .begin_checkpoint(
@@ -360,7 +361,7 @@ impl CapitalController {
                     "INR 50,000 target reached on actual equity: final checkpoint",
                 ),
             Stage::Stage2Protective if now_ms >= self.plan.stage2_deadline_ms => {
-                self.begin_checkpoint(CheckpointKind::Final, now_ms, "17:00 IST final checkpoint")
+                self.begin_checkpoint(CheckpointKind::Final, now_ms, "22:00 IST final checkpoint")
             }
             Stage::Stage2Protective if self.equity >= self.plan.stage2_target_inr => self
                 .begin_checkpoint(
@@ -571,7 +572,11 @@ mod tests {
 
     #[test]
     fn plan_times_are_ist() {
-        assert_eq!(STAGE2_DEADLINE_MS - STAGE0_END_MS, 75_600_000); // 21 h
+        assert_eq!(STAGE2_DEADLINE_MS - STAGE0_END_MS, 93_600_000); // 26 h
+        assert_eq!(
+            STAGE2_DEADLINE_MS as i64,
+            crate::campaign::CAMPAIGN_DEADLINE_MS
+        );
         assert_eq!(STAGE1_CHECKPOINT_MS, STAGE2_DEADLINE_MS); // no 22:30 checkpoint
                                                               // 2026-11-23 14:30:00 UTC == 20:00 IST
         assert_eq!(STAGE0_END_MS / 1000 % 86_400, 14 * 3600 + 30 * 60);

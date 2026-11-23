@@ -6,6 +6,9 @@
 //! loops in `main.rs`, never while a decision is being computed.
 use crate::store::Store;
 use qe_coindcx::types::{Book, FuturesInstrument, SpotMarketDetail};
+use qe_engine::campaign::{
+    Campaign, CampaignConfig, DeadlineStep, EquitySource, PlannedLoss, TradeCheck,
+};
 use qe_engine::capital::{CapitalController, CapitalPlan, Stage, Step};
 use qe_engine::paper::SimFill;
 use qe_engine::Decimal;
@@ -418,6 +421,9 @@ pub struct Desk {
     /// Latest target-probability Monte Carlo (refreshed by the monitor loop).
     pub gamble_sim: Option<Value>,
     pub maker_stats: MakerStats,
+    /// 24 Nov 2026 campaign controller (benchmark + campaign risk profile).
+    pub campaign: Campaign,
+    pub campaign_error: Option<String>,
 }
 
 pub type WsPrice = (i64, f64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
@@ -681,7 +687,10 @@ impl Desk {
             gamble_trades: HashMap::new(),
             gamble_sim: None,
             maker_stats: MakerStats::default(),
+            campaign: Campaign::new(CampaignConfig::default(), EquitySource::Paper),
+            campaign_error: None,
         };
+        load_campaign(&mut desk);
         desk.learn = crate::learn::LearnCtx::open(&desk.store.dir);
         if let Some(e) = desk.learn.error.clone() {
             desk.incident("learning", e);
@@ -1439,6 +1448,15 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             "capital stage {:?}: no new entries (checkpoint workflow / complete)",
             d.cap.stage
         ));
+    } else if !data_ok {
+        reasons.push(
+            "campaign: stale or incomplete market data (book > 5 s or REST ticker stale)".into(),
+        );
+    } else if let Err(why) = {
+        let open = d.positions.len();
+        d.campaign.entry_gate(now, open)
+    } {
+        reasons.push(format!("campaign: {why}"));
     } else {
         let c = cap.clone().unwrap();
         let proposal = TradeProposal {
@@ -1467,12 +1485,40 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
         };
         match d.gov.evaluate_proposal(&proposal, &c, &acct, now as u64) {
             Decision::Approved(o) => {
-                decision = "taken";
-                reasons.push(format!(
-                    "approved: qty {} lev {}x notional INR {:.2} risk INR {:.4}",
-                    o.qty, o.leverage, o.notional_account, o.risk_at_stop
-                ));
-                approved = Some(o);
+                // Campaign risk profile: planned loss = stop loss + round-trip fees
+                // (actual order type: maker or taker entry) + slippage/spread, INR.
+                let fxv = fx.unwrap();
+                let entry_fee = if maker_entry {
+                    c.maker_fee
+                } else {
+                    c.taker_fee
+                };
+                let fee_frac = entry_fee + c.taker_fee;
+                let tc = TradeCheck {
+                    planned: PlannedLoss {
+                        stop_loss_inr: dec(o.qty * (o.entry_price - o.stop_loss).abs() * fxv),
+                        fees_inr: dec(o.notional_account * fee_frac),
+                        slippage_inr: dec(o.notional_account * (cost - fee_frac).max(0.0)),
+                    },
+                    notional_inr: dec(o.notional_account),
+                    min_notional_inr: dec(c.min_notional * fxv),
+                    stop_price: o.stop_loss,
+                    liquidation_price: o.liquidation_price,
+                    long: o.side == Side::Long,
+                    // desk orders are built with position_margin_type "isolated"
+                    isolated_margin: true,
+                };
+                match d.campaign.check_trade(now, &tc) {
+                    Ok(()) => {
+                        decision = "taken";
+                        reasons.push(format!(
+                            "approved: qty {} lev {}x notional INR {:.2} risk INR {:.4}; campaign planned loss INR {:.4}",
+                            o.qty, o.leverage, o.notional_account, o.risk_at_stop, tc.planned.total()
+                        ));
+                        approved = Some(o);
+                    }
+                    Err(why) => reasons.push(format!("campaign: {why}")),
+                }
             }
             Decision::Rejected { reasons: r, .. } => {
                 // a bet the account cannot size must not outrank affordable ones
@@ -1548,6 +1594,10 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             gamble,
         });
         match crate::learn::record_decision(d, snap) {
+            Ok(()) if crate::live_exec::live_installed() && gamble => d.incident(
+                "live",
+                format!("{trace}: gamble mode is paper/research only, entry NOT sent live"),
+            ),
             Ok(()) if crate::live_exec::live_installed() => {
                 let lev = |x: f64| (x.is_finite() && x >= 1.0).then_some(x as u32);
                 let job = crate::live_exec::LiveJob {
@@ -1840,6 +1890,7 @@ fn close_trade(d: &mut Desk, idx: usize, pnl: f64, exit_price: f64, reason: &str
         (pp.pos.entry_fees + pp.pos.exit_fees) * pp.fx
     };
     d.cap.on_realised(dec(pnl), dec(fees_inr));
+    d.campaign.on_trade_closed(now, dec(pnl));
     let eq = d.cap.equity_f64();
     d.gov.record_realised(pnl, eq, now as u64);
     for a in std::mem::take(&mut d.gov.audit) {
@@ -2107,6 +2158,7 @@ fn maker_tick(d: &mut Desk, idx: usize, now: i64) {
 /// (stop entries, flatten, cancel entry orders, verify flat, query the PAPER
 /// ledger balance, reconcile, prepare the withdrawal for the user).
 pub fn capital_tick(d: &mut Desk, now: i64) {
+    campaign_tick(d, now);
     if let Some(ev) = d.cap.on_clock(now as u64) {
         d.store
             .append("capital", &serde_json::to_value(&ev).unwrap_or_default());
@@ -2875,7 +2927,7 @@ pub fn live_json() -> Value {
 }
 
 /// Scheduled reports: 20:00 paper, hourly while trading toward the single INR 50,000
-/// target, final at the 17:00 IST final checkpoint (then the plan completes). Written as
+/// target, final at the 22:00 IST final checkpoint (then the plan completes). Written as
 /// markdown under `<data dir>/reports/`.
 pub fn report_tick(d: &mut Desk, now: i64) {
     use qe_engine::report::ReportKind as K;
@@ -3328,5 +3380,206 @@ mod tests {
     fn iso_utc_formats_the_deadline() {
         assert_eq!(iso_utc(1_795_519_800_000), "2026-11-24T11:30:00Z");
         assert_eq!(gamble_json(&Desk::new(Settings::default())), Value::Null);
+    }
+}
+
+fn campaign_path(d: &Desk) -> std::path::PathBuf {
+    d.store.dir.join("campaign_state.json")
+}
+
+/// Restart recovery: resume the persisted campaign (a stop stays a stop). An
+/// unreadable or foreign state blocks entries instead of being reset silently.
+pub fn load_campaign(d: &mut Desk) {
+    let cfg = CampaignConfig::default();
+    let src = if crate::live_exec::live_installed() {
+        EquitySource::LiveExchange
+    } else {
+        EquitySource::Paper
+    };
+    d.campaign = Campaign::new(cfg.clone(), src);
+    match std::fs::read_to_string(campaign_path(d)) {
+        Ok(txt) => match Campaign::restore(&txt, &cfg) {
+            Ok(c) => d.campaign = c,
+            Err(e) => {
+                d.campaign
+                    .owner_stop(now_ms(), &format!("state not restorable ({e})"));
+                d.campaign_error = Some(e);
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            d.campaign
+                .owner_stop(now_ms(), &format!("state unreadable ({e})"));
+            d.campaign_error = Some(e.to_string());
+        }
+    }
+}
+
+/// Feed the campaign the current equity, run the 22:00 IST deadline workflow,
+/// audit every campaign event and persist the state.
+pub fn campaign_tick(d: &mut Desk, now: i64) {
+    let live = crate::live_exec::live_installed();
+    // Live: the paper ledger is never real capital. No verified exchange balance
+    // is wired into this build, so live equity is reported as unknown (null) and
+    // the campaign gate refuses entries.
+    let (eq, src) = if live {
+        (None, EquitySource::LiveExchange)
+    } else {
+        (Some(d.cap.equity), EquitySource::Paper)
+    };
+    let realised = d.cap.equity - d.campaign.cfg.start_equity;
+    let unreal = dec(d.unrealized());
+    d.campaign.observe(now, eq, src, realised, unreal);
+    if d.campaign.is_stopped() && !d.controls.entries_paused {
+        let _ = d.gov.pause_entries(true, now as u64);
+        d.controls.entries_paused = true;
+    }
+    d.campaign.tick(now);
+    if d.campaign.expired(now) && d.campaign.final_record.is_none() {
+        if d.campaign.deadline_steps.is_empty() {
+            let _ = d.gov.pause_entries(true, now as u64);
+            d.controls.entries_paused = true;
+            d.campaign.record_step(
+                now,
+                DeadlineStep::StopEntries,
+                true,
+                "entries paused, exit-only".into(),
+            );
+            let cancel = if live {
+                "live: owner must cancel resting entry orders (not verified by this build)"
+            } else {
+                "paper: no resting entry orders"
+            };
+            d.campaign
+                .record_step(now, DeadlineStep::CancelEntryOrders, !live, cancel.into());
+            let n = flatten(d, "campaign deadline 22:00 IST");
+            let fl = if live {
+                "live close path NOT verified: owner alerted, flatten via the validated owner procedure"
+                    .to_string()
+            } else {
+                format!("paper: {n} exit action(s)")
+            };
+            d.campaign
+                .record_step(now, DeadlineStep::Flatten, !live, fl);
+            if live {
+                d.incident(
+                    "campaign",
+                    "22:00 IST deadline: live close path not verified; entries stopped, OWNER must flatten and reconcile".into(),
+                );
+            }
+        }
+        if live {
+            d.campaign.record_step(
+                now,
+                DeadlineStep::VerifyFlat,
+                false,
+                "no exchange reconciliation in this build".into(),
+            );
+            d.campaign.finalize(
+                now,
+                false,
+                "live: exchange reconciliation not performed; account NOT verified flat",
+            );
+        } else if d.positions.is_empty() {
+            d.campaign.record_step(
+                now,
+                DeadlineStep::ReconcilePositions,
+                true,
+                "paper ledger: 0 open positions".into(),
+            );
+            d.campaign.record_step(
+                now,
+                DeadlineStep::ReconcileProtectiveOrders,
+                true,
+                "paper: protective orders close with the position".into(),
+            );
+            d.campaign.record_step(
+                now,
+                DeadlineStep::VerifyFlat,
+                true,
+                "paper ledger flat".into(),
+            );
+            let realised = d.cap.equity - d.campaign.cfg.start_equity;
+            d.campaign.observe(
+                now,
+                Some(d.cap.equity),
+                EquitySource::Paper,
+                realised,
+                Decimal::ZERO,
+            );
+            d.campaign
+                .finalize(now, true, "paper ledger (not an exchange account)");
+            d.campaign.record_step(
+                now,
+                DeadlineStep::RecordFinal,
+                true,
+                "final paper equity recorded".into(),
+            );
+        }
+    }
+    let events = d.campaign.drain_events();
+    if !events.is_empty() {
+        for e in &events {
+            d.store
+                .append("campaign", &serde_json::to_value(e).unwrap_or_default());
+            d.audit("campaign", e.message.clone(), e.data.clone());
+        }
+        persist_campaign(d);
+    }
+}
+
+fn persist_campaign(d: &mut Desk) {
+    let Ok(txt) = serde_json::to_string(&d.campaign) else {
+        return;
+    };
+    let p = campaign_path(d);
+    let tmp = p.with_extension("json.tmp");
+    let r = std::fs::write(&tmp, txt).and_then(|_| std::fs::rename(&tmp, &p));
+    if let Err(e) = r {
+        d.campaign_error = Some(format!("campaign state not persisted: {e}"));
+    }
+}
+
+/// `/api/state.campaign` (docs/DASHBOARD_API.md).
+pub fn campaign_json(d: &Desk, now: i64) -> Value {
+    let open = d
+        .positions
+        .iter()
+        .find(|p| p.pos.filled_qty > 0.0)
+        .map_or(Value::Null, |p| {
+            let s = if p.pos.order.side == Side::Long {
+                1.0
+            } else {
+                -1.0
+            };
+            let u = (p.mark - p.pos.avg_entry) * (p.pos.filled_qty - p.pos.exited_qty) * s * p.fx;
+            json!({"pair": p.pos.order.pair, "side": if s > 0.0 {"long"} else {"short"},
+                   "held_secs": p.pos.age_ms(now as u64).unwrap_or(0) as f64 / 1000.0,
+                   "unrealised_inr": format!("{u:.2}")})
+        });
+    let note = match d.campaign.equity_source {
+        EquitySource::Paper => "PAPER ledger in INR (simulated, not real capital); USDT P&L converted at the CoinDCX USDTINR spot mid",
+        EquitySource::LiveExchange => "live: no verified CoinDCX INR balance in this build (null); INR and USDT are never combined without a stated rate",
+    };
+    let mut j = d.campaign.to_json(now, open, note);
+    j["error"] = json!(d.campaign_error);
+    j
+}
+
+#[cfg(test)]
+mod campaign_tests {
+    use super::*;
+
+    #[test]
+    fn campaign_state_is_exposed_and_paper_labelled() {
+        let d = Desk::new(Settings::default());
+        let j = campaign_json(&d, qe_engine::campaign::CAMPAIGN_START_MS);
+        assert_eq!(j["target_inr"], "50000");
+        assert_eq!(j["floor_inr"], "95");
+        assert_eq!(j["loss_budget_inr"], "5");
+        assert_eq!(j["per_trade_max_loss_inr"], "1");
+        assert_eq!(j["deadline"], "2026-11-24T22:00:00+05:30");
+        assert_eq!(j["milestones"].as_array().unwrap().len(), 23);
+        assert_eq!(j["equity_source"], "paper");
     }
 }
