@@ -20,6 +20,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod gamble;
+
 /// Maximum holding time, measured from the first confirmed fill.
 pub const T_MAX_MS: u64 = 120_000;
 
@@ -94,6 +96,9 @@ pub enum Profile {
     /// time. Raw EV > 0 after costs, model SL/TP, the 120 s time stop, fees and
     /// liquidation modelling are kept.
     ExperimentMaxLeverage,
+    /// GAMBLE MODE (owner-armed, docs/GAMBLE_MODE.md): no calibration or
+    /// net-EV gate; owner stake/leverage/floor; floor is a permanent stop.
+    Gamble,
 }
 
 /// Hard ceilings. The governor may only tighten them, never loosen them.
@@ -116,6 +121,9 @@ pub struct RiskPolicy {
     pub exit_ack_timeout_ms: u64,
     #[serde(default)]
     pub profile: Profile,
+    /// Owner gamble parameters; Some only for [`Profile::Gamble`].
+    #[serde(default)]
+    pub gamble: Option<gamble::GambleParams>,
 }
 
 impl RiskPolicy {
@@ -134,6 +142,7 @@ impl RiskPolicy {
             entry_ack_timeout_ms: 2_000,
             exit_ack_timeout_ms: 2_000,
             profile: Profile::Standard,
+            gamble: None,
         }
     }
     pub fn protective() -> Self {
@@ -151,6 +160,7 @@ impl RiskPolicy {
             entry_ack_timeout_ms: 2_000,
             exit_ack_timeout_ms: 2_000,
             profile: Profile::Standard,
+            gamble: None,
         }
     }
     /// Paper experiment policy: growth ceilings with [`Profile::ExperimentMaxLeverage`].
@@ -163,6 +173,18 @@ impl RiskPolicy {
     }
     pub fn is_experiment(&self) -> bool {
         self.profile == Profile::ExperimentMaxLeverage
+    }
+    /// Gamble policy: growth ceilings for the standard fields (unused by the
+    /// gamble path) plus the owner's parameters.
+    pub fn gamble(params: gamble::GambleParams) -> Self {
+        Self {
+            profile: Profile::Gamble,
+            gamble: Some(params),
+            ..Self::growth()
+        }
+    }
+    pub fn is_gamble(&self) -> bool {
+        self.profile == Profile::Gamble && self.gamble.is_some()
     }
     /// Clamp a user/config-supplied policy to the mode's hard ceilings.
     pub fn clamped(mut self) -> Self {
@@ -301,6 +323,10 @@ pub struct RiskGovernor {
     pub killed: bool,
     pub final_target: f64,
     pub audit: Vec<AuditRecord>,
+    /// Gamble mode: set when the floor is reached; permanent until the owner re-arms.
+    pub gamble_stopped: Option<String>,
+    /// Gamble mode: notional (account ccy) of the last approved bet.
+    pub last_bet_notional: Option<f64>,
 }
 
 impl RiskGovernor {
@@ -316,6 +342,8 @@ impl RiskGovernor {
             killed: false,
             final_target,
             audit: Vec::new(),
+            gamble_stopped: None,
+            last_bet_notional: None,
         }
     }
 
@@ -367,6 +395,16 @@ impl RiskGovernor {
     }
 
     pub fn pause_entries(&mut self, paused: bool, now_ms: u64) -> ControlResult {
+        if !paused && self.gamble_stopped.is_some() {
+            return ControlResult {
+                ok: false,
+                message: format!(
+                    "gamble mode stopped at the floor ({}); only the owner can re-arm",
+                    self.gamble_stopped.clone().unwrap_or_default()
+                ),
+                actions: vec![],
+            };
+        }
         if !paused && self.killed {
             return ControlResult {
                 ok: false,
@@ -410,15 +448,19 @@ impl RiskGovernor {
             ));
         }
         let experiment = pol.is_experiment();
+        let gamble = pol.is_gamble();
+        if let Some(why) = &self.gamble_stopped {
+            r.push(format!("gamble mode stopped at the floor: {why}"));
+        }
         let session_loss = -self.session_realised_pnl.min(0.0);
         let loss_limit = pol.max_session_loss_fraction * self.stage_start_equity;
-        if !experiment && session_loss >= loss_limit {
+        if !experiment && !gamble && session_loss >= loss_limit {
             r.push(format!(
                 "session loss {session_loss:.4} >= limit {loss_limit:.4}"
             ));
         }
         let hwm_floor = self.high_water_mark * (1.0 - pol.max_drawdown_from_hwm);
-        if !experiment && acct.equity < hwm_floor {
+        if !experiment && !gamble && acct.equity < hwm_floor {
             r.push(format!(
                 "equity {:.4} below high-water-mark floor {hwm_floor:.4}",
                 acct.equity
@@ -445,10 +487,12 @@ impl RiskGovernor {
         if !p.data_healthy {
             r.push("market data integrity not established".into());
         }
-        if !experiment && !p.calibrated {
+        if !experiment && !gamble && !p.calibrated {
             r.push("forecast uncalibrated: denied strategy authority".into());
         }
-        if p.expected_net_edge.is_nan() || p.expected_net_edge <= pol.min_expected_net_edge {
+        if !gamble
+            && (p.expected_net_edge.is_nan() || p.expected_net_edge <= pol.min_expected_net_edge)
+        {
             r.push(format!(
                 "expected net edge {:.6} <= minimum {:.6}",
                 p.expected_net_edge, pol.min_expected_net_edge
@@ -473,6 +517,9 @@ impl RiskGovernor {
         }
         if experiment {
             return self.size_experiment(p, inst, acct, stop_dist, now_ms);
+        }
+        if gamble {
+            return self.size_gamble(p, inst, acct, stop_dist, now_ms);
         }
 
         // Sizing from the stop-loss risk budget, independent of leverage.
@@ -686,6 +733,177 @@ impl RiskGovernor {
         detail["profile"] = serde_json::json!("experiment_max_leverage");
         self.log(now_ms, "approved", &p.trace_id, detail);
         Decision::Approved(order)
+    }
+
+    /// Gamble sizing ([`gamble::bet_notional`]): owner stake (or bold play) at
+    /// the owner leverage capped by the exchange tier, margin plus fees kept
+    /// above the floor, never larger after a loss, exchange min/max respected,
+    /// and the stop must sit inside the estimated liquidation price.
+    fn size_gamble(
+        &mut self,
+        p: &TradeProposal,
+        inst: &InstrumentCapability,
+        acct: &AccountSnapshot,
+        stop_dist: f64,
+        now_ms: u64,
+    ) -> Decision {
+        let Some(params) = self.policy.gamble.clone() else {
+            return self.reject(p, vec!["gamble parameters missing".into()], now_ms);
+        };
+        let fx = p.fx_to_account;
+        let s = p.side.sign();
+        let cost_frac = (p.cost_per_unit / p.entry_price).max(0.0);
+        let win_frac = ((p.take_profit - p.entry_price) * s - p.cost_per_unit) / p.entry_price;
+        let owner = params.leverage as f64;
+        let max_q = inst.max_quantity * p.entry_price * fx;
+        let tier_max = inst
+            .tiers
+            .iter()
+            .map(|t| t.max_notional)
+            .fold(0.0, f64::max);
+        let max_notional = if inst.tiers.is_empty() {
+            max_q
+        } else {
+            max_q.min(tier_max * fx)
+        };
+        let after_loss_cap = if self.consecutive_losses > 0 {
+            self.last_bet_notional
+        } else {
+            None
+        };
+        let mut lev = max_permitted_leverage(inst, p.side, 0.0, owner);
+        let mut n_acct = 0.0;
+        for _ in 0..=inst.tiers.len() + 1 {
+            let ctx = gamble::SizeCtx {
+                equity: acct.equity,
+                available_margin: acct.available_margin,
+                leverage: lev,
+                cost_frac,
+                win_frac,
+                target: self.final_target,
+                after_loss_cap,
+                min_notional: inst.min_notional * fx,
+                max_notional,
+            };
+            match gamble::bet_notional(&params, &ctx) {
+                Ok(n) => n_acct = n,
+                Err(e) => return self.reject(p, vec![format!("gamble: {e}")], now_ms),
+            }
+            let l2 = max_permitted_leverage(inst, p.side, n_acct / fx, owner);
+            if l2 >= lev || l2 < 1.0 {
+                break;
+            }
+            lev = l2;
+        }
+        if lev < 1.0 {
+            return self.reject(
+                p,
+                vec!["no leverage tier admits this notional".into()],
+                now_ms,
+            );
+        }
+        let n_max = (n_acct / fx / p.entry_price).min(inst.max_quantity);
+        let qty = floor_to(n_max, inst.quantity_increment);
+        if qty <= 0.0 || qty < inst.min_quantity {
+            return self.reject(
+                p,
+                vec![format!(
+                    "gamble: min quantity {} exceeds bet quantity {n_max:.8}",
+                    inst.min_quantity
+                )],
+                now_ms,
+            );
+        }
+        let notional_quote = qty * p.entry_price;
+        if notional_quote < inst.min_notional {
+            return self.reject(
+                p,
+                vec![format!(
+                    "gamble: min notional {} exceeds bet notional {notional_quote:.4}; not raised",
+                    inst.min_notional
+                )],
+                now_ms,
+            );
+        }
+        let liq = liquidation_price(
+            p.entry_price,
+            p.side,
+            lev,
+            Some(inst.maintenance_margin_rate.unwrap_or(0.0)),
+        );
+        if let Some(lp) = liq {
+            if (p.entry_price - lp) * s <= stop_dist {
+                return self.reject(
+                    p,
+                    vec![format!(
+                        "gamble: stop {:.6} lies beyond the estimated liquidation {lp:.6} at {lev}x; lower the leverage",
+                        p.stop_loss
+                    )],
+                    now_ms,
+                );
+            }
+        }
+        let notional_account = notional_quote * fx;
+        let margin = notional_account / lev;
+        let loss_per_unit = (stop_dist + p.cost_per_unit.max(0.0)) * fx;
+        let order = ApprovedOrder {
+            trace_id: p.trace_id.clone(),
+            pair: p.pair.clone(),
+            side: p.side,
+            qty,
+            leverage: lev,
+            entry_price: p.entry_price,
+            stop_loss: p.stop_loss,
+            take_profit: p.take_profit,
+            notional_account,
+            margin_account: margin,
+            risk_budget: acct.equity - params.floor(),
+            risk_at_stop: (qty * loss_per_unit).min(margin),
+            liquidation_price: liq,
+            risk_fraction_used: if acct.equity > 0.0 {
+                margin / acct.equity
+            } else {
+                0.0
+            },
+        };
+        self.open_positions += 1;
+        self.last_bet_notional = Some(notional_account);
+        let mut detail = serde_json::to_value(&order).unwrap_or_default();
+        detail["profile"] = serde_json::json!("gamble");
+        detail["stake_policy"] = serde_json::to_value(params.stake_policy).unwrap_or_default();
+        self.log(now_ms, "approved", &p.trace_id, detail);
+        Decision::Approved(order)
+    }
+
+    /// Gamble floor stop: once equity minus the floor cannot carry the
+    /// smallest bet (or equity is at/below the floor), gamble mode stops for
+    /// good: entries paused and resuming refused until the owner re-arms.
+    /// Returns the reason when it fires (once).
+    pub fn gamble_floor_check(
+        &mut self,
+        equity: f64,
+        min_margin: f64,
+        now_ms: u64,
+    ) -> Option<String> {
+        let floor = self.policy.gamble.as_ref()?.floor();
+        if self.gamble_stopped.is_some() {
+            return None;
+        }
+        if equity <= floor || equity - floor < min_margin {
+            let why = format!(
+                "equity INR {equity:.4}, floor INR {floor:.4}, smallest bet margin INR {min_margin:.4}"
+            );
+            self.gamble_stopped = Some(why.clone());
+            self.entries_paused = true;
+            self.log(
+                now_ms,
+                "gamble_floor_stop",
+                "",
+                serde_json::json!({"reason": why}),
+            );
+            return Some(why);
+        }
+        None
     }
 
     fn reject(&mut self, p: &TradeProposal, reasons: Vec<String>, now_ms: u64) -> Decision {
@@ -1711,5 +1929,90 @@ mod tests {
         assert_eq!(pos.state, State::Closed);
         assert_eq!(pos.exit_reason, Some(ExitReason::Liquidated));
         assert!(!pos.liquidation_hit(0.0, 0.0));
+    }
+
+    fn gamble_gov(policy: &str) -> RiskGovernor {
+        let raw = gamble::RawGamble {
+            enabled: Some(true),
+            owner_ack: Some(gamble::OWNER_ACK.into()),
+            stake_inr: Some("10".into()),
+            leverage: Some("10".into()),
+            floor_inr: Some("50".into()),
+            stake_policy: Some(policy.into()),
+        };
+        let p = gamble::validate(&raw, 100.0).unwrap();
+        RiskGovernor::new(RiskPolicy::gamble(p), 100.0, 50_000.0)
+    }
+
+    #[test]
+    fn gamble_skips_calibration_and_ev_but_sizes_owner_stake() {
+        let mut g = gamble_gov("fixed");
+        let mut p = prop(Side::Long);
+        p.calibrated = false;
+        p.expected_net_edge = -0.01;
+        let o = approved(g.evaluate_proposal(&p, &inst(), &acct(100.0), 0));
+        assert_eq!(o.leverage, 10.0, "owner leverage, below exchange max 50");
+        assert!((o.margin_account - 10.0).abs() < 1e-9);
+        assert!((o.notional_account - 100.0).abs() < 1e-9);
+        // one position: a second bet is refused while the first is open
+        let d = g.evaluate_proposal(&p, &inst(), &acct(100.0), 1);
+        assert!(rejected(&d));
+        // data integrity and kill switch still apply
+        let mut g = gamble_gov("fixed");
+        p.data_healthy = false;
+        assert!(rejected(&g.evaluate_proposal(&p, &inst(), &acct(100.0), 0)));
+        p.data_healthy = true;
+        g.kill_switch(0);
+        assert!(rejected(&g.evaluate_proposal(&p, &inst(), &acct(100.0), 0)));
+    }
+
+    #[test]
+    fn gamble_leverage_capped_by_exchange_and_stop_inside_liquidation() {
+        let raw = gamble::RawGamble {
+            enabled: Some(true),
+            owner_ack: Some(gamble::OWNER_ACK.into()),
+            stake_inr: Some("10".into()),
+            leverage: Some("200".into()),
+            floor_inr: Some("50".into()),
+            stake_policy: None,
+        };
+        let pol = RiskPolicy::gamble(gamble::validate(&raw, 100.0).unwrap());
+        let mut g = RiskGovernor::new(pol, 100.0, 50_000.0);
+        // 50x cap (short 40x): liquidation ~1.5% away, stop 1% away -> allowed
+        let o = approved(g.evaluate_proposal(&prop(Side::Long), &inst(), &acct(100.0), 0));
+        assert_eq!(o.leverage, 50.0);
+        // a 2% stop lies beyond the 50x liquidation -> refused
+        let mut g = RiskGovernor::new(g.policy.clone(), 100.0, 50_000.0);
+        let mut p = prop(Side::Long);
+        p.stop_loss = 98.0;
+        assert!(rejected(&g.evaluate_proposal(&p, &inst(), &acct(100.0), 0)));
+    }
+
+    #[test]
+    fn gamble_floor_stop_is_permanent() {
+        let mut g = gamble_gov("fixed");
+        assert_eq!(g.gamble_floor_check(60.0, 0.6, 0), None);
+        assert!(g.gamble_floor_check(50.3, 0.6, 0).is_some());
+        assert!(g.entries_paused);
+        assert!(!g.pause_entries(false, 1).ok, "only the owner re-arms");
+        assert!(rejected(&g.evaluate_proposal(
+            &prop(Side::Long),
+            &inst(),
+            &acct(100.0),
+            2
+        )));
+        // the bet itself never risks the floor: margin + fees fit above it
+        let mut g = gamble_gov("fixed");
+        let o = approved(g.evaluate_proposal(&prop(Side::Long), &inst(), &acct(52.0), 0));
+        assert!(52.0 - o.margin_account >= 50.0 - 1e-9);
+    }
+
+    #[test]
+    fn gamble_never_sizes_up_after_a_loss() {
+        let mut g = gamble_gov("target_optimal");
+        let o1 = approved(g.evaluate_proposal(&prop(Side::Long), &inst(), &acct(100.0), 0));
+        g.record_realised(-1.0, 99.0, 1);
+        let o2 = approved(g.evaluate_proposal(&prop(Side::Long), &inst(), &acct(150.0), 2));
+        assert!(o2.notional_account <= o1.notional_account + 1e-9);
     }
 }

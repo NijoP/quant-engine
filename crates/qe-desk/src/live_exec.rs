@@ -510,6 +510,11 @@ pub struct LiveJob {
     pub risk_fraction: f64,
     /// When the governor approved it; older than [`MAX_JOB_AGE_MS`] is dropped.
     pub created_ms: i64,
+    /// Gamble mode: owner balance floor (INR). The guard then requires the
+    /// isolated margin to fit above the floor in the REAL wallet balance.
+    pub gamble_floor: Option<f64>,
+    /// Isolated margin of the order (margin currency).
+    pub margin: f64,
 }
 
 /// A proposal queued behind an open trade is stale by the time it is read.
@@ -526,6 +531,14 @@ pub fn submit(job: LiveJob) -> bool {
 }
 
 static STALE_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set when a live gamble bet would breach, or a live trade ended at/below,
+/// the owner floor; the desk then stops gamble mode permanently.
+static GAMBLE_FLOOR_HIT: AtomicBool = AtomicBool::new(false);
+
+pub fn gamble_floor_hit() -> bool {
+    GAMBLE_FLOOR_HIT.load(Ordering::SeqCst)
+}
 
 pub fn stale_dropped() -> u64 {
     STALE_DROPPED.load(Ordering::Relaxed)
@@ -545,6 +558,17 @@ pub fn risk_fits_real_equity(job: &LiveJob, real_balance: Option<f64>) -> Result
     let bal = real_balance.ok_or("real wallet balance unavailable")?;
     if !(bal.is_finite() && bal > 0.0) {
         return Err(format!("real wallet balance {bal} not positive"));
+    }
+    if let Some(floor) = job.gamble_floor {
+        // Gamble: the worst case (isolated margin lost) must stay above the floor.
+        if !(job.margin.is_finite() && bal - job.margin >= floor) {
+            GAMBLE_FLOOR_HIT.store(true, Ordering::SeqCst);
+            return Err(format!(
+                "gamble floor: real balance {bal:.4} minus margin {:.4} is below floor {floor:.4}",
+                job.margin
+            ));
+        }
+        return Ok(());
     }
     let cap = bal * job.risk_fraction;
     if !(job.risk_at_stop.is_finite() && job.risk_at_stop <= cap) {
@@ -605,6 +629,11 @@ pub fn install_if_armed(state: qe_live_check::state::StateDir) -> Result<(), Str
                     r
                 }
             };
+            if let (Some(f), Some(b)) = (job.gamble_floor, r.wallet_balance_after) {
+                if b <= f {
+                    GAMBLE_FLOOR_HIT.store(true, Ordering::SeqCst);
+                }
+            }
             if let Ok(mut v) = LIVE_REPORTS.lock() {
                 v.push(r);
                 let n = v.len();
@@ -783,6 +812,8 @@ mod tests {
             risk_at_stop: risk,
             risk_fraction: 0.01,
             created_ms: 0,
+            gamble_floor: None,
+            margin: 5.0,
         };
         assert!(risk_fits_real_equity(&job(0.5), Some(100.0)).is_ok());
         assert!(risk_fits_real_equity(&job(1.5), Some(100.0)).is_err());
@@ -792,6 +823,23 @@ mod tests {
             !submit(job(0.1)),
             "no live task installed in tests: paper path kept"
         );
+    }
+
+    #[test]
+    fn gamble_live_guard_keeps_margin_above_the_real_floor() {
+        let job = |margin| LiveJob {
+            req: req(),
+            risk_at_stop: 5.0,
+            risk_fraction: 0.01,
+            created_ms: 0,
+            gamble_floor: Some(50.0),
+            margin,
+        };
+        // risk 5 > 1% of 100 would fail the standard guard; gamble uses the floor
+        assert!(risk_fits_real_equity(&job(10.0), Some(100.0)).is_ok());
+        assert!(risk_fits_real_equity(&job(10.0), Some(55.0)).is_err());
+        assert!(gamble_floor_hit());
+        assert!(risk_fits_real_equity(&job(10.0), None).is_err());
     }
 
     #[test]

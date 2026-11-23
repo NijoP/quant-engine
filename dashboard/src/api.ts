@@ -181,6 +181,29 @@ export interface DeskState {
   readiness?: Record<string, boolean | string>;
   calibration?: Calibration;
   live?: LiveStatus;
+  /** Gamble mode, armed by the owner; null when the desk has it off. Money fields are decimal strings. */
+  gamble?: Gamble | null;
+}
+
+export interface Gamble {
+  enabled: boolean;
+  policy: "fixed" | "bold_play";
+  stake_inr: string;
+  leverage: string;
+  floor_inr: string;
+  equity_inr: string;
+  target_inr: string;
+  deadline: string;
+  trades: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+  net_pnl_inr: string;
+  distance_to_floor_inr: string;
+  p_target: number | null;
+  p_floor: number | null;
+  stopped_reason: string | null;
+  paper: boolean;
 }
 
 export interface Calibration {

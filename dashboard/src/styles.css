@@ -145,3 +145,14 @@ tr.click { cursor: pointer; }
 .chart .axis { fill: var(--muted); font-size: 10px; }
 pre.book { max-height: 200px; overflow: auto; background: #0e131b; padding: 6px; margin: 0; color: var(--muted); white-space: pre-wrap; word-break: break-all; }
 .ag-ok { color: var(--pos); } .ag-degraded { color: var(--warn); } .ag-error { color: var(--neg); } .ag-stopped { color: var(--muted); }
+
+/* Gamble mode */
+.gamble-banner { margin: 0 0 8px; padding: 8px 12px; border-radius: 4px; font-weight: 800; letter-spacing: 0.06em; border: 2px solid var(--warn); background: #3a2a08; color: var(--warn); }
+.gamble-banner.live { border-color: var(--neg); background: #4a1219; color: var(--neg); }
+.gamble-banner.stopped, .gamble-banner.off { border-color: var(--muted); background: #1a1f28; color: var(--muted); }
+.gamble-banner .rules { display: block; font-size: 11px; font-weight: 600; letter-spacing: 0; opacity: 0.9; }
+.panel.gamble { border-color: var(--warn); }
+.gamble-progress { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; color: var(--muted); font-size: 11px; min-width: 0; }
+.gamble-progress .bar { flex: 1 1 auto; min-width: 0; height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
+.gamble-progress .fill { height: 100%; background: var(--warn); }
+.gamble-note { margin: 8px 0 0; color: var(--muted); font-size: 11px; max-width: 900px; }
