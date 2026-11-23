@@ -661,6 +661,23 @@ async fn meta_loop(c: PublicClient, s: S) {
                         format!("{p} ({m}) metadata; {n} instrument records cached"),
                     );
                 }
+                Err(e) if qe_coindcx::client::is_circuit_open(&e) => {
+                    // Throttled / breaker open: a property of the connection, not of
+                    // this instrument. Keep any cached record, record no failure (a
+                    // failure would reject the pair for 10 min) and wait out the
+                    // cooldown instead of burning the queue on fast-fails.
+                    let wait = c.breaker_retry_in().await.max(Duration::from_secs(1));
+                    s.write().await.agent_err(
+                        "metadata",
+                        t0,
+                        format!(
+                            "{p} {m}: {e}; pausing metadata fetch {:.0}s",
+                            wait.as_secs_f64()
+                        ),
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
                 Err(e) => {
                     let mut d = s.write().await;
                     let why = if e.to_string().contains("decode") {
@@ -775,6 +792,36 @@ async fn mtf_loop(c: PublicClient, s: S) {
         }
         drop(d);
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Every public-REST circuit-breaker open/close becomes an incident
+/// (`incidents.jsonl` + audit log), with the client, reason, cooldown, time open
+/// and the number of calls refused while open.
+async fn breaker_incident_loop(clients: Vec<PublicClient>, s: S) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for c in &clients {
+            let evs = c.take_breaker_events().await;
+            if evs.is_empty() {
+                continue;
+            }
+            let mut d = s.write().await;
+            for e in evs {
+                let detail = if e.transition == "open" {
+                    format!(
+                        "{} client breaker OPEN: {} (cooldown {:.0}s, request spacing {} ms)",
+                        e.client, e.reason, e.cooldown_s, e.interval_ms
+                    )
+                } else {
+                    format!(
+                        "{} client breaker CLOSED after {:.1}s open; {} call(s) refused while open",
+                        e.client, e.open_for_s, e.rejected_while_open
+                    )
+                };
+                d.incident(&format!("rest_breaker_{}", e.transition), detail);
+            }
+        }
     }
 }
 
@@ -1510,7 +1557,7 @@ async fn main() -> anyhow::Result<()> {
             st,
         );
     }
-    let c = PublicClient::new();
+    let c = PublicClient::named("market-data");
     let w = ws::spawn(ws::WsConfig {
         channels: vec![Channel::CurrentPrices],
         rest_bootstrap: Some(ws::RestBootstrap(c.clone())),
@@ -1527,7 +1574,9 @@ async fn main() -> anyhow::Result<()> {
     // Metadata gets its own client (own 8 req/s pacing and breaker; the loop makes
     // 1 req/s): instrument records the exchange returns with null fields fail to
     // decode, and those must not open the market-data client's circuit breaker.
-    tokio::spawn(meta_loop(PublicClient::new(), s.clone()));
+    let meta = PublicClient::named("metadata");
+    tokio::spawn(meta_loop(meta.clone(), s.clone()));
+    tokio::spawn(breaker_incident_loop(vec![c.clone(), meta], s.clone()));
     tokio::spawn(mtf_loop(c.clone(), s.clone()));
     tokio::spawn(monitor_loop(c.clone(), s.clone()));
     let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/dist");
