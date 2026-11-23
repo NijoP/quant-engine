@@ -74,6 +74,58 @@ cost, or when another fresh candidate scores higher. Only the best available bet
 taken. Liquidity and cost enter through the spread and fee in `cost`. The
 `unstable` and `liquidity_withdrawal` regimes fail the data-integrity check.
 
+## Maker entries (sprint 5)
+
+Set `entry = "maker"` (and optionally `maker_timeout_s = 4`, default 4 s, max 30)
+in the gamble config. The default is `entry = "taker"` (market order, as before).
+
+- **Order:** a passive limit order at the near touch (buy at the best bid, sell at
+  the best ask), `order_type = "limit_order"`, `time_in_force = "good_till_cancel"`.
+  CoinDCX documents the futures `post_only` field as "Ignore this (Not supported
+  at the moment)", so **no post-only flag is sent**. If the book moves through the
+  price before the order arrives, the exchange can fill it as **taker**.
+- **Timeout:** if the order is not filled within `maker_timeout_s`, the remainder
+  is cancelled and the position is re-read once, to catch a fill that raced the
+  cancel. A partial fill is protected (SL + TP) at its filled size. There is
+  **no taker chase**. The desk evaluates again on the next scan.
+- **Exits are unchanged:** exchange-side SL/TP when live, and the 120 s time exit
+  as a market (taker) order.
+- **Cost used for ranking and sizing:** `maker_fee + taker_fee + slippage` (the
+  entry rests on the same side the exit leaves from, so no spread is crossed),
+  against `2 x taker_fee + spread + 2 x slippage` for taker entries. Both fees
+  come from live instrument metadata.
+- **Paper simulator:** a resting entry fills only when public trades print
+  **strictly through** its price after it was placed. A print *at* the price does
+  not count, because the queue position is unknown and we assume we are last in
+  the queue. The fill is at the limit price with the maker fee. When the timeout
+  expires, the paper simulator fills what printed through (if that meets the
+  exchange minimum quantity) and cancels the rest. Caveats: (1) real fills may
+  be later or smaller, since queue position and hidden size are not modelled;
+  (2) adverse selection is real, because a maker fill tends to come just as the
+  price moves against the bet; this shows up in realised results, not in the cost.
+- **Dashboard:** `/api/state.gamble.entry` and `/api/state.gamble.maker`
+  (placed, filled, partial, cancelled, fill_rate).
+- Only instruments whose metadata lists `limit_order` can be candidates.
+- With a `[payoff]` section in the gamble config, `payoff.maker_entry` decides the
+  entry order type, so the cost the plan ranks on always matches the order that
+  is sent. If `entry` is also set and disagrees, startup is refused.
+
+### Payoff wiring in the desk
+
+When `[payoff]` is present, each evaluated instrument gets one
+`qe_risk::gamble::payoff::plan` per side. Its inputs are the live maker/taker fee,
+spread, top-5 depth on the exit side, the median 120 s high-low range of the last
+~10 minutes of prices, sigma_120, the exchange max leverage, the maintenance
+margin, and realised gamble bets on that pair and side. Excluded instruments
+(for example cost > `max_cost_share_of_tp` of TP) are skipped with the plan's
+reason. The chosen side uses the plan's TP/SL, cost and `win_p`, and the plan is
+journaled on the decision (`payoff_plan`). The target-odds Monte Carlo then
+takes `win_p`, the gross payoff ratio TP/SL and `cost_frac` from the best plan on
+the board (`/api/state.gamble.simulation`, `barriers` = "payoff plan"). The
+plan's liquidation-safe leverage is not passed to the governor. The governor
+still uses the owner leverage capped at the exchange max, and refuses any stop
+beyond the estimated liquidation price.
+
 ## Target probability
 
 `/api/state.gamble.p_target` and `p_floor` come from `qe_math::gamble::target_odds`
