@@ -1986,43 +1986,52 @@ fn gamble_closed(d: &Desk) -> (usize, usize, usize, f64, Vec<f64>) {
     )
 }
 
-/// Target-probability Monte Carlo for the dashboard: P(reach the target before
-/// the deadline) and P(hit the floor) under the owner's stake policy. Outcomes
-/// are bootstrapped from realised gamble bets once >= 10 exist, otherwise the
-/// best fresh candidate's estimated P(win) and payoff after costs.
+/// Target-probability Monte Carlo for the dashboard (`qe_math::gamble::target_odds`):
+/// P(reach the target before the deadline) and P(hit the floor) under the
+/// owner's stake policy. Win rate and payoff come from realised gamble bets
+/// once >= 10 exist, otherwise from the best fresh candidate's estimate
+/// (P(win) conditional on a barrier being hit; time exits are not modelled).
 pub fn refresh_gamble_sim(d: &mut Desk, now: i64) {
+    use qe_math::gamble as gm;
     let Some(params) = d.gov.policy.gamble.clone() else {
         return;
     };
-    let (n, _, _, _, rets) = gamble_closed(d);
+    let (n, wins, _, _, rets) = gamble_closed(d);
     let best = d
         .gamble_board
         .values()
         .filter(|b| now - b.ts_ms <= GAMBLE_BOARD_MS)
         .max_by(|a, b| a.score.total_cmp(&b.score))
         .cloned();
-    let (outcomes, source, cost) = if n >= 10 {
-        let c = best.as_ref().map_or(0.0015, |b| b.cost_frac);
+    let cost = best.as_ref().map_or(0.0015, |b| b.cost_frac);
+    let (win_p, payoff, source) = if n >= 10 {
+        let w: Vec<f64> = rets.iter().copied().filter(|x| *x > 0.0).collect();
+        let l: Vec<f64> = rets
+            .iter()
+            .copied()
+            .filter(|x| *x <= 0.0)
+            .map(|x| -x)
+            .collect();
+        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+        let payoff = if l.is_empty() {
+            f64::INFINITY
+        } else {
+            avg(&w) / avg(&l).max(1e-12)
+        };
         (
-            qe_risk::gamble::Outcomes::Empirical(rets),
-            format!("bootstrap of {n} realised gamble bets"),
-            c,
+            wins as f64 / n as f64,
+            payoff,
+            format!("{n} realised gamble bets"),
         )
     } else if let Some(b) = &best {
         (
-            qe_risk::gamble::Outcomes::Model {
-                p_win: b.p_win,
-                win: b.win_frac,
-                p_stop: b.p_stop,
-                loss: b.loss_frac,
-                neither: b.neither_frac,
-            },
+            b.p_win / (b.p_win + b.p_stop).max(1e-12),
+            b.tp_frac / b.sl_frac.max(1e-12),
             format!(
                 "estimate for the best current bet {} {} (fewer than 10 realised bets)",
                 b.pair,
                 if b.long { "long" } else { "short" }
             ),
-            b.cost_frac,
         )
     } else {
         d.gamble_sim = Some(json!({"p_target": null, "p_floor": null,
@@ -2050,28 +2059,31 @@ pub fn refresh_gamble_sim(d: &mut Desk, now: i64) {
     } else {
         0.0
     };
-    let input = qe_risk::gamble::TargetSimInput {
-        equity: d.cap.equity_f64(),
-        target: d.settings.stage1_target_inr,
-        hours_remaining: hours,
-        bets_per_hour: bph,
-        leverage: params.leverage as f64,
-        params,
+    let input = gm::TargetInputs {
+        equity: dec(d.cap.equity_f64()),
+        target: dec(d.settings.stage1_target_inr),
+        floor: params.floor_inr,
+        win_p,
+        payoff_ratio: if payoff.is_finite() { payoff } else { 1e6 },
         cost_frac: cost,
-        min_notional,
-        max_notional: f64::INFINITY,
-        outcomes,
-        paths: 2_000,
-        seed: 42,
+        leverage: Decimal::from(params.leverage),
+        bets_remaining: (hours * bph) as u32,
+        min_notional: dec(min_notional),
+        max_notional: Decimal::from(1_000_000_000u64),
+        policy: match params.stake_policy {
+            qe_risk::gamble::StakePolicy::Fixed => gm::StakePolicy::Fixed {
+                stake_inr: params.stake_inr,
+            },
+            qe_risk::gamble::StakePolicy::TargetOptimal => gm::StakePolicy::BoldPlay,
+        },
     };
-    let r = qe_risk::gamble::simulate_target(&input);
-    d.gamble_sim = Some(
-        json!({"p_target": r.p_reach_target, "p_floor": r.p_hit_floor,
-        "p_deadline": r.p_deadline, "median_final_equity": r.median_final_equity,
-        "mean_bets": r.mean_bets, "max_bets": r.max_bets, "paths": r.paths, "seed": 42,
-        "bets_per_hour": bph, "hours_remaining": hours, "ev_per_bet_frac": r.ev_per_bet_frac,
-        "source": source, "computed_ms": now}),
-    );
+    let r = gm::target_odds(&input, 2_000, 42);
+    d.gamble_sim = Some(json!({"p_target": r.p_target, "p_floor": r.p_floor,
+        "expected_bets": r.expected_bets, "median_final_equity": r.median_final_equity,
+        "bets_remaining": input.bets_remaining, "sims": 2_000, "seed": 42,
+        "win_p": win_p, "payoff_ratio": input.payoff_ratio, "cost_frac": cost,
+        "bets_per_hour": bph, "hours_remaining": hours,
+        "source": source, "computed_ms": now}));
 }
 
 /// `/api/state.gamble` (docs/DASHBOARD_API.md): null unless gamble mode runs.
