@@ -1164,8 +1164,19 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             .retain(|_, b| now - b.ts_ms <= GAMBLE_BOARD_MS && b.pair != pair);
         let board: Vec<_> = d.gamble_board.values().cloned().collect();
         gamble_skip = qe_risk::gamble::skip_reason(&me, &board);
-        d.gamble_board
-            .insert((pair.to_string(), me.long), me.clone());
+        // Only instruments the account can actually trade compete for the bet;
+        // an ineligible one (e.g. null exchange leverage) must not block others.
+        let tradable = cap.as_ref().is_some_and(|c| {
+            c.active
+                && !c.exit_only
+                && c.max_leverage_long >= 1.0
+                && c.max_leverage_short >= 1.0
+                && c.supports_market_order
+        });
+        if tradable {
+            d.gamble_board
+                .insert((pair.to_string(), me.long), me.clone());
+        }
         gamble_est = Some(me);
     }
     let (side, fp, _gross, mut net) = sides[best];
