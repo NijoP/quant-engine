@@ -183,6 +183,67 @@ export interface DeskState {
   live?: LiveStatus;
   /** Gamble mode, armed by the owner; null when the desk has it off. Money fields are decimal strings. */
   gamble?: Gamble | null;
+  /** 24 November ₹100 → ₹50,000 campaign tracker; absent or null when the desk does not run one. Money fields are decimal strings. */
+  campaign?: Campaign | null;
+  /** Optional operational-health extras; the dashboard renders each field only if the desk reports it. */
+  ops?: OpsHealth | null;
+}
+
+export interface OpsHealth {
+  /** ms epoch of the last exchange reconciliation of positions and protective orders. */
+  last_reconciliation_ms?: number | null;
+  last_reconciliation_result?: string | null;
+  /** Watchdog status text, e.g. "ok" or a fault description. */
+  watchdog?: string | null;
+  watchdog_last_ms?: number | null;
+}
+
+export interface CampaignMilestone {
+  hour: number;
+  /** ISO timestamp of the checkpoint. */
+  at: string;
+  /** Mathematical requirement 100 × 500^(hour/22), as the desk rounds it. */
+  required_inr: string;
+  /** Verified equity recorded at the checkpoint; null if not reached yet or not recorded. */
+  actual_inr: string | null;
+}
+
+export type CampaignStatus = "ahead" | "on_track" | "behind" | "stopped" | "completed" | "expired";
+
+export interface Campaign {
+  start: string;
+  deadline: string;
+  start_equity_inr: string;
+  target_inr: string;
+  /** Verified equity; null when the desk cannot verify it. */
+  equity_inr: string | null;
+  /** `live_exchange` is the real exchange balance; `paper` is simulated and is never real capital. */
+  equity_source: "live_exchange" | "paper";
+  /** Which balance currency the figure is in, and the conversion source if INR was combined from USDT. */
+  equity_currency_note: string;
+  required_now_inr: string;
+  delta_inr: string;
+  prev_milestone: { hour: number; at: string; required_inr: string };
+  next_milestone: { hour: number; at: string; required_inr: string };
+  milestones: CampaignMilestone[];
+  realised_pnl_inr: string;
+  unrealised_pnl_inr: string;
+  remaining_inr: string;
+  remaining_secs: number;
+  drawdown_inr: string;
+  /** Compounded hourly rate still needed from the current equity (0.33 = 33%/h); null when undefined. */
+  required_hourly_rate: number | null;
+  checkpoints_done: number;
+  status: CampaignStatus;
+  floor_inr: string;
+  loss_budget_inr: string;
+  loss_used_inr: string;
+  per_trade_max_loss_inr: string;
+  risk_budget_now_inr: string;
+  open_position: null | { pair: string; side: string; held_secs: number; unrealised_inr: string };
+  stop_reason: string | null;
+  exit_only: boolean;
+  equity_history: { t: string; equity_inr: string }[];
 }
 
 export interface Gamble {
