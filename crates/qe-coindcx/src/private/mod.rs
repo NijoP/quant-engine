@@ -24,4 +24,6 @@ pub mod types;
 pub use client::PrivateClient;
 pub use error::PrivateError;
 pub use reconcile::{LedgerState, OrderIntent, Reconciliation};
-pub use types::{FuturesOrderRecord, FuturesPosition, FuturesWallet, NewOrder, Side, TpslResult};
+pub use types::{
+    FuturesOrderRecord, FuturesPosition, FuturesWallet, NewOrder, Side, SpotBalance, TpslResult,
+};

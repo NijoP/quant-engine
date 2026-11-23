@@ -17,7 +17,7 @@ use super::ratelimit::RateLimiter;
 use super::reconcile::{match_order, LedgerState, OrderIntent, OrderLedger, Reconciliation};
 use super::types::*;
 use crate::auth::{request_timestamp_ms, Credentials, HEADER_API_KEY, HEADER_SIGNATURE};
-use crate::live::LiveGate;
+use crate::live::{LiveGate, Purpose};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -83,9 +83,17 @@ impl PrivateClient {
         }
     }
 
-    fn require_gate(&self) -> Result<(), PrivateError> {
+    /// Point the client at another base URL (mock servers in tests of
+    /// dependent crates). Never needed in production.
+    #[doc(hidden)]
+    pub fn with_base_url(mut self, base: &str) -> Self {
+        self.base = base.trim_end_matches('/').into();
+        self
+    }
+
+    fn require_gate(&self, purpose: Purpose) -> Result<(), PrivateError> {
         self.gate()
-            .check()
+            .check_for(purpose)
             .map_err(|gate| PrivateError::GateClosed { gate })
     }
 
@@ -271,6 +279,15 @@ impl PrivateClient {
         Ok(all)
     }
 
+    /// Spot balances (docs: POST /exchange/v1/users/balances). Used only to
+    /// READ the INR balance around the owner's manual withdrawal.
+    pub async fn spot_balances(&self) -> Result<Vec<SpotBalance>, PrivateError> {
+        self.read(Method::Post, PATH_SPOT_BALANCES, || TimestampOnly {
+            timestamp: request_timestamp_ms(),
+        })
+        .await
+    }
+
     pub async fn list_orders(
         &self,
         side: Side,
@@ -292,8 +309,13 @@ impl PrivateClient {
 
     // -------------------------------------------------------- mutations
 
-    async fn mutate<B: Serialize>(&self, path: &str, body: &B) -> Result<Value, PrivateError> {
-        self.require_gate()?;
+    async fn mutate<B: Serialize>(
+        &self,
+        purpose: Purpose,
+        path: &str,
+        body: &B,
+    ) -> Result<Value, PrivateError> {
+        self.require_gate(purpose)?;
         self.send(Method::Post, path, body, true).await
     }
 
@@ -315,6 +337,7 @@ impl PrivateClient {
         }
         let v = self
             .mutate(
+                Purpose::OpenRisk,
                 PATH_UPDATE_LEVERAGE,
                 &UpdateLeverageBody {
                     timestamp: request_timestamp_ms(),
@@ -333,7 +356,7 @@ impl PrivateClient {
         client_order_id: &str,
         order: NewOrder,
     ) -> Result<FuturesOrderRecord, PrivateError> {
-        self.require_gate()?;
+        self.require_gate(Purpose::OpenRisk)?;
         order.validate().map_err(|m| PrivateError::Rejected {
             status: 0,
             message: format!("local validation: {m}"),
@@ -450,6 +473,7 @@ impl PrivateClient {
     pub async fn cancel_order(&self, exchange_order_id: &str) -> Result<Ack, PrivateError> {
         let v = self
             .mutate(
+                Purpose::ReduceRisk,
                 PATH_CANCEL_ORDER,
                 &IdBody {
                     timestamp: request_timestamp_ms(),
@@ -480,6 +504,7 @@ impl PrivateClient {
         }
         let v = self
             .mutate(
+                Purpose::OpenRisk,
                 PATH_CREATE_TPSL,
                 &CreateTpslBody::new(request_timestamp_ms(), position_id, take_profit, stop_loss),
             )
@@ -493,6 +518,7 @@ impl PrivateClient {
     pub async fn exit_position(&self, position_id: &str) -> Result<Ack, PrivateError> {
         let v = self
             .mutate(
+                Purpose::ReduceRisk,
                 PATH_EXIT_POSITION,
                 &IdBody {
                     timestamp: request_timestamp_ms(),
@@ -503,9 +529,26 @@ impl PrivateClient {
         decode(v)
     }
 
+    /// Cancel every open futures order in the given margin currencies
+    /// (docs: positions/cancel_all_open_orders, `margin_currency_short_name` is a list).
+    pub async fn cancel_all_open_orders(&self, margin: &[&str]) -> Result<Ack, PrivateError> {
+        let v = self
+            .mutate(
+                Purpose::ReduceRisk,
+                PATH_CANCEL_ALL_OPEN_ORDERS,
+                &CancelAllBody {
+                    timestamp: request_timestamp_ms(),
+                    margin_currency_short_name: margin.iter().map(|m| m.to_string()).collect(),
+                },
+            )
+            .await?;
+        decode(v)
+    }
+
     pub async fn cancel_all_for_position(&self, position_id: &str) -> Result<Ack, PrivateError> {
         let v = self
             .mutate(
+                Purpose::ReduceRisk,
                 PATH_CANCEL_ALL_FOR_POSITION,
                 &IdBody {
                     timestamp: request_timestamp_ms(),
@@ -556,6 +599,7 @@ mod tests {
         assert!(gated(c.create_tpsl("p", 2.0, 1.0).await.map(|_| ())));
         assert!(gated(c.exit_position("p").await.map(|_| ())));
         assert!(gated(c.cancel_all_for_position("p").await.map(|_| ())));
+        assert!(gated(c.cancel_all_open_orders(&["USDT"]).await.map(|_| ())));
         // Gate refusal happens before the ledger, so nothing was recorded.
         assert!(c.ledger_snapshot().await.is_empty());
     }
