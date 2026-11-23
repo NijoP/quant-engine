@@ -6,13 +6,26 @@
 //! loops in `main.rs`, never while a decision is being computed.
 use crate::store::Store;
 use qe_coindcx::types::{Book, FuturesInstrument, SpotMarketDetail};
+use qe_engine::capital::{CapitalController, CapitalPlan, Stage, Step};
+use qe_engine::paper::SimFill;
+use qe_engine::Decimal;
 use qe_math::timeframe::{self, Candle as MCandle, ContextTf};
 use qe_math::{features, micro, prob, stats};
 use qe_risk::{
-    AccountSnapshot, Action, CapitalManager, CapitalMode, Decision, InstrumentCapability,
-    LeverageTier, PaperExchange, Position, RiskGovernor, RiskPolicy, Side, Stage, State,
-    TradeProposal,
+    AccountSnapshot, Action, CapitalMode, Decision, InstrumentCapability, LeverageTier,
+    PaperExchange, Position, RiskGovernor, RiskPolicy, Side, State, TradeProposal,
 };
+
+/// f64 -> Decimal for the money ledger (non-finite values book as zero).
+pub fn dec(x: f64) -> Decimal {
+    Decimal::from_f64_retain(x).unwrap_or_default().round_dp(8)
+}
+
+/// Decimal -> f64 for the (f64) risk and display paths.
+pub fn dec_f64(x: Decimal) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    x.to_f64().unwrap_or(0.0)
+}
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -80,8 +93,10 @@ pub struct Settings {
     /// "standard" (default) or [`EXPERIMENT_PROFILE`] (opt-in, paper only).
     pub profile: String,
     pub paper_start_equity_inr: f64,
+    pub stage0_end_ms: i64,
     pub stage1_target_inr: f64,
     pub stage1_checkpoint_ms: i64,
+    pub withdrawal_inr: f64,
     pub stage2_target_inr: f64,
     pub stage2_deadline_ms: i64,
     pub paper_slippage_bps: f64,
@@ -95,10 +110,12 @@ impl Default for Settings {
             execution_mode: "paper".into(),
             profile: "standard".into(),
             paper_start_equity_inr: 100.0,
-            stage1_target_inr: 18_000.0,
-            stage1_checkpoint_ms: 1_795_451_400_000,
+            stage0_end_ms: qe_engine::capital::STAGE0_END_MS as i64,
+            stage1_target_inr: 3_000.0,
+            stage1_checkpoint_ms: qe_engine::capital::STAGE1_CHECKPOINT_MS as i64,
+            withdrawal_inr: 2_000.0,
             stage2_target_inr: 50_000.0,
-            stage2_deadline_ms: 1_795_516_200_000,
+            stage2_deadline_ms: qe_engine::capital::STAGE2_DEADLINE_MS as i64,
             paper_slippage_bps: 2.0,
             growth: RiskPolicy::growth(),
             protective: RiskPolicy::protective(),
@@ -272,6 +289,7 @@ impl Calib {
         }
     }
 
+    #[allow(dead_code)]
     pub fn calibrated(&self) -> bool {
         self.status()["calibrated"].as_bool().unwrap_or(false)
     }
@@ -292,6 +310,7 @@ pub struct Desk {
     pub spot_details: Vec<SpotMarketDetail>,
     pub spot: HashMap<String, (f64, f64, f64, f64)>,
     pub hist: HashMap<String, VecDeque<(i64, f64, f64)>>,
+    #[allow(clippy::type_complexity)]
     pub rt_meta: HashMap<String, (Option<f64>, Option<f64>, Option<f64>, Option<f64>)>,
     pub books: HashMap<String, Book>,
     pub ew_spread: HashMap<String, (f64, u32)>,
@@ -311,7 +330,11 @@ pub struct Desk {
     pub calib: Calib,
     pub controls: Controls,
     pub gov: RiskGovernor,
-    pub cap: CapitalManager,
+    pub cap: CapitalController,
+    pub fill_model: qe_engine::paper::FillModel,
+    pub latency: qe_engine::paper::LatencyStats,
+    pub risk_events: VecDeque<String>,
+    pub reports_done: HashSet<String>,
     pub positions: Vec<PaperPos>,
     pub closed: VecDeque<Value>,
     pub fills: VecDeque<Value>,
@@ -483,19 +506,26 @@ impl Settings {
     pub fn is_experiment(&self) -> bool {
         self.profile == EXPERIMENT_PROFILE
     }
+    /// The two-stage capital plan from these settings.
+    pub fn plan(&self) -> CapitalPlan {
+        CapitalPlan {
+            stage0_end_ms: self.stage0_end_ms as u64,
+            stage1_start_inr: dec(self.paper_start_equity_inr),
+            stage1_target_inr: dec(self.stage1_target_inr),
+            stage1_checkpoint_ms: self.stage1_checkpoint_ms as u64,
+            withdrawal_inr: dec(self.withdrawal_inr),
+            stage2_expected_start_inr: dec(1_000.0),
+            stage2_target_inr: dec(self.stage2_target_inr),
+            stage2_deadline_ms: self.stage2_deadline_ms as u64,
+        }
+    }
 }
 
 impl Desk {
     pub fn new(settings: Settings) -> Self {
         let now = now_ms();
         let s = &settings;
-        let cap = CapitalManager::new(
-            s.paper_start_equity_inr,
-            true,
-            s.stage1_target_inr,
-            s.stage1_checkpoint_ms as u64,
-            s.stage2_target_inr,
-        );
+        let cap = CapitalController::new(s.plan(), dec(s.paper_start_equity_inr), true, now as u64);
         let policy = if s.is_experiment() && s.execution_mode == "paper" {
             RiskPolicy::experiment_max_leverage()
         } else {
@@ -558,6 +588,10 @@ impl Desk {
             },
             gov,
             cap,
+            fill_model: qe_engine::paper::FillModel::new(Default::default()),
+            latency: Default::default(),
+            risk_events: VecDeque::new(),
+            reports_done: HashSet::new(),
             positions: vec![],
             closed: VecDeque::new(),
             fills: VecDeque::new(),
@@ -647,7 +681,7 @@ impl Desk {
     }
 
     pub fn equity(&self) -> f64 {
-        self.cap.equity
+        self.cap.equity_f64()
     }
 
     pub fn unrealized(&self) -> f64 {
@@ -1122,10 +1156,11 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
         ));
     } else if fx.is_none() {
         reasons.push("USDTINR fx unavailable".into());
-    } else if d.cap.stage == Stage::AwaitingCheckpoint {
-        reasons.push(
-            "stage-1 checkpoint reached: awaiting reconciliation/withdrawal confirmation".into(),
-        );
+    } else if !d.cap.entries_allowed() {
+        reasons.push(format!(
+            "capital stage {:?}: no new entries (checkpoint workflow / complete)",
+            d.cap.stage
+        ));
     } else {
         let c = cap.clone().unwrap();
         let proposal = TradeProposal {
@@ -1279,20 +1314,62 @@ pub fn run_actions(d: &mut Desk, idx: usize, actions: Vec<Action>) {
                 qty,
             } => {
                 let buy = side == Side::Long;
+                let (inc, minq) = d
+                    .instruments
+                    .get(&format!("{pair}|{TRADE_MARGIN}"))
+                    .map(|c| capability(&c.1))
+                    .map_or((0.0, 0.0), |c| (c.quantity_increment, c.min_quantity));
+                let decided = d.positions[idx].proposal["ts_ms"].as_i64().unwrap_or(now);
+                let sim = d.fill_model.entry(qty, inc, minq);
+                let (fill_qty, partial, lat) = match sim {
+                    SimFill::Rejected { reason, latency_ms } => {
+                        d.incident(
+                            "entry_rejected",
+                            format!(
+                                "{client_id}: {reason} after {latency_ms} ms (paper fill model)"
+                            ),
+                        );
+                        let more = d.positions[idx].pos.on_entry_rejected();
+                        q.extend(more);
+                        continue;
+                    }
+                    SimFill::Filled {
+                        qty,
+                        partial,
+                        latency_ms,
+                    } => (qty, partial, latency_ms),
+                };
                 match book.and_then(|b| {
-                    px.market_fill(buy, qty, b.best_bid()?, b.best_ask()?)
+                    px.market_fill(buy, fill_qty, b.best_bid()?, b.best_ask()?)
                         .map(|f| (f, micro::mid(b.best_bid().unwrap(), b.best_ask().unwrap())))
                 }) {
                     Some((f, m)) => {
-                        fill_rec(d, idx, buy, f, m, "entry");
+                        let latency_ms = (now - decided).max(0) as f64 + lat as f64;
+                        d.latency.push(latency_ms);
+                        fill_rec(
+                            d,
+                            idx,
+                            buy,
+                            f,
+                            m,
+                            if partial { "entry_partial" } else { "entry" },
+                        );
+                        if let Some(fr) = d.fills.front_mut() {
+                            fr["latency_ms"] = json!(latency_ms);
+                            fr["simulated_latency_ms"] = json!(lat);
+                            fr["partial"] = json!(partial);
+                        }
                         d.audit(
                             "execution",
                             format!("paper entry {client_id} filled {} @ {}", f.qty, f.price),
                             Value::Null,
                         );
-                        let more = d.positions[idx]
+                        let mut more = d.positions[idx]
                             .pos
                             .on_fill(f.qty, f.price, f.fee, now as u64);
+                        if partial {
+                            more.extend(d.positions[idx].pos.on_entry_done_partial());
+                        }
                         q.extend(more);
                     }
                     None => {
@@ -1366,8 +1443,12 @@ pub fn run_actions(d: &mut Desk, idx: usize, actions: Vec<Action>) {
 
 fn close_trade(d: &mut Desk, idx: usize, pnl: f64, exit_price: f64, reason: &str) {
     let now = now_ms();
-    d.cap.on_realised(pnl);
-    let eq = d.cap.equity;
+    let fees_inr = {
+        let pp = &d.positions[idx];
+        (pp.pos.entry_fees + pp.pos.exit_fees) * pp.fx
+    };
+    d.cap.on_realised(dec(pnl), dec(fees_inr));
+    let eq = d.cap.equity_f64();
     d.gov.record_realised(pnl, eq, now as u64);
     for a in std::mem::take(&mut d.gov.audit) {
         d.store
@@ -1411,7 +1492,7 @@ pub fn sweep(d: &mut Desk) {
         match p.pos.state {
             State::Closed => {}
             State::Rejected => {
-                let eq = d.cap.equity;
+                let eq = d.cap.equity_f64();
                 d.gov.record_realised(0.0, eq, now);
             }
             _ => keep.push(p),
@@ -1485,17 +1566,79 @@ pub fn lifecycle_tick(d: &mut Desk) {
         }
     }
     sweep(d);
-    // stage-1 checkpoint: stop entries, flatten, await reconciliation
-    if d.cap.on_clock(now as u64) && !d.checkpoint_handled {
-        d.checkpoint_handled = true;
-        let _ = d.gov.pause_entries(true, now as u64);
-        d.controls.entries_paused = true;
-        flatten(d, "checkpoint");
+    capital_tick(d, now);
+    report_tick(d, now);
+}
+
+/// Drive the capital plan: stage transitions and the checkpoint workflow
+/// (stop entries, flatten, cancel entry orders, verify flat, query the PAPER
+/// ledger balance, reconcile, prepare the withdrawal for the user).
+pub fn capital_tick(d: &mut Desk, now: i64) {
+    if let Some(ev) = d.cap.on_clock(now as u64) {
+        d.store
+            .append("capital", &serde_json::to_value(&ev).unwrap_or_default());
         d.audit(
             "capital",
-            "stage-1 checkpoint reached: entries paused, positions flattened; awaiting user-confirmed withdrawal and balance".into(),
+            format!("{:?} -> {:?}: {}", ev.from, ev.to, ev.note),
             Value::Null,
         );
+        match ev.to {
+            Stage::Stage1Growth => {
+                // fresh stage: session-loss and HWM limits measured from this stage start
+                let (paused, killed) = (d.gov.entries_paused, d.gov.killed);
+                let pol = d.gov.policy.clone();
+                let eq = d.cap.equity_f64();
+                d.gov = RiskGovernor::new(pol, eq, d.settings.stage1_target_inr);
+                d.gov.entries_paused = paused;
+                d.gov.killed = killed;
+            }
+            Stage::Checkpoint1 | Stage::FinalCheckpoint => {
+                d.checkpoint_handled = true;
+                let _ = d.gov.pause_entries(true, now as u64);
+                d.controls.entries_paused = true;
+                let _ = d.cap.report_step(Step::StopEntries, true, "entries paused");
+                let n = flatten(d, "checkpoint");
+                let _ = d
+                    .cap
+                    .report_step(Step::Flatten, true, &format!("{n} exit action(s)"));
+                let _ = d.cap.report_step(
+                    Step::CancelEntryOrders,
+                    true,
+                    "paper entries are immediate (no resting entry orders); remainders cancelled on fill",
+                );
+                d.risk_events.push_front(format!(
+                    "{}: {:?} - entries stopped, flatten issued",
+                    now, ev.to
+                ));
+            }
+            _ => {}
+        }
+    }
+    let Some(cp) = d.cap.checkpoint.clone() else {
+        return;
+    };
+    if cp.status(Step::VerifyFlat) != Some(qe_engine::capital::StepStatus::Done) {
+        if d.positions.is_empty() {
+            let _ = d
+                .cap
+                .report_step(Step::VerifyFlat, true, "no open paper positions");
+        } else {
+            return;
+        }
+    }
+    if cp.balance.is_none() {
+        let mut src = qe_engine::capital::PaperLedgerBalance(d.cap.equity);
+        if let Err(e) = d.cap.record_balance(&mut src, now as u64) {
+            d.incident("checkpoint", e);
+        } else if let Some(cp) = &d.cap.checkpoint {
+            d.store
+                .append("capital", &serde_json::to_value(cp).unwrap_or_default());
+            d.audit(
+                "capital",
+                "checkpoint: flat verified, PAPER ledger balance queried and reconciled; any withdrawal is prepared for the user only".into(),
+                Value::Null,
+            );
+        }
     }
 }
 
@@ -1505,7 +1648,10 @@ pub fn lifecycle_tick(d: &mut Desk) {
 fn liquidate(d: &mut Desk, idx: usize) {
     let fx = d.positions[idx].fx;
     let liq = d.positions[idx].pos.order.liquidation_price.unwrap_or(0.0);
-    let pnl = d.positions[idx].pos.close_liquidated(fx).max(-d.cap.equity);
+    let pnl = d.positions[idx]
+        .pos
+        .close_liquidated(fx)
+        .max(-d.cap.equity_f64());
     d.positions[idx].pos.realised_pnl = Some(pnl);
     d.incident(
         "paper_liquidation",
@@ -1524,7 +1670,7 @@ fn experiment_stop_check(d: &mut Desk) {
         return;
     }
     let fx = d.fx_usdtinr().unwrap_or(f64::NAN);
-    let eq = d.cap.equity;
+    let eq = d.cap.equity_f64();
     let min_margin = d
         .instruments
         .values()
@@ -1639,9 +1785,9 @@ pub fn account_json(d: &Desk) -> Value {
     };
     json!({"currency": "INR", "paper": true, "label": "PAPER equity (configured start value, not a CoinDCX balance)",
         "starting_equity": d.settings.paper_start_equity_inr, "stage_start_equity": d.gov.stage_start_equity,
-        "equity": d.cap.equity + unreal, "realised_equity": d.cap.equity,
+        "equity": d.cap.equity_f64() + unreal, "realised_equity": d.cap.equity_f64(),
         "realized_pnl": realized, "unrealized_pnl": unreal, "fees_paid": fees, "day_pnl": d.gov.session_realised_pnl,
-        "used_margin": d.used_margin(), "available": (d.cap.equity - d.used_margin()).max(0.0),
+        "used_margin": d.used_margin(), "available": (d.cap.equity_f64() - d.used_margin()).max(0.0),
         "trades": d.closed.len(), "wins": wins, "losses": losses, "halted": halt_reason.is_some(),
         "halt_reason": halt_reason, "high_water_mark": d.gov.high_water_mark,
         "consecutive_losses": d.gov.consecutive_losses, "stage": format!("{:?}", d.cap.stage),
@@ -1652,21 +1798,17 @@ pub fn account_json(d: &Desk) -> Value {
 /// and a seeded stochastic simulation (cached in `d.sim`).
 pub fn target_json(d: &Desk, now: i64) -> Value {
     let s = &d.settings;
-    let (stage, start, target, deadline) = match d.cap.stage {
-        Stage::Stage1Growth | Stage::AwaitingCheckpoint => (
-            1,
-            s.paper_start_equity_inr,
-            s.stage1_target_inr,
-            s.stage1_checkpoint_ms,
-        ),
-        _ => (
-            2,
-            d.gov.stage_start_equity,
-            s.stage2_target_inr,
-            s.stage2_deadline_ms,
-        ),
+    let _ = s;
+    let stage = match d.cap.stage {
+        Stage::Stage0Paper => 0,
+        Stage::Stage1Growth | Stage::Checkpoint1 => 1,
+        _ => 2,
     };
-    let eq = d.cap.equity;
+    let start = dec_f64(d.cap.stage_start_equity);
+    let (t, dl) = d.cap.target();
+    let target = dec_f64(t);
+    let deadline = dl as i64;
+    let eq = d.cap.equity_f64();
     let hrs = ((deadline - now) as f64 / 3.6e6).max(0.0);
     let scen: Vec<Value> = qe_math::barrier::scenarios(eq, target, hrs)
         .into_iter()
@@ -1690,6 +1832,16 @@ pub fn target_json(d: &Desk, now: i64) -> Value {
         "avg_win": stats::mean(&wins), "avg_loss": stats::mean(&losses), "expectancy": stats::mean(&pnl),
         "geometric_growth": qe_math::target::geometric_growth(&eqs),
         "simulation": d.sim, "paper": true,
+        "stage_name": format!("{:?}", d.cap.stage),
+        "requirement": d.cap.required(now as u64),
+        "reference_tables": {
+            "stage1": qe_engine::frequency::Requirement::new(100.0, 3_000.0, 2.5),
+            "stage2": qe_engine::frequency::Requirement::new(1_000.0, 50_000.0, 18.5)},
+        "plan": d.cap.plan, "checkpoint": d.cap.checkpoint, "history": d.cap.history,
+        "withdrawals": d.cap.withdrawals,
+        "stage_trades": d.cap.stage_trades, "stage_wins": d.cap.stage_wins,
+        "stage_realised_pnl": d.cap.stage_realised_pnl, "stage_fees": d.cap.stage_fees,
+        "high_water_mark": d.cap.high_water_mark,
         "note": "a trade quota never forces an entry; every entry still needs governor approval"})
 }
 
@@ -1699,7 +1851,7 @@ pub fn target_json(d: &Desk, now: i64) -> Value {
 pub fn refresh_sim(d: &mut Desk, now: i64) {
     let t = target_json(d, now);
     let (eq, target, hrs) = (
-        d.cap.equity,
+        d.cap.equity_f64(),
         t["target_equity"].as_f64().unwrap_or(0.0),
         t["hours_remaining"].as_f64().unwrap_or(0.0),
     );
@@ -1763,6 +1915,202 @@ pub fn refresh_sim(d: &mut Desk, now: i64) {
         "win_ret": win_ret, "loss_ret": loss_ret, "seed": 42, "floor": eq * 0.5, "streak_len": 5,
         "source": source, "computed_ms": now}),
     );
+}
+
+/// Scanner coverage per universe: discovered, eligible (active, not exit-only, metadata
+/// decoded) and actually subscribed. Only the shortlist gets order books and trades;
+/// every futures instrument gets 1 Hz `currentPrices`, which is not tick coverage.
+pub fn coverage_json(d: &Desk) -> Value {
+    let elig = |m: &str| {
+        d.instruments
+            .iter()
+            .filter(|(k, (_, i))| {
+                k.ends_with(&format!("|{m}")) && {
+                    let c = capability(i);
+                    c.active && !c.exit_only
+                }
+            })
+            .count()
+    };
+    let now = now_ms();
+    let books_live = d.ws_book_ms.values().filter(|t| now - **t < 10_000).count();
+    json!({
+        "spot": {"discovered": d.spot_details.len(), "active": d.spot_active,
+                 "eligible": 0, "subscribed": 0,
+                 "note": "spot is tracked for basis/fx only; not traded"},
+        "usdt_futures": {"discovered": d.fut_usdt.len(), "eligible": elig("USDT"),
+                 "subscribed_prices_1hz": d.fut_usdt.len()},
+        "inr_futures": {"discovered": d.fut_inr.len(), "eligible": elig("INR"),
+                 "metadata_rejected": d.meta_fail.keys().filter(|k| k.ends_with("|INR")).count(),
+                 "subscribed_prices_1hz": d.fut_inr.len()},
+        "order_books_subscribed": d.ws_book_ms.len(), "order_books_fresh_10s": books_live,
+        "trade_streams_subscribed": d.trades.len(),
+        "tick_coverage": "shortlist only: order books and trades for the top candidates and open positions; all other instruments at 1 Hz prices",
+    })
+}
+
+/// Execution quality for reports and the dashboard.
+pub fn execution_json(d: &Desk) -> Value {
+    let fm = &d.fill_model;
+    json!({"paper": true, "fill_model": fm.params, "entries": fm.entries, "rejected": fm.rejected,
+        "partial": fm.partial, "latency_decision_to_fill": d.latency.summary(),
+        "note": "latency = measured decision->paper-fill time plus simulated exchange latency"})
+}
+
+/// Build a report of `kind` from the current desk state.
+pub fn build_report(d: &Desk, kind: qe_engine::report::ReportKind, now: i64) -> String {
+    use qe_engine::report::{render, ReportInput, TradeLine};
+    let since = match kind {
+        qe_engine::report::ReportKind::Stage2Hourly => now - 3_600_000,
+        _ => 0,
+    };
+    let trades: Vec<TradeLine> = d
+        .closed
+        .iter()
+        .filter(|c| c["closed_ms"].as_i64().unwrap_or(0) >= since)
+        .map(|c| TradeLine {
+            id: c["id"].as_str().unwrap_or("").into(),
+            pair: c["pair"].as_str().unwrap_or("").into(),
+            side: c["side"].as_str().unwrap_or("").into(),
+            net_pnl_inr: c["net_pnl"].as_f64().unwrap_or(0.0),
+            fees_inr: c["fees"].as_f64().unwrap_or(0.0),
+            held_s: c["held_s"].as_f64().unwrap_or(0.0),
+            exit_reason: c["exit_reason"].as_str().unwrap_or("").into(),
+            paper: true,
+        })
+        .collect();
+    let sim = simulate_target(d, now);
+    render(&ReportInput {
+        kind,
+        generated_ms: now as u64,
+        capital: &d.cap,
+        trades: &trades,
+        requirement: d.cap.required(now as u64),
+        simulation: Some(&sim),
+        forecasts: json!({"forward_monitor": d.calib.status()}),
+        calibration: d.calibration_json(),
+        learning: learning_json(d),
+        risk_events: d.risk_events.iter().cloned().collect(),
+        execution: execution_json(d),
+        coverage: coverage_json(d),
+    })
+}
+
+/// Stochastic target simulation (qe-engine) from measured paper trades when at least
+/// 10 exist, otherwise from the current candidates' uncalibrated model probabilities.
+pub fn simulate_target(d: &Desk, now: i64) -> qe_engine::frequency::SimSummary {
+    let req = d.cap.required(now as u64);
+    let rf = d.gov.effective_risk_fraction();
+    let rets: Vec<f64> = d
+        .closed
+        .iter()
+        .filter_map(|c| {
+            let pnl = c["net_pnl"].as_f64()?;
+            Some(pnl / (c["equity_after"].as_f64()? - pnl))
+        })
+        .collect();
+    let (p_win, w, l) = if rets.len() >= 10 {
+        let wins: Vec<f64> = rets.iter().copied().filter(|x| *x > 0.0).collect();
+        let losses: Vec<f64> = rets
+            .iter()
+            .copied()
+            .filter(|x| *x <= 0.0)
+            .map(|x| -x)
+            .collect();
+        (
+            wins.len() as f64 / rets.len() as f64,
+            stats::mean(&wins).unwrap_or(0.0),
+            stats::mean(&losses).unwrap_or(rf),
+        )
+    } else {
+        let ps: Vec<f64> = d
+            .opportunities
+            .iter()
+            .take(20)
+            .filter_map(|o| o["p_win"].as_f64())
+            .collect();
+        (stats::mean(&ps).unwrap_or(0.0), rf * K_TARGET / K_STOP, rf)
+    };
+    let taken = d
+        .decisions
+        .iter()
+        .filter(|x| x["decision"] == "taken")
+        .count() as f64;
+    let n_dec = d.decisions.len().max(1) as f64;
+    let fm = &d.fill_model;
+    qe_engine::frequency::simulate(&qe_engine::frequency::SimParams {
+        c0: req.equity,
+        target: req.target,
+        hours: req.hours,
+        windows_per_hour: 30,
+        p_win,
+        win_ret: w,
+        loss_ret: l,
+        magnitude_spread: 0.5,
+        cost_ret: 0.0,
+        funding_ret: 0.0,
+        p_no_opportunity: (1.0 - taken / n_dec).clamp(0.0, 1.0),
+        p_reject: fm.params.p_reject,
+        p_partial: fm.params.p_partial,
+        partial_fill_frac: (1.0 + fm.params.min_partial_frac) / 2.0,
+        p_downtime: 0.02,
+        session_loss_frac: d.gov.policy.max_session_loss_fraction,
+        paths: 1_000,
+        seed: 42,
+    })
+}
+
+/// Learning-engine view. Filled by the s3-learn integration; until then it says so.
+pub fn learning_json(d: &Desk) -> Value {
+    let _ = d;
+    json!({"status": "not wired", "note": "s3-learn decision snapshots / outcomes / mistake classification not integrated in this build"})
+}
+
+/// Scheduled reports: 20:00 paper, Stage 1 checkpoint once reconciled, hourly in
+/// Stage 2, final at the final checkpoint (then the plan completes). Written as
+/// markdown under `<data dir>/reports/`.
+pub fn report_tick(d: &mut Desk, now: i64) {
+    use qe_engine::report::ReportKind as K;
+    let mut due = vec![];
+    if now >= d.settings.stage0_end_ms && !d.reports_done.contains("paper-8pm") {
+        due.push((K::Paper8pm, "paper-8pm".to_string()));
+    }
+    let reconciled = d
+        .cap
+        .checkpoint
+        .as_ref()
+        .is_some_and(|c| c.balance.is_some());
+    if d.cap.stage == Stage::Checkpoint1
+        && reconciled
+        && !d.reports_done.contains("stage1-checkpoint")
+    {
+        due.push((K::Stage1Checkpoint, "stage1-checkpoint".to_string()));
+    }
+    if d.cap.stage == Stage::Stage2Protective {
+        let h = (now - d.cap.stage_started_ms as i64) / 3_600_000;
+        if h >= 1 && !d.reports_done.contains(&format!("stage2-h{h}")) {
+            due.push((K::Stage2Hourly, format!("stage2-h{h}")));
+        }
+    }
+    if d.cap.stage == Stage::FinalCheckpoint && reconciled && !d.reports_done.contains("final") {
+        due.push((K::Final, "final".to_string()));
+    }
+    for (kind, key) in due {
+        let md = build_report(d, kind, now);
+        let dir = d.store.dir.join("reports");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{key}.md"));
+        match std::fs::write(&path, md) {
+            Ok(()) => d.audit("report", format!("wrote {}", path.display()), Value::Null),
+            Err(e) => d.incident("report", format!("{}: {e}", path.display())),
+        }
+        d.reports_done.insert(key.clone());
+        if kind == K::Final {
+            if let Err(e) = d.cap.complete_final(now as u64) {
+                d.incident("checkpoint", e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1901,7 +2249,7 @@ mod tests {
         assert_eq!(d.closed.len(), 1);
         assert_eq!(d.closed[0]["exit_reason"], "sl");
         assert!(d.closed[0]["net_pnl"].as_f64().unwrap() < 0.0);
-        assert!(d.cap.equity < 100.0);
+        assert!(d.cap.equity_f64() < 100.0);
         assert_eq!(d.gov.open_positions, 0);
         assert_eq!(d.gov.consecutive_losses, 1);
     }
@@ -2010,7 +2358,7 @@ mod tests {
         assert!(d.positions.is_empty());
         assert_eq!(d.closed[0]["exit_reason"], "liquidated");
         // equity 100 < margin 200 + fee: clamped at zero, never negative
-        assert_eq!(d.cap.equity, 0.0);
+        assert_eq!(d.cap.equity_f64(), 0.0);
         assert!(
             d.gov.entries_paused,
             "experiment stops below the tradable minimum"

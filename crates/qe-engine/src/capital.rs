@@ -380,7 +380,10 @@ impl CapitalController {
 
     /// The desk reports a mechanical step (stop entries, flatten, cancel, verify flat).
     pub fn report_step(&mut self, step: Step, ok: bool, note: &str) -> Result<(), String> {
-        let cp = self.checkpoint.as_mut().ok_or("no checkpoint in progress")?;
+        let cp = self
+            .checkpoint
+            .as_mut()
+            .ok_or("no checkpoint in progress")?;
         if matches!(
             step,
             Step::QueryBalance | Step::Reconcile | Step::PrepareWithdrawal
@@ -408,7 +411,10 @@ impl CapitalController {
     ) -> Result<(), String> {
         let (equity, pnl, fees) = (self.equity, self.stage_realised_pnl, self.stage_fees);
         let (target, w) = (self.plan.stage1_target_inr, self.plan.withdrawal_inr);
-        let cp = self.checkpoint.as_mut().ok_or("no checkpoint in progress")?;
+        let cp = self
+            .checkpoint
+            .as_mut()
+            .ok_or("no checkpoint in progress")?;
         if !cp.done(Step::VerifyFlat) {
             return Err("account not verified flat; balance not queried".into());
         }
@@ -483,7 +489,10 @@ impl CapitalController {
         if !user_confirmed {
             return Err("withdrawal not confirmed by the user; nothing recorded".into());
         }
-        let cp = self.checkpoint.as_mut().ok_or("no checkpoint in progress")?;
+        let cp = self
+            .checkpoint
+            .as_mut()
+            .ok_or("no checkpoint in progress")?;
         if !cp.done(Step::VerifyFlat) {
             return Err("account not verified flat".into());
         }
@@ -493,7 +502,11 @@ impl CapitalController {
         if amount < Decimal::ZERO || verified_retained < Decimal::ZERO {
             return Err("negative amount or balance".into());
         }
-        cp.set(Step::AwaitUserWithdrawal, StepStatus::Done, "user confirmed");
+        cp.set(
+            Step::AwaitUserWithdrawal,
+            StepStatus::Done,
+            "user confirmed",
+        );
         self.withdrawals.push(WithdrawalRecord {
             ts_ms: now_ms,
             amount_inr: amount,
@@ -511,9 +524,11 @@ impl CapitalController {
 
     /// Finish the final checkpoint once reports are written.
     pub fn complete_final(&mut self, now_ms: u64) -> Result<(), String> {
-        let cp = self.checkpoint.as_mut().ok_or("no checkpoint in progress")?;
-        if cp.kind != CheckpointKind::Final || !cp.done(Step::VerifyFlat) || cp.balance.is_none()
-        {
+        let cp = self
+            .checkpoint
+            .as_mut()
+            .ok_or("no checkpoint in progress")?;
+        if cp.kind != CheckpointKind::Final || !cp.done(Step::VerifyFlat) || cp.balance.is_none() {
             return Err("final checkpoint: verify flat and reconcile first".into());
         }
         cp.set(Step::FinalReports, StepStatus::Done, "reports written");
@@ -525,11 +540,7 @@ impl CapitalController {
     pub fn required(&self, now_ms: u64) -> crate::frequency::Requirement {
         let (target, deadline) = self.target();
         let hours = deadline.saturating_sub(now_ms) as f64 / 3.6e6;
-        crate::frequency::Requirement::new(
-            self.equity_f64(),
-            target.to_f64().unwrap_or(0.0),
-            hours,
-        )
+        crate::frequency::Requirement::new(self.equity_f64(), target.to_f64().unwrap_or(0.0), hours)
     }
 }
 
@@ -558,7 +569,7 @@ mod tests {
     fn plan_times_are_ist() {
         assert_eq!(STAGE1_CHECKPOINT_MS - STAGE0_END_MS, 9_000_000); // 2.5 h
         assert_eq!(STAGE2_DEADLINE_MS - STAGE1_CHECKPOINT_MS, 66_600_000); // 18.5 h
-        // 2026-11-23 14:30:00 UTC == 20:00 IST
+                                                                           // 2026-11-23 14:30:00 UTC == 20:00 IST
         assert_eq!(STAGE0_END_MS / 1000 % 86_400, 14 * 3600 + 30 * 60);
     }
 

@@ -35,8 +35,15 @@ impl Default for FillModelParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum SimFill {
-    Rejected { reason: String, latency_ms: u64 },
-    Filled { qty: f64, partial: bool, latency_ms: u64 },
+    Rejected {
+        reason: String,
+        latency_ms: u64,
+    },
+    Filled {
+        qty: f64,
+        partial: bool,
+        latency_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +68,10 @@ impl FillModel {
     }
 
     fn latency(&mut self) -> u64 {
-        let (a, b) = (self.params.latency_ms_min, self.params.latency_ms_max.max(self.params.latency_ms_min));
+        let (a, b) = (
+            self.params.latency_ms_min,
+            self.params.latency_ms_max.max(self.params.latency_ms_min),
+        );
         a + ((b - a) as f64 * self.rng.f64()) as u64
     }
 
@@ -79,7 +89,11 @@ impl FillModel {
         if self.rng.f64() < self.params.p_partial {
             let lo = self.params.min_partial_frac.clamp(0.0, 1.0);
             let frac = lo + (1.0 - lo) * self.rng.f64();
-            let inc = if qty_increment > 0.0 { qty_increment } else { qty };
+            let inc = if qty_increment > 0.0 {
+                qty_increment
+            } else {
+                qty
+            };
             let filled = ((qty * frac / inc).floor() * inc * 1e12).round() / 1e12;
             if filled + 1e-12 < min_qty.max(inc) || filled <= 0.0 {
                 self.rejected += 1;
@@ -90,10 +104,18 @@ impl FillModel {
             }
             if filled + 1e-12 < qty {
                 self.partial += 1;
-                return SimFill::Filled { qty: filled, partial: true, latency_ms };
+                return SimFill::Filled {
+                    qty: filled,
+                    partial: true,
+                    latency_ms,
+                };
             }
         }
-        SimFill::Filled { qty, partial: false, latency_ms }
+        SimFill::Filled {
+            qty,
+            partial: false,
+            latency_ms,
+        }
     }
 
     pub fn exit_latency(&mut self) -> u64 {
@@ -150,7 +172,11 @@ mod tests {
         let mut parts = 0;
         for _ in 0..5_000 {
             match m.entry(1.0, 0.001, 0.001) {
-                SimFill::Filled { qty, partial, latency_ms } => {
+                SimFill::Filled {
+                    qty,
+                    partial,
+                    latency_ms,
+                } => {
                     assert!(qty <= 1.0 && qty > 0.0);
                     assert!((qty / 0.001 - (qty / 0.001).round()).abs() < 1e-6);
                     assert!((40..=250).contains(&latency_ms));
@@ -173,7 +199,10 @@ mod tests {
             ..Default::default()
         });
         // qty equals the minimum: any partial is below it
-        assert!(matches!(m.entry(0.001, 0.001, 0.001), SimFill::Rejected { .. }));
+        assert!(matches!(
+            m.entry(0.001, 0.001, 0.001),
+            SimFill::Rejected { .. }
+        ));
     }
 
     #[test]

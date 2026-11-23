@@ -1,0 +1,45 @@
+name: CI
+on:
+  push:
+    branches: [main, "fm/**"]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      # Desk-owned crates are held to -D warnings; the whole workspace is linted and
+      # reported (pre-existing qe-coindcx lints are tracked, not yet gating).
+      - run: cargo clippy -p qe-engine -p qe-desk -p qe-risk --all-targets --no-deps -- -D warnings
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run build
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

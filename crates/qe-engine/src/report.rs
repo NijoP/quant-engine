@@ -33,7 +33,9 @@ impl ReportKind {
     pub fn title(self) -> &'static str {
         match self {
             Self::Paper8pm => "Stage 0 paper-trading report (20:00 IST)",
-            Self::Stage1Checkpoint => "Stage 1 checkpoint and withdrawal reconciliation report (22:30 IST)",
+            Self::Stage1Checkpoint => {
+                "Stage 1 checkpoint and withdrawal reconciliation report (22:30 IST)"
+            }
             Self::Stage2Hourly => "Stage 2 hourly report",
             Self::Final => "Final trading and learning report (17:00 IST 24 Nov)",
         }
@@ -94,14 +96,22 @@ fn ist(ms: u64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{day:02} {:02}:{:02}:{:02} IST", r / 3600, r % 3600 / 60, r % 60)
+    format!(
+        "{y:04}-{m:02}-{day:02} {:02}:{:02}:{:02} IST",
+        r / 3600,
+        r % 3600 / 60,
+        r % 60
+    )
 }
 
 fn pretty(v: &Value) -> String {
     if v.is_null() {
         "not available".into()
     } else {
-        format!("```json\n{}\n```", serde_json::to_string_pretty(v).unwrap_or_default())
+        format!(
+            "```json\n{}\n```",
+            serde_json::to_string_pretty(v).unwrap_or_default()
+        )
     }
 }
 
@@ -110,7 +120,12 @@ pub fn render(i: &ReportInput) -> String {
     let label = if c.paper { "PAPER" } else { "LIVE" };
     let mut o = String::new();
     let _ = writeln!(o, "# {} — {label}\n", i.kind.title());
-    let _ = writeln!(o, "Generated {}. Stage: {:?}.", ist(i.generated_ms), c.stage);
+    let _ = writeln!(
+        o,
+        "Generated {}. Stage: {:?}.",
+        ist(i.generated_ms),
+        c.stage
+    );
     if c.paper {
         let _ = writeln!(o, "\n> All equity and P&L below are a PAPER ledger (simulated orders on live public CoinDCX data). They are not a CoinDCX balance and must not be represented as real equity.");
     }
@@ -123,34 +138,82 @@ pub fn render(i: &ReportInput) -> String {
     let _ = writeln!(o, "\n## 1. Actual measured results ({label})\n");
     let _ = writeln!(o, "| Metric | Value |\n|---|---|");
     let _ = writeln!(o, "| Ledger equity | INR {} |", c.equity.round_dp(4));
-    let _ = writeln!(o, "| Stage start equity | INR {} |", c.stage_start_equity.round_dp(4));
-    let _ = writeln!(o, "| Stage realised net P&L | INR {} |", c.stage_realised_pnl.round_dp(4));
+    let _ = writeln!(
+        o,
+        "| Stage start equity | INR {} |",
+        c.stage_start_equity.round_dp(4)
+    );
+    let _ = writeln!(
+        o,
+        "| Stage realised net P&L | INR {} |",
+        c.stage_realised_pnl.round_dp(4)
+    );
     let _ = writeln!(o, "| Stage fees | INR {} |", c.stage_fees.round_dp(4));
-    let _ = writeln!(o, "| High-water mark | INR {} |", c.high_water_mark.round_dp(4));
-    let _ = writeln!(o, "| Closed trades in report window | {} ({wins} won, {losses} lost) |", i.trades.len());
-    let _ = writeln!(o, "| Net P&L of those trades | INR {net:.4} (fees INR {fees:.4}) |");
+    let _ = writeln!(
+        o,
+        "| High-water mark | INR {} |",
+        c.high_water_mark.round_dp(4)
+    );
+    let _ = writeln!(
+        o,
+        "| Closed trades in report window | {} ({wins} won, {losses} lost) |",
+        i.trades.len()
+    );
+    let _ = writeln!(
+        o,
+        "| Net P&L of those trades | INR {net:.4} (fees INR {fees:.4}) |"
+    );
     if !i.trades.is_empty() {
         let _ = writeln!(o, "\n| Trade | Pair | Side | Net INR | Fees INR | Held s | Exit |\n|---|---|---|---|---|---|---|");
         for t in i.trades.iter().take(200) {
-            let _ = writeln!(o, "| {} | {} | {} | {:.4} | {:.4} | {:.1} | {} |", t.id, t.pair, t.side, t.net_pnl_inr, t.fees_inr, t.held_s, t.exit_reason);
+            let _ = writeln!(
+                o,
+                "| {} | {} | {} | {:.4} | {:.4} | {:.1} | {} |",
+                t.id, t.pair, t.side, t.net_pnl_inr, t.fees_inr, t.held_s, t.exit_reason
+            );
         }
     } else {
         let _ = writeln!(o, "\nNo trades closed. The governor may reject every proposal; that is a valid outcome, not a fault.");
     }
     if let Some(cp) = &c.checkpoint {
-        let _ = writeln!(o, "\n### Checkpoint workflow ({:?})\n\n| Step | Status | Note |\n|---|---|---|", cp.kind);
+        let _ = writeln!(
+            o,
+            "\n### Checkpoint workflow ({:?})\n\n| Step | Status | Note |\n|---|---|---|",
+            cp.kind
+        );
         for (s, st, n) in &cp.steps {
             let _ = writeln!(o, "| {s:?} | {st:?} | {n} |");
         }
         if let Some(r) = &cp.reconciliation {
-            let _ = writeln!(o, "\nReconciliation: ledger INR {} vs queried INR {} (difference INR {}; {}).", r.ledger_equity_inr, r.queried_balance_inr, r.difference_inr, if r.ok { "matched" } else { "MISMATCH: reconciliation required" });
+            let _ = writeln!(
+                o,
+                "\nReconciliation: ledger INR {} vs queried INR {} (difference INR {}; {}).",
+                r.ledger_equity_inr,
+                r.queried_balance_inr,
+                r.difference_inr,
+                if r.ok {
+                    "matched"
+                } else {
+                    "MISMATCH: reconciliation required"
+                }
+            );
         }
         if let Some(w) = &cp.withdrawal {
-            let _ = writeln!(o, "\nWithdrawal prepared (not executed): INR {}; expected retained INR {}. {}", w.amount_inr, w.expected_retained_inr, w.note);
+            let _ = writeln!(
+                o,
+                "\nWithdrawal prepared (not executed): INR {}; expected retained INR {}. {}",
+                w.amount_inr, w.expected_retained_inr, w.note
+            );
         }
     }
     for w in &c.withdrawals {
-        let _ = writeln!(o, "\nUser-confirmed withdrawal recorded {}: INR {}; verified retained balance INR {}.", ist(w.ts_ms), w.amount_inr, w.retained_balance_inr);
+        let _ = writeln!(
+            o,
+            "\nUser-confirmed withdrawal recorded {}: INR {}; verified retained balance INR {}.",
+            ist(w.ts_ms),
+            w.amount_inr,
+            w.retained_balance_inr
+        );
     }
     if matches!(i.kind, ReportKind::Stage1Checkpoint | ReportKind::Final) {
         let (target, _) = c.target();
@@ -161,11 +224,32 @@ pub fn render(i: &ReportInput) -> String {
 
     // 2. target-implied
     let r = &i.requirement;
-    let _ = writeln!(o, "\n## 2. Target-implied requirements (mathematics, not forecasts)\n");
-    let _ = writeln!(o, "From equity INR {:.4} to INR {:.0} in {:.2} h: multiple x{:.4}; ideal hourly return {}.", r.equity, r.target, r.hours, r.multiple, r.ideal_hourly_return.map_or("n/a".into(), |x| format!("{:.4}%", x * 100.0)));
-    let _ = writeln!(o, "\n| Trades/h | n | Required return per trade (all won) |\n|---|---|---|");
+    let _ = writeln!(
+        o,
+        "\n## 2. Target-implied requirements (mathematics, not forecasts)\n"
+    );
+    let _ = writeln!(
+        o,
+        "From equity INR {:.4} to INR {:.0} in {:.2} h: multiple x{:.4}; ideal hourly return {}.",
+        r.equity,
+        r.target,
+        r.hours,
+        r.multiple,
+        r.ideal_hourly_return
+            .map_or("n/a".into(), |x| format!("{:.4}%", x * 100.0))
+    );
+    let _ = writeln!(
+        o,
+        "\n| Trades/h | n | Required return per trade (all won) |\n|---|---|---|"
+    );
     for row in &r.rows {
-        let _ = writeln!(o, "| {} | {} | {:.4}% |", row.trades_per_hour, row.n_trades, row.required_return_per_trade * 100.0);
+        let _ = writeln!(
+            o,
+            "| {} | {} | {:.4}% |",
+            row.trades_per_hour,
+            row.n_trades,
+            row.required_return_per_trade * 100.0
+        );
     }
     let _ = writeln!(o, "\nA trade count is a reporting metric, never a quota.");
 
@@ -181,7 +265,11 @@ pub fn render(i: &ReportInput) -> String {
         }
     }
 
-    let _ = writeln!(o, "\n## 4. Forecasts (prediction vs actual)\n\n{}", pretty(&i.forecasts));
+    let _ = writeln!(
+        o,
+        "\n## 4. Forecasts (prediction vs actual)\n\n{}",
+        pretty(&i.forecasts)
+    );
     let _ = writeln!(o, "\n## 5. Uncalibrated probabilities\n\nProbabilities without calibration authority are model priors, not measured frequencies.\n\n{}", pretty(&i.calibration));
     let _ = writeln!(o, "\n## 6. Learning results\n\n{}", pretty(&i.learning));
     let _ = writeln!(o, "\n## 7. Risk-limit events\n");
@@ -191,7 +279,12 @@ pub fn render(i: &ReportInput) -> String {
     for e in i.risk_events.iter().take(100) {
         let _ = writeln!(o, "- {e}");
     }
-    let _ = writeln!(o, "\n## 8. Execution quality and coverage\n\n{}\n\n{}", pretty(&i.execution), pretty(&i.coverage));
+    let _ = writeln!(
+        o,
+        "\n## 8. Execution quality and coverage\n\n{}\n\n{}",
+        pretty(&i.execution),
+        pretty(&i.coverage)
+    );
     if c.stage == Stage::Complete || i.kind == ReportKind::Final {
         let _ = writeln!(o, "\nNo position is carried past the final checkpoint.");
     }
@@ -224,10 +317,12 @@ mod tests {
         });
         assert!(r.contains("2026-11-23 20:00:00 IST"));
         assert!(r.contains("PAPER ledger"));
-        let idx: Vec<usize> = ["## 1.", "## 2.", "## 3.", "## 4.", "## 5.", "## 6.", "## 7.", "## 8."]
-            .iter()
-            .map(|s| r.find(s).unwrap())
-            .collect();
+        let idx: Vec<usize> = [
+            "## 1.", "## 2.", "## 3.", "## 4.", "## 5.", "## 6.", "## 7.", "## 8.",
+        ]
+        .iter()
+        .map(|s| r.find(s).unwrap())
+        .collect();
         assert!(idx.windows(2).all(|w| w[0] < w[1]));
     }
 }
