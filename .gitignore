@@ -6,3 +6,5 @@ dist/
 audit/
 .env.*
 !.env.example
+# qe-research local market-data store (public data; never committed)
+/data/
