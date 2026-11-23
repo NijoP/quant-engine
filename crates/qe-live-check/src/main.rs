@@ -6,7 +6,7 @@ use qe_coindcx::private::PrivateClient;
 use qe_coindcx::PublicClient;
 use qe_live_check::checkpoint::{self, CheckpointKind};
 use qe_live_check::confirm::{Confirm, Terminal};
-use qe_live_check::readiness::{self, DeskState, MARGINS};
+use qe_live_check::readiness::{self, check_label, DeskState, MARGINS};
 use qe_live_check::state::{fresh_checks, record_check, StateDir};
 use qe_live_check::{arming, now_ms, validate, Poll};
 use rust_decimal::Decimal;
@@ -19,7 +19,10 @@ const USAGE: &str = "qe-live-check <command> [options]   (state dir: $QE_LIVE_ST
                                            instrument check, read-only account reconciliation
   governor                                 run `cargo test -p qe-risk` and record the result
   validate --pair P --margin M [--leverage N]
-                                           SUPERVISED REAL minimum-size protective-order test
+                                           SUPERVISED REAL minimum-size protective-order test:
+                                           verifies isolated margin, TP/SL, and fill-to-flat within
+                                           120 s during validation (immediate close); does NOT prove
+                                           the desk's automatic 120 s holding-time enforcement
                                            (needs --features live-orders; typed confirmations)
   checkpoint --kind stage1|stage2|adhoc [--currency INR] [--expected X] [--withdrawal 2000]
                                            disarm, cancel all, exit all, verify flat, read actual
@@ -82,8 +85,9 @@ fn desk_state(dir: &StateDir) -> DeskState {
 fn print_checks(dir: &StateDir) {
     for c in fresh_checks(dir, now_ms()) {
         let (t, d) = tag(&c.status);
-        println!("  [{t}] {:?}: {d}", c.item);
+        println!("  [{t}] {:?} ({}): {d}", c.item, check_label(c.item));
     }
+    println!("  [NOTE  ] {}", validate::DESK_HOLD_ENFORCEMENT_NOTE);
 }
 
 #[tokio::main]
@@ -312,7 +316,7 @@ async fn validate_cmd(dir: &StateDir, args: &[String]) -> i32 {
         eprintln!("REFUSED before any order: {e:?}");
         for (i, s) in &gate.readiness.items {
             let (t, d) = tag(s);
-            println!("  [{t}] {i:?}: {d}");
+            println!("  [{t}] {i:?} ({}): {d}", check_label(*i));
         }
         return 2;
     }
@@ -326,6 +330,21 @@ async fn validate_cmd(dir: &StateDir, args: &[String]) -> i32 {
     println!("plan: {}", serde_json::to_string(&plan).unwrap_or_default());
     audit(dir, "validation_start", serde_json::json!({"plan": plan}));
     let out = validate::run(&pc, &mut Terminal, plan, Poll::DEFAULT, &now_ms, true).await;
+    if out.entry_sent {
+        audit(
+            dir,
+            "validation_margin_type",
+            serde_json::json!({
+                "pair": out.plan.pair,
+                "margin_type": out.margin_type,
+                "verified_isolated": out.margin_type_verified,
+            }),
+        );
+        println!(
+            "margin_type reported by the exchange: {:?} (isolated verified: {})",
+            out.margin_type, out.margin_type_verified
+        );
+    }
     for (item, st) in out.checks() {
         record(dir, item, st);
     }
@@ -339,10 +358,12 @@ async fn validate_cmd(dir: &StateDir, args: &[String]) -> i32 {
         println!("!!! NOT VERIFIED FLAT. Open the CoinDCX app NOW and close {pair} manually, then run `qe-live-check checkpoint --kind adhoc`.");
     }
     println!(
-        "Result: protective {:?}; closure {:?}",
+        "Result: protective {:?}; {}: {:?}",
         out.protective_status(),
+        validate::CLOSURE_CHECK_LABEL,
         out.closure_status()
     );
+    println!("NOTE: {}", validate::DESK_HOLD_ENFORCEMENT_NOTE);
     if out.protective_verified && out.closure_status().is_pass() {
         0
     } else {

@@ -221,6 +221,20 @@ pub async fn account_check<A: AccountApi>(
     }
 }
 
+/// What each readiness item proves, for status/readiness output. The
+/// serialized keys (`checks.json`, `armed.json`) are unchanged.
+pub fn check_label(item: CheckItem) -> &'static str {
+    match item {
+        CheckItem::CredentialsConfigured => "credentials configured",
+        CheckItem::SigningSelfTest => "signing self-test",
+        CheckItem::AccountReconciled => "account reconciled",
+        CheckItem::InstrumentRequirementsVerified => "instrument requirements verified",
+        CheckItem::ProtectiveOrdersVerified => "protective orders verified (validation)",
+        CheckItem::Closure120sTested => crate::validate::CLOSURE_CHECK_LABEL,
+        CheckItem::RiskGovernorAcceptance => "risk-governor acceptance",
+    }
+}
+
 /// Item list for the readiness command.
 pub fn checklist_order() -> [CheckItem; 7] {
     CheckItem::ALL

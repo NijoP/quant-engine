@@ -191,7 +191,7 @@ async fn main() {
     r.set(
         CheckItem::Closure120sTested,
         CheckStatus::NotRun(
-            "needs a supervised live open -> exit within 120 s; not automatable read-only".into(),
+            "fill-to-flat within 120 s during validation (immediate close): needs the supervised `qe-live-check validate`; not automatable read-only. Does not prove the desk's automatic 120 s holding-time enforcement (unit-tested only, not proven live)".into(),
         ),
     );
     r.set(
