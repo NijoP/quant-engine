@@ -37,7 +37,7 @@ export function GambleBanner({ gamble }: { gamble: Gamble | null | undefined }) 
   const cls = "gamble-banner " + (gamble.stopped_reason ? "stopped" : gamble.enabled ? (gamble.paper ? "paper" : "live") : "off");
   return (
     <div className={cls} role="alert">
-      GAMBLE MODE {gamble.enabled ? "ARMED" : "OFF"} · {mode}
+      GAMBLE MODE {gamble.enabled ? "ARMED" : "OFF"} · {mode} · PAPER / RESEARCH ONLY — not the campaign's live path
       {gamble.stopped_reason ? ` · STOPPED: ${gamble.stopped_reason}` : ""}
       <span className="rules">
         {policyLabel(gamble)} · leverage {gamble.leverage}x · stops permanently at floor {inr(gamble.floor_inr)} · forecast gate bypassed — bets are not
@@ -51,7 +51,7 @@ export function GamblePanel({ gamble, serverNow }: { gamble: Gamble | null | und
   if (!gamble)
     return (
       <section className="panel">
-        <h2>Gamble mode</h2>
+        <h2>Gamble mode (paper / research only)</h2>
         <div className="empty">Gamble mode off</div>
       </section>
     );
@@ -72,7 +72,7 @@ export function GamblePanel({ gamble, serverNow }: { gamble: Gamble | null | und
   return (
     <section className="panel gamble">
       <h2>
-        Gamble mode — {g.enabled ? "armed" : "off"} · <span className={"badge " + (g.paper ? "mode" : "danger")}>{g.paper ? "PAPER" : "LIVE"}</span>
+        Gamble mode (paper / research only) — {g.enabled ? "armed" : "off"} · <span className={"badge " + (g.paper ? "mode" : "danger")}>{g.paper ? "PAPER" : "LIVE"}</span>
         {g.stopped_reason && <span className="badge danger"> STOPPED: {g.stopped_reason}</span>}
       </h2>
       <div className="gamble-progress" title="floor → target">

@@ -194,7 +194,7 @@ export function UniverseTable({ onSelect }: { onSelect: (pair: string, margin: s
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [desc, setDesc] = useState(true);
   const [page, setPage] = useState(0);
-  const rows = data?.[coll] ?? [];
+  const rows = useMemo(() => data?.[coll] ?? [], [data, coll]);
   const keys = useMemo(() => pickKeys(rows), [rows]);
   const filtered = useMemo(() => {
     const ql = q.trim().toLowerCase();
