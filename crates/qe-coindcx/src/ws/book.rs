@@ -12,6 +12,11 @@
 //!   levels outside the exchange's window are not maintained by the feed.
 //! * A crossed book (best bid >= best ask) is treated as an integrity failure.
 //! * Disconnects and stale-feed alerts call [`OrderBook::invalidate`].
+//! * While awaiting a snapshot, updates are buffered (bounded). When a snapshot
+//!   with version `S` arrives (stream or REST, which share the `vs` sequence —
+//!   verified live 2026-11-23), buffered updates with `vs > S` are replayed and
+//!   must be contiguous from `S + 1`. A snapshot older than a version already seen,
+//!   with no contiguous buffered bridge, is rejected (`StaleSnapshot`).
 
 use super::events::{DepthKind, DepthMsg};
 use serde::Serialize;
@@ -55,7 +60,13 @@ pub enum ApplyOutcome {
     IgnoredAwaitingSnapshot,
     /// Book crossed after applying: invalidated.
     Crossed,
+    /// Snapshot older than versions already seen and not bridged by buffered
+    /// updates: rejected, book stays awaiting.
+    StaleSnapshot,
 }
+
+/// Maximum updates buffered while awaiting a snapshot.
+pub const PENDING_CAP: usize = 2048;
 
 /// Immutable top-of-book view handed to consumers. Bids descending, asks ascending.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -93,6 +104,8 @@ pub struct BookStats {
     pub crossed: u64,
     pub ignored_awaiting_snapshot: u64,
     pub invalidations: u64,
+    pub replayed: u64,
+    pub stale_snapshots: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +118,8 @@ pub struct OrderBook {
     exchange_ts_ms: i64,
     recv_ts_ms: i64,
     state: BookState,
+    max_seen: Option<u64>,
+    pending: Vec<DepthMsg>,
     pub stats: BookStats,
 }
 
@@ -119,6 +134,8 @@ impl OrderBook {
             exchange_ts_ms: 0,
             recv_ts_ms: 0,
             state: BookState::AwaitingSnapshot,
+            max_seen: None,
+            pending: Vec::new(),
             stats: BookStats::default(),
         }
     }
@@ -142,13 +159,25 @@ impl OrderBook {
         self.asks.clear();
     }
 
+    /// True when updates are buffered awaiting a snapshot (a REST bootstrap can help).
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     pub fn apply(&mut self, m: &DepthMsg) -> ApplyOutcome {
+        let out = self.apply_inner(m);
+        self.max_seen = Some(self.max_seen.map_or(m.version, |v| v.max(m.version)));
+        out
+    }
+
+    fn apply_inner(&mut self, m: &DepthMsg) -> ApplyOutcome {
         match m.kind {
             DepthKind::Snapshot => {
                 if self.state == BookState::Live && self.version.is_some_and(|v| m.version <= v) {
                     self.stats.duplicates += 1;
                     return ApplyOutcome::Duplicate;
                 }
+                let max_seen = self.max_seen;
                 self.bids = m
                     .bids
                     .iter()
@@ -171,6 +200,35 @@ impl OrderBook {
                     self.invalidate();
                     return ApplyOutcome::Crossed;
                 }
+                // Replay buffered updates newer than the snapshot.
+                let mut pending = std::mem::take(&mut self.pending);
+                pending.sort_by_key(|u| u.version);
+                pending.retain(|u| u.version > m.version);
+                for (k, u) in pending.iter().enumerate() {
+                    match self.apply_inner(u) {
+                        ApplyOutcome::UpdateApplied => self.stats.replayed += 1,
+                        ApplyOutcome::Duplicate => {}
+                        _ => {
+                            // Book invalid again: keep the rest for the next snapshot.
+                            for r in &pending[k + 1..] {
+                                self.buffer(r);
+                            }
+                            break;
+                        }
+                    }
+                }
+                if self.state != BookState::Live {
+                    return ApplyOutcome::Gap {
+                        expected: m.version + 1,
+                        got: self.version.unwrap_or(m.version),
+                    };
+                }
+                if max_seen.is_some_and(|s| self.version.unwrap_or(0) < s) {
+                    self.stats.stale_snapshots += 1;
+                    self.invalidate();
+                    self.version = max_seen;
+                    return ApplyOutcome::StaleSnapshot;
+                }
                 ApplyOutcome::SnapshotApplied
             }
             DepthKind::Update => {
@@ -180,6 +238,7 @@ impl OrderBook {
                         return ApplyOutcome::Duplicate;
                     }
                     self.stats.ignored_awaiting_snapshot += 1;
+                    self.buffer(m);
                     return ApplyOutcome::IgnoredAwaitingSnapshot;
                 }
                 let last = self.version.expect("live book has a version");
@@ -191,6 +250,7 @@ impl OrderBook {
                     self.stats.gaps += 1;
                     self.version = Some(m.version);
                     self.invalidate();
+                    self.buffer(m);
                     return ApplyOutcome::Gap {
                         expected: last + 1,
                         got: m.version,
@@ -222,6 +282,31 @@ impl OrderBook {
                 ApplyOutcome::UpdateApplied
             }
         }
+    }
+
+    fn buffer(&mut self, m: &DepthMsg) {
+        if self.pending.len() >= PENDING_CAP {
+            self.pending.remove(0);
+        }
+        self.pending.push(m.clone());
+    }
+
+    /// Apply a REST order book (`GET public.coindcx.com/market_data/v3/orderbook/
+    /// {pair}-futures/{depth}`) as a snapshot. Requires its `vs`.
+    pub fn apply_rest(&mut self, b: &crate::types::Book, recv_ts_ms: i64) -> Option<ApplyOutcome> {
+        let vs = u64::try_from(b.vs?).ok()?;
+        let m = DepthMsg {
+            kind: DepthKind::Snapshot,
+            symbol: String::new(),
+            version: vs,
+            exchange_ts_ms: b.ts,
+            event_ts_ms: None,
+            publish_ts_ms: None,
+            bids: b.bids.clone(),
+            asks: b.asks.clone(),
+            recv_ts_ms,
+        };
+        Some(self.apply(&m))
     }
 
     fn stamp(&mut self, m: &DepthMsg) {
@@ -362,6 +447,70 @@ mod tests {
         let v = b.view().unwrap();
         assert_eq!(v.bids, vec![(1.0, 1.0), (0.95, 5.0)]);
         assert_eq!(v.asks, vec![(1.9, 5.0), (2.0, 1.0)]);
+    }
+
+    #[test]
+    fn buffered_updates_replay_onto_late_snapshot() {
+        let mut b = OrderBook::new("X", 5);
+        // Updates 11..=13 arrive before any snapshot.
+        for (vs, q) in [(11, 2.0), (12, 3.0), (13, 4.0)] {
+            assert_eq!(
+                b.apply(&msg(DepthKind::Update, vs, &[(1.0, q)], &[])),
+                ApplyOutcome::IgnoredAwaitingSnapshot
+            );
+        }
+        assert!(b.has_pending());
+        // REST snapshot at vs 11: replay 12 and 13 on top.
+        let rest = crate::types::Book {
+            ts: 5,
+            vs: Some(11),
+            bids: vec![(1.0, 2.0)],
+            asks: vec![(2.0, 1.0)],
+        };
+        assert_eq!(b.apply_rest(&rest, 0), Some(ApplyOutcome::SnapshotApplied));
+        let v = b.view().unwrap();
+        assert_eq!(v.version, 13);
+        assert_eq!(v.bids, vec![(1.0, 4.0)]);
+        assert_eq!(b.stats.replayed, 2);
+        assert!(!b.has_pending());
+        // A REST book without vs cannot be sequenced.
+        assert_eq!(
+            b.apply_rest(
+                &crate::types::Book {
+                    vs: None,
+                    ..rest.clone()
+                },
+                0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_older_than_seen_versions_is_rejected() {
+        let mut b = OrderBook::new("X", 5);
+        b.apply(&msg(DepthKind::Snapshot, 10, &[(1.0, 1.0)], &[(2.0, 1.0)]));
+        b.apply(&msg(DepthKind::Update, 11, &[(1.0, 2.0)], &[]));
+        b.invalidate(); // e.g. stale alert, no buffered updates
+        assert_eq!(
+            b.apply(&msg(DepthKind::Snapshot, 9, &[(1.0, 9.0)], &[(2.0, 1.0)])),
+            ApplyOutcome::StaleSnapshot
+        );
+        assert!(b.view().is_none());
+        // Gap inside the buffer: snapshot 20, buffered 21 then 23 -> invalid again.
+        b.apply(&msg(DepthKind::Update, 21, &[(1.0, 3.0)], &[]));
+        b.apply(&msg(DepthKind::Update, 23, &[(1.0, 4.0)], &[]));
+        assert!(matches!(
+            b.apply(&msg(DepthKind::Snapshot, 20, &[(1.0, 2.0)], &[(2.0, 1.0)])),
+            ApplyOutcome::Gap { .. }
+        ));
+        assert!(b.view().is_none());
+        assert!(b.has_pending());
+        // Next stream snapshot recovers.
+        assert_eq!(
+            b.apply(&msg(DepthKind::Snapshot, 24, &[(1.0, 5.0)], &[(2.0, 1.0)])),
+            ApplyOutcome::SnapshotApplied
+        );
     }
 
     /// Replay consecutive live BTC depth messages: the version sequence is

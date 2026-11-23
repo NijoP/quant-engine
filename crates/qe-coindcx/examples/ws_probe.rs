@@ -7,7 +7,8 @@
 //! restoration, then prints per-channel counts, duplicates, gaps, latency
 //! (local receive − exchange timestamp) and stale flags, plus a JSON summary.
 
-use qe_coindcx::ws::{self, Channel, Depth, WsConfig, WsEvent};
+use qe_coindcx::ws::{self, Channel, Depth, RestBootstrap, WsConfig, WsEvent};
+use qe_coindcx::PublicClient;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -36,8 +37,14 @@ async fn main() -> anyhow::Result<()> {
         channels.len(),
         instruments.len()
     );
+    // QE_WS_NO_BOOTSTRAP=1 disables the REST order-book bootstrap.
+    let rest_bootstrap = std::env::var_os("QE_WS_NO_BOOTSTRAP")
+        .is_none()
+        .then(|| RestBootstrap(PublicClient::new()));
+    println!("rest bootstrap: {}", rest_bootstrap.is_some());
     let h = ws::spawn(WsConfig {
         channels,
+        rest_bootstrap,
         ..WsConfig::default()
     })?;
     let mut rx = h.subscribe();
@@ -120,8 +127,8 @@ async fn main() -> anyhow::Result<()> {
     println!("\nevents: {counts:?}");
     println!("book outcomes: {outcomes:?}");
     println!(
-        "sessions={} disconnects={} engine_pings={} parse_errors={} unattributed_price_ticks={} unattributed_depth={} lagged={lagged}",
-        hl.session, hl.disconnects, hl.engine_pings, hl.parse_errors, hl.unattributed_price_ticks, hl.unattributed_depth
+        "sessions={} disconnects={} engine_pings={} parse_errors={} unattributed_price_ticks={} unattributed_depth={} rest_bootstraps={} rest_bootstrap_errors={} lagged={lagged}",
+        hl.session, hl.disconnects, hl.engine_pings, hl.parse_errors, hl.unattributed_price_ticks, hl.unattributed_depth, hl.rest_bootstraps, hl.rest_bootstrap_errors
     );
     for i in &instruments {
         match h.book(i) {

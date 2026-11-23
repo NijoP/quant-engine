@@ -72,8 +72,8 @@ pub mod protocol;
 
 pub use book::{ApplyOutcome, BookState, BookView, OrderBook};
 pub use client::{
-    backoff_delay, now_ms, spawn, BookEvent, ChannelHealth, StaleThresholds, WsConfig, WsEvent,
-    WsHandle, WsHealth, DEFAULT_URL,
+    backoff_delay, now_ms, spawn, BookEvent, ChannelHealth, RestBootstrap, StaleThresholds,
+    WsConfig, WsEvent, WsHandle, WsHealth, DEFAULT_URL,
 };
 pub use events::{
     Candle, CandleInterval, Channel, ChannelKind, CurrentPrices, Depth, PriceEntry, PriceTick,

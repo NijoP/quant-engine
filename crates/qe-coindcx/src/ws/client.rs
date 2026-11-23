@@ -78,6 +78,22 @@ pub struct WsConfig {
     pub app_ping_interval: Option<Duration>,
     /// Recent-payload window for duplicate suppression of trades/prices/candles.
     pub dedup_window: usize,
+    /// Optional REST bootstrap for books awaiting a snapshot (thin instruments may
+    /// go many seconds between stream snapshots). Pass the desk's shared
+    /// `PublicClient` so its global rate limiter and circuit breaker apply.
+    pub rest_bootstrap: Option<RestBootstrap>,
+    /// Minimum time between REST bootstrap attempts for one instrument.
+    pub bootstrap_min_interval: Duration,
+}
+
+/// Wrapper so the config stays `Debug`.
+#[derive(Clone)]
+pub struct RestBootstrap(pub crate::PublicClient);
+
+impl std::fmt::Debug for RestBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RestBootstrap(PublicClient)")
+    }
 }
 
 impl Default for WsConfig {
@@ -92,6 +108,8 @@ impl Default for WsConfig {
             broadcast_capacity: 8192,
             app_ping_interval: Some(Duration::from_secs(25)),
             dedup_window: 4096,
+            rest_bootstrap: None,
+            bootstrap_min_interval: Duration::from_secs(5),
         }
     }
 }
@@ -185,6 +203,9 @@ pub struct WsHealth {
     pub unattributed_price_ticks: u64,
     /// Depth messages whose symbol matched no subscribed book.
     pub unattributed_depth: u64,
+    /// REST order-book bootstraps requested / failed.
+    pub rest_bootstraps: u64,
+    pub rest_bootstrap_errors: u64,
     pub channels: BTreeMap<String, ChannelHealth>,
 }
 
@@ -262,14 +283,15 @@ pub fn spawn(cfg: WsConfig) -> Result<WsHandle> {
     validate_channels(&cfg.channels)?;
     let (tx, _) = broadcast::channel(cfg.broadcast_capacity.max(16));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (boot_tx, boot_rx) = mpsc::unbounded_channel();
     let handle = WsHandle {
         events: tx,
         health: Arc::new(Mutex::new(WsHealth::default())),
         books: Arc::new(Mutex::new(HashMap::new())),
         cmd: cmd_tx,
     };
-    let mut state = State::new(cfg, handle.clone());
-    tokio::spawn(async move { state.run(cmd_rx).await });
+    let mut state = State::new(cfg, handle.clone(), boot_tx);
+    tokio::spawn(async move { state.run(cmd_rx, boot_rx).await });
     Ok(handle)
 }
 
@@ -352,13 +374,18 @@ struct State {
     dedup: Dedup,
     prices_version: Option<u64>,
     joined_at: HashMap<String, Instant>,
+    boot_tx: mpsc::UnboundedSender<BootResult>,
+    boot_inflight: HashSet<String>,
+    boot_last: HashMap<String, Instant>,
 }
+
+type BootResult = (String, Result<crate::types::Book>, i64);
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 impl State {
-    fn new(cfg: WsConfig, h: WsHandle) -> Self {
+    fn new(cfg: WsConfig, h: WsHandle, boot_tx: mpsc::UnboundedSender<BootResult>) -> Self {
         let subs: BTreeSet<Channel> = cfg.channels.iter().cloned().collect();
         let dedup = Dedup::new(cfg.dedup_window);
         let mut s = Self {
@@ -369,6 +396,9 @@ impl State {
             dedup,
             prices_version: None,
             joined_at: HashMap::new(),
+            boot_tx,
+            boot_inflight: HashSet::new(),
+            boot_last: HashMap::new(),
         };
         s.rebuild_maps();
         s
@@ -429,13 +459,17 @@ impl State {
         true
     }
 
-    async fn run(&mut self, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
+    async fn run(
+        &mut self,
+        mut cmd_rx: mpsc::UnboundedReceiver<Command>,
+        mut boot_rx: mpsc::UnboundedReceiver<BootResult>,
+    ) {
         let mut attempt: u32 = 0;
         let mut session: u64 = 0;
         loop {
             self.health(|h| h.connect_attempts += 1);
             let started = Instant::now();
-            let result = self.session(&mut cmd_rx, &mut session).await;
+            let result = self.session(&mut cmd_rx, &mut boot_rx, &mut session).await;
             self.on_disconnect();
             let reason = match result {
                 Ok(true) => return,
@@ -461,6 +495,8 @@ impl State {
                 tokio::select! {
                     _ = &mut sleep => break,
                     c = cmd_rx.recv() => if !self.apply_offline(c) { return },
+                    // Never make a book Live from REST while the stream is down.
+                    Some((i, _, _)) = boot_rx.recv() => { self.boot_inflight.remove(&i); }
                 }
             }
         }
@@ -482,6 +518,7 @@ impl State {
     async fn session(
         &mut self,
         cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
+        boot_rx: &mut mpsc::UnboundedReceiver<BootResult>,
         session: &mut u64,
     ) -> Result<bool> {
         let url = format!(
@@ -594,6 +631,7 @@ impl State {
                         self.rebuild_maps();
                     }
                 },
+                Some((instr, res, recv)) = boot_rx.recv() => self.on_bootstrap(instr, res, recv),
                 _ = stale_tick.tick() => {
                     if last_frame.elapsed() > liveness {
                         bail!("no frames for {:?} (engine.io ping timeout)", last_frame.elapsed());
@@ -662,6 +700,61 @@ impl State {
         }
     }
 
+    fn maybe_bootstrap(&mut self, instr: &str, depth: usize) {
+        let Some(RestBootstrap(client)) = self.cfg.rest_bootstrap.clone() else {
+            return;
+        };
+        if self.boot_inflight.contains(instr)
+            || self
+                .boot_last
+                .get(instr)
+                .is_some_and(|t| t.elapsed() < self.cfg.bootstrap_min_interval)
+        {
+            return;
+        }
+        self.boot_inflight.insert(instr.to_string());
+        self.boot_last.insert(instr.to_string(), Instant::now());
+        self.health(|h| h.rest_bootstraps += 1);
+        let tx = self.boot_tx.clone();
+        let instr = instr.to_string();
+        tokio::spawn(async move {
+            let res = client.futures_book(&instr, depth as u32).await;
+            let _ = tx.send((instr, res, now_ms()));
+        });
+    }
+
+    fn on_bootstrap(&mut self, instr: String, res: Result<crate::types::Book>, recv: i64) {
+        self.boot_inflight.remove(&instr);
+        let book = match res {
+            Ok(b) => b,
+            Err(_) => {
+                self.health(|h| h.rest_bootstrap_errors += 1);
+                return;
+            }
+        };
+        let ev = {
+            let mut books = self.h.books.lock().expect("books lock");
+            let Some(b) = books.get_mut(&instr) else {
+                return;
+            };
+            if b.state() == BookState::Live {
+                return; // a stream snapshot won the race
+            }
+            let Some(outcome) = b.apply_rest(&book, recv) else {
+                drop(books);
+                self.health(|h| h.rest_bootstrap_errors += 1);
+                return;
+            };
+            BookEvent {
+                instrument: instr.clone(),
+                outcome,
+                state: b.state(),
+                view: b.view().map(Arc::new),
+            }
+        };
+        self.emit(WsEvent::Book(ev));
+    }
+
     fn bump_gap(&self, channel: &str) {
         self.health(|h| {
             if let Some(c) = h.channels.get_mut(channel) {
@@ -728,7 +821,7 @@ impl State {
                     self.health(|h| h.unattributed_depth += 1);
                     return;
                 };
-                let (outcome, state, view, ch_name) = {
+                let (outcome, state, view, ch_name, depth) = {
                     let mut books = self.h.books.lock().expect("books lock");
                     let Some(b) = books.get_mut(&instr) else {
                         return;
@@ -739,8 +832,12 @@ impl State {
                         b.state(),
                         b.view().map(Arc::new),
                         Channel::OrderBook(instr.clone(), depth_of(b.depth)).name(),
+                        b.depth,
                     )
                 };
+                if state != BookState::Live {
+                    self.maybe_bootstrap(&instr, depth);
+                }
                 let dup = outcome == ApplyOutcome::Duplicate;
                 self.touch(&ch_name, recv, d.exchange_ts_ms, dup);
                 if matches!(outcome, ApplyOutcome::Gap { .. }) {
@@ -811,6 +908,7 @@ mod tests {
     fn state(channels: Vec<Channel>) -> State {
         let (tx, _) = broadcast::channel(4096);
         let (cmd, _) = mpsc::unbounded_channel();
+        let (boot_tx, _) = mpsc::unbounded_channel();
         let h = WsHandle {
             events: tx,
             health: Arc::new(Mutex::new(WsHealth::default())),
@@ -823,6 +921,7 @@ mod tests {
                 ..WsConfig::default()
             },
             h,
+            boot_tx,
         )
     }
 
