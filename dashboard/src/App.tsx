@@ -9,6 +9,7 @@ import {
   type Position,
   type ScannerRow,
 } from "./api";
+import { AgentsPanel, ControlsPanel, DecisionsPanel, GlobalStatus, InstrumentPanel, TargetPanel, UniverseTable } from "./panels";
 
 const POLL_MS = 1000;
 const DASH = "—";
@@ -76,6 +77,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState<number>(Date.now());
   const inFlight = useRef(false);
+  const [sel, setSel] = useState<{ pair: string; margin: string } | null>(null);
+  const select = (pair: string, margin: string) => setSel({ pair, margin });
 
   useEffect(() => {
     let alive = true;
@@ -122,13 +125,20 @@ export default function App() {
       <Header state={state} serverNow={serverNow} />
       {state ? (
         <>
+          <GlobalStatus state={state} serverNow={serverNow} offline={offline} />
+          <ControlsPanel controls={state.controls} offline={offline} />
           <AccountStrip state={state} />
           <div className="grid2">
             <PositionsPanel positions={state.positions} sinceFetchMs={sinceFetchMs} maxHold={state.account.policy.max_hold_s} />
             <UniversePanel state={state} serverNow={serverNow} />
           </div>
+          <TargetPanel state={state} />
           <OpportunitiesPanel rows={state.opportunities} />
-          <ScannerPanel rows={state.scanner} />
+          <ScannerPanel rows={state.scanner} onSelect={select} />
+          <InstrumentPanel sel={sel} />
+          <DecisionsPanel />
+          <AgentsPanel agents={state.agents} serverNow={serverNow} />
+          <UniverseTable onSelect={select} />
           <div className="grid2">
             <FillsPanel rows={state.fills} />
             <ClosedPanel rows={state.closed} />
@@ -219,6 +229,7 @@ function UniversePanel({ state, serverNow }: { state: DeskState; serverNow: numb
       <h2>Universe</h2>
       <div className="kv">
         <span>Futures active</span><b>{u.futures_active}</b>
+        <span>· USDT / INR</span><b>{u.futures_usdt ?? DASH} / {u.futures_inr ?? DASH}</b>
         <span>Futures tracked</span><b>{u.futures_tracked}</b>
         <span>Spot active</span><b>{u.spot_active}</b>
         <span>Spot with ticker</span><b>{u.spot_with_ticker}</b>
@@ -232,7 +243,7 @@ function UniversePanel({ state, serverNow }: { state: DeskState; serverNow: numb
 function PositionsPanel({ positions, sinceFetchMs, maxHold }: { positions: Position[]; sinceFetchMs: number; maxHold: number }) {
   return (
     <section className="panel">
-      <h2>Open paper positions ({positions.length})</h2>
+      <h2>Position workstation — open paper positions ({positions.length}) · countdown is display-only, backend owns the 120s timer</h2>
       {positions.length === 0 ? (
         <div className="empty">No open positions</div>
       ) : (
@@ -240,7 +251,7 @@ function PositionsPanel({ positions, sinceFetchMs, maxHold }: { positions: Posit
           <thead>
             <tr>
               <th>Pair</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP</th><th>SL</th>
-              <th>Lev</th><th>Notional</th><th>uPnL</th><th>Time left</th>
+              <th>Lev</th><th>Notional</th><th>uPnL</th><th>Fees</th><th>State</th><th>Age</th><th>Time left</th>
             </tr>
           </thead>
           <tbody>
@@ -261,6 +272,9 @@ function PositionsPanel({ positions, sinceFetchMs, maxHold }: { positions: Posit
                   <td className="r">{num(p.leverage, 1)}x</td>
                   <td className="r">{money(p.notional)}</td>
                   <td className={"r " + sign(p.unrealized_pnl)}>{signedMoney(p.unrealized_pnl)}</td>
+                  <td className="r">{num(p.fees_paid, 4)}</td>
+                  <td>{p.state ?? DASH}</td>
+                  <td className="r">{age.toFixed(1)}s</td>
                   <td className="countdown">
                     <div className="bar">
                       <div className={"fill " + (left < 20 ? "urgent" : "")} style={{ width: `${frac * 100}%` }} />
@@ -289,7 +303,7 @@ function OpportunitiesPanel({ rows }: { rows: Opportunity[] }) {
           <table>
             <thead>
               <tr>
-                <th>Time</th><th>Pair</th><th>Side</th><th>P(win)</th><th>EV gross bps</th><th>Cost bps</th>
+                <th>Time</th><th>Pair</th><th>Side</th><th>P(TP first)</th><th>P(SL first)</th><th>P(up)</th><th>Calib</th><th>EV gross bps</th><th>Cost bps</th>
                 <th>EV net bps</th><th>TP</th><th>SL</th><th>Horizon</th><th>Qty</th><th>Notional</th><th>Lev</th>
                 <th>Decision</th><th>Reason</th>
               </tr>
@@ -301,6 +315,9 @@ function OpportunitiesPanel({ rows }: { rows: Opportunity[] }) {
                   <td>{o.pair}</td>
                   <td className={o.side}>{o.side.toUpperCase()}</td>
                   <td className="r">{pct(o.p_win, 1)}</td>
+                  <td className="r">{pct(o.p_stop, 1)}</td>
+                  <td className="r">{pct(o.p_up_horizon, 1)}</td>
+                  <td className={o.calibrated ? "pos" : "neg"}>{o.calibrated === undefined ? DASH : o.calibrated ? "yes" : "NO"}</td>
                   <td className="r">{bps(o.ev_gross_bps)}</td>
                   <td className="r">{bps(o.cost_bps)}</td>
                   <td className={"r " + sign(o.ev_net_bps)}>{bps(o.ev_net_bps)}</td>
@@ -322,7 +339,7 @@ function OpportunitiesPanel({ rows }: { rows: Opportunity[] }) {
   );
 }
 
-function ScannerPanel({ rows }: { rows: ScannerRow[] }) {
+function ScannerPanel({ rows, onSelect }: { rows: ScannerRow[]; onSelect: (pair: string, margin: string) => void }) {
   const top = [...rows].sort((a, b) => b.score - a.score).slice(0, 60);
   return (
     <section className="panel">
@@ -338,13 +355,13 @@ function ScannerPanel({ rows }: { rows: ScannerRow[] }) {
               <tr>
                 <th>Pair</th><th>Last</th><th>r10s</th><th>r30s</th><th>r60s</th><th>r300s</th><th>σ 1s</th>
                 <th>σ 1m candle</th><th>z r10s</th><th>z vol</th><th>Basis bps</th><th>OBI</th><th>Spread bps</th>
-                <th>Funding</th><th>24h</th><th>Score</th><th>Anomaly</th>
+                <th>Funding</th><th>24h</th><th>Regime</th><th>Score</th><th>Anomaly</th>
               </tr>
             </thead>
             <tbody>
               {top.map((r) => (
-                <tr key={r.pair} className={r.anomaly ? "anomaly" : ""}>
-                  <td>{r.pair}</td>
+                <tr key={`${r.pair}-${r.margin ?? ""}`} className={"click " + (r.anomaly ? "anomaly" : "")} onClick={() => onSelect(r.pair, r.margin ?? "USDT")}>
+                  <td>{r.pair}{r.margin ? <span className="muted"> {r.margin}</span> : null}</td>
                   <td className="r">{px(r.last)}</td>
                   <td className={"r " + sign(r.ret_10s)}>{pct(r.ret_10s, 3)}</td>
                   <td className={"r " + sign(r.ret_30s)}>{pct(r.ret_30s, 3)}</td>
@@ -359,6 +376,7 @@ function ScannerPanel({ rows }: { rows: ScannerRow[] }) {
                   <td className="r">{bps(r.spread_bps)}</td>
                   <td className="r">{pct(r.funding_rate, 4)}</td>
                   <td className={"r " + sign(r.change_24h_pct)}>{isNum(r.change_24h_pct) ? r.change_24h_pct.toFixed(2) + "%" : DASH}</td>
+                  <td>{r.regime ?? DASH}</td>
                   <td className="r">{num(r.score, 3)}</td>
                   <td className="reason" title={r.anomaly_reasons.join(", ")}>
                     {r.anomaly ? "⚠ " : ""}
