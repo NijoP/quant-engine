@@ -9,9 +9,10 @@
 //!   cancels or modifies anything, and never prints the key or secret.
 //! * `--pair/--margin` fetches PUBLIC instrument metadata and checks it.
 //!
-//! Exit status 0 only if every checklist item passes. In this build the items
-//! "protective orders verified" and "120 s closure tested" cannot pass (they
-//! need a supervised live test), so live execution stays disabled.
+//! Exit status 0 only if every checklist item passes. This sprint-2 command
+//! cannot pass "protective orders verified" / "120 s closure tested"; the
+//! sprint-3 owner workflow `qe-live-check` (docs/LIVE_READINESS.md) runs the
+//! supervised test, records results and arms live.
 use qe_coindcx::auth::{load_credentials, signing_self_test};
 use qe_coindcx::live::{CheckItem, CheckStatus, LiveGate};
 use qe_coindcx::private::types::Side;
