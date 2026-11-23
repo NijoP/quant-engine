@@ -1109,6 +1109,13 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
         reasons.push("paper trading stopped".into());
     } else if cap.is_none() && !d.fut_inr.is_empty() && !d.fut_inr.contains(pair) {
         reasons.push(format!("no {TRADE_MARGIN}-margined contract for this pair"));
+    } else if let (None, Some((_, why))) =
+        (&cap, d.meta_fail.get(&format!("{pair}|{TRADE_MARGIN}")))
+    {
+        // e.g. the exchange publishes null max leverage: no permitted leverage
+        reasons.push(format!(
+            "{TRADE_MARGIN} instrument metadata rejected (not tradable): {why}"
+        ));
     } else if cap.is_none() {
         reasons.push(format!(
             "{TRADE_MARGIN} instrument metadata not fetched yet"

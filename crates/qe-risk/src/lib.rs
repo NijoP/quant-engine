@@ -589,7 +589,7 @@ impl RiskGovernor {
             return self.reject(
                 p,
                 vec![format!(
-                    "experiment stopped: equity {margin_budget:.4} below minimum tradable notional {min_notional_account:.4} at max leverage"
+                    "equity {margin_budget:.4} below minimum tradable notional {min_notional_account:.4} for this instrument at max leverage"
                 )],
                 now_ms,
             );
