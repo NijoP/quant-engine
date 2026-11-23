@@ -36,6 +36,39 @@ pub const TRADE_MARGIN: &str = "INR";
 pub const CALIB_MIN_N: usize = 200;
 pub const CALIB_MAX_ECE: f64 = 0.05;
 
+/// Opt-in paper experiment profile (configs/experiment-max-leverage.toml).
+pub const EXPERIMENT_PROFILE: &str = "experiment-max-leverage";
+pub const EXPERIMENT_BANNER: &str = "PAPER EXPERIMENT - UNGATED, MAX LEVERAGE";
+
+/// Startup guard for the experiment profile: it may only run in paper mode.
+/// Every execution-mode source must say paper (an absent env var means paper);
+/// anything else refuses startup.
+pub fn experiment_guard(
+    profile_mode: Option<&str>,
+    limits_mode: Option<&str>,
+    env_mode: Option<&str>,
+) -> Result<(), String> {
+    match profile_mode {
+        Some("paper") => {}
+        other => {
+            return Err(format!(
+            "experiment profile requires execution_mode = \"paper\" in its config (got {other:?})"
+        ))
+        }
+    }
+    if let Some(m) = limits_mode.filter(|m| *m != "paper") {
+        return Err(format!(
+            "experiment profile refused: risk-limits execution_mode = {m:?}, not paper"
+        ));
+    }
+    if let Some(m) = env_mode.filter(|m| !m.trim().eq_ignore_ascii_case("paper")) {
+        return Err(format!(
+            "experiment profile refused: QE_EXECUTION_MODE = {m:?}, not paper"
+        ));
+    }
+    Ok(())
+}
+
 pub fn now_ms() -> i64 {
     qe_coindcx::auth::request_timestamp_ms()
 }
@@ -44,6 +77,8 @@ pub fn now_ms() -> i64 {
 #[derive(Debug, Clone, Serialize)]
 pub struct Settings {
     pub execution_mode: String,
+    /// "standard" (default) or [`EXPERIMENT_PROFILE`] (opt-in, paper only).
+    pub profile: String,
     pub paper_start_equity_inr: f64,
     pub stage1_target_inr: f64,
     pub stage1_checkpoint_ms: i64,
@@ -58,6 +93,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             execution_mode: "paper".into(),
+            profile: "standard".into(),
             paper_start_equity_inr: 100.0,
             stage1_target_inr: 18_000.0,
             stage1_checkpoint_ms: 1_795_451_400_000,
@@ -443,6 +479,12 @@ pub const AGENTS: [(&str, &str, &str); 10] = [
     ),
 ];
 
+impl Settings {
+    pub fn is_experiment(&self) -> bool {
+        self.profile == EXPERIMENT_PROFILE
+    }
+}
+
 impl Desk {
     pub fn new(settings: Settings) -> Self {
         let now = now_ms();
@@ -454,11 +496,12 @@ impl Desk {
             s.stage1_checkpoint_ms as u64,
             s.stage2_target_inr,
         );
-        let gov = RiskGovernor::new(
-            s.growth.clone(),
-            s.paper_start_equity_inr,
-            s.stage1_target_inr,
-        );
+        let policy = if s.is_experiment() && s.execution_mode == "paper" {
+            RiskPolicy::experiment_max_leverage()
+        } else {
+            s.growth.clone()
+        };
+        let gov = RiskGovernor::new(policy, s.paper_start_equity_inr, s.stage1_target_inr);
         let agents = AGENTS
             .iter()
             .map(|(id, name, perm)| {
@@ -1064,6 +1107,8 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
         reasons.push("strategy evaluation disabled".into());
     } else if !d.controls.paper_running {
         reasons.push("paper trading stopped".into());
+    } else if cap.is_none() && !d.fut_inr.is_empty() && !d.fut_inr.contains(pair) {
+        reasons.push(format!("no {TRADE_MARGIN}-margined contract for this pair"));
     } else if cap.is_none() {
         reasons.push(format!(
             "{TRADE_MARGIN} instrument metadata not fetched yet"
@@ -1199,6 +1244,7 @@ fn exit_reason_str(r: qe_risk::ExitReason) -> &'static str {
         TimeExpiry => "time_stop",
         Emergency => "flatten",
         ProtectionFailed => "protection_failed",
+        Liquidated => "liquidated",
     }
 }
 
@@ -1347,6 +1393,7 @@ fn close_trade(d: &mut Desk, idx: usize, pnl: f64, exit_price: f64, reason: &str
     d.audit("trade", msg, rec.clone());
     d.closed.push_front(rec);
     d.closed.truncate(200);
+    experiment_stop_check(d);
 }
 
 /// Drop closed/rejected positions; a rejected entry frees its governor slot.
@@ -1414,6 +1461,10 @@ pub fn lifecycle_tick(d: &mut Desk) {
             Some(b) => {
                 let (bid, ask) = (b.best_bid().unwrap(), b.best_ask().unwrap());
                 d.positions[idx].mark = micro::mid(bid, ask);
+                if d.gov.policy.is_experiment() && d.positions[idx].pos.liquidation_hit(bid, ask) {
+                    liquidate(d, idx);
+                    continue;
+                }
                 let data_ok = now - b.ts < 3_000;
                 let edge = hold_edge(d, &d.positions[idx], now);
                 d.positions[idx]
@@ -1436,6 +1487,59 @@ pub fn lifecycle_tick(d: &mut Desk) {
         d.audit(
             "capital",
             "stage-1 checkpoint reached: entries paused, positions flattened; awaiting user-confirmed withdrawal and balance".into(),
+            Value::Null,
+        );
+    }
+}
+
+/// Paper experiment: the adverse move reached the estimated liquidation price,
+/// so the position is closed as liquidated and its margin (plus the entry fee)
+/// is lost. Equity never goes below zero.
+fn liquidate(d: &mut Desk, idx: usize) {
+    let fx = d.positions[idx].fx;
+    let liq = d.positions[idx].pos.order.liquidation_price.unwrap_or(0.0);
+    let pnl = d.positions[idx].pos.close_liquidated(fx).max(-d.cap.equity);
+    d.positions[idx].pos.realised_pnl = Some(pnl);
+    d.incident(
+        "paper_liquidation",
+        format!(
+            "{} liquidated at est. {liq}: margin lost, net INR {pnl:.4}",
+            d.positions[idx].pos.order.pair
+        ),
+    );
+    close_trade(d, idx, pnl, liq, "liquidated");
+}
+
+/// Experiment stop: equity below the smallest minimum notional the account can
+/// still reach at maximum leverage (over cached INR-margined instruments).
+fn experiment_stop_check(d: &mut Desk) {
+    if !d.gov.policy.is_experiment() || d.gov.entries_paused {
+        return;
+    }
+    let fx = d.fx_usdtinr().unwrap_or(f64::NAN);
+    let eq = d.cap.equity;
+    let min_margin = d
+        .instruments
+        .values()
+        .filter(|(_, i)| i.margin_currency_short_name == TRADE_MARGIN && i.status == "active")
+        .map(|(_, i)| {
+            let c = capability(i);
+            c.min_notional * fx / c.max_leverage_long.max(c.max_leverage_short).max(1.0)
+        })
+        .filter(|x| x.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let min_margin = if min_margin.is_finite() {
+        min_margin
+    } else {
+        0.0
+    };
+    if eq <= 0.0 || eq < min_margin {
+        let now = now_ms() as u64;
+        let _ = d.gov.pause_entries(true, now);
+        d.controls.entries_paused = true;
+        d.audit(
+            "capital",
+            format!("{EXPERIMENT_BANNER}: equity INR {eq:.4} below minimum tradable notional (margin INR {min_margin:.4} at max leverage); trading stopped"),
             Value::Null,
         );
     }
@@ -1478,9 +1582,22 @@ pub fn position_json(pp: &PaperPos, now: i64) -> Value {
         "risk_at_stop": p.order.risk_at_stop, "exit_reason": p.exit_reason.map(exit_reason_str)})
 }
 
+/// Active profile for the dashboard/status: the experiment banner is set only
+/// when the opt-in paper experiment is running.
+pub fn profile_json(d: &Desk) -> Value {
+    let exp = d.gov.policy.is_experiment();
+    json!({"name": d.settings.profile, "experiment": exp,
+        "banner": if exp { json!(EXPERIMENT_BANNER) } else { Value::Null },
+        "rules": if exp { json!(["paper only", "calibration gate disabled", "no session-loss / HWM stop",
+            "all paper equity as margin at the highest exchange-permitted leverage",
+            "one position at a time, profits compounded", "raw EV > 0 after fees/spread/slippage",
+            "model SL/TP, 120 s time stop, liquidation modelled (margin lost)",
+            "stops when equity is below the minimum tradable notional"]) } else { json!([]) }})
+}
+
 pub fn policy_json(d: &Desk) -> Value {
     let p = &d.gov.policy;
-    json!({"tier": if p.mode == CapitalMode::Growth {"growth"} else {"protective"},
+    json!({"profile": profile_json(d),"tier": if p.mode == CapitalMode::Growth {"growth"} else {"protective"},
         "risk_per_trade_frac": p.risk_fraction, "effective_risk_frac": d.gov.effective_risk_fraction(),
         "max_leverage": if p.policy_max_leverage.is_finite() { json!(p.policy_max_leverage) } else { json!("exchange max per instrument/tier") },
         "max_positions": p.max_open_positions, "daily_loss_limit_frac": p.max_session_loss_fraction,
@@ -1836,6 +1953,60 @@ mod tests {
         assert_eq!(
             qe_risk::max_permitted_leverage(&c, Side::Long, 5000.0, f64::INFINITY),
             10.0
+        );
+    }
+
+    #[test]
+    fn experiment_guard_refuses_anything_but_paper() {
+        assert!(experiment_guard(Some("paper"), Some("paper"), None).is_ok());
+        assert!(experiment_guard(Some("paper"), None, Some("paper")).is_ok());
+        assert!(experiment_guard(Some("live"), Some("paper"), None).is_err());
+        assert!(experiment_guard(None, Some("paper"), None).is_err());
+        assert!(experiment_guard(Some("paper"), Some("live"), None).is_err());
+        assert!(experiment_guard(Some("paper"), Some("paper"), Some("live")).is_err());
+    }
+
+    #[test]
+    fn experiment_policy_only_when_opted_in_and_paper() {
+        std::env::set_var(
+            "QE_DATA_DIR",
+            std::env::temp_dir()
+                .join("qe-desk-test")
+                .to_string_lossy()
+                .to_string(),
+        );
+        let d = Desk::new(Settings::default());
+        assert!(!d.gov.policy.is_experiment());
+        assert_eq!(profile_json(&d)["banner"], Value::Null);
+        let s = Settings {
+            profile: EXPERIMENT_PROFILE.into(),
+            ..Settings::default()
+        };
+        let d = Desk::new(s.clone());
+        assert!(d.gov.policy.is_experiment());
+        assert_eq!(profile_json(&d)["banner"], EXPERIMENT_BANNER);
+        let d = Desk::new(Settings {
+            execution_mode: "live".into(),
+            ..s
+        });
+        assert!(!d.gov.policy.is_experiment());
+    }
+
+    #[test]
+    fn experiment_liquidation_closes_with_margin_lost() {
+        let mut d = desk_with(Side::Long);
+        d.gov.policy = RiskPolicy::experiment_max_leverage();
+        // order(): margin 200 at 5x; liquidation estimated at 99.5 (inside the 99 stop)
+        d.positions[0].pos.order.liquidation_price = Some(99.5);
+        d.books.insert("B-X_USDT".into(), book(99.4, 99.45));
+        lifecycle_tick(&mut d);
+        assert!(d.positions.is_empty());
+        assert_eq!(d.closed[0]["exit_reason"], "liquidated");
+        // equity 100 < margin 200 + fee: clamped at zero, never negative
+        assert_eq!(d.cap.equity, 0.0);
+        assert!(
+            d.gov.entries_paused,
+            "experiment stops below the tradable minimum"
         );
     }
 }

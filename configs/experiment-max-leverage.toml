@@ -1,0 +1,17 @@
+# PAPER EXPERIMENT - UNGATED, MAX LEVERAGE (opt-in only).
+# Selected with `qe-desk --profile experiment` or `QE_PROFILE=experiment`; the
+# default profile and default behaviour are unchanged without it.
+# Startup refuses unless every execution-mode source is "paper".
+#
+# Rules: calibration gate and session-loss / high-water-mark stops disabled; all
+# paper equity committed as margin at the highest exchange-permitted leverage for
+# the side and notional tier (quantity rounded down, below min notional rejected);
+# one position at a time, profits compounded. Kept: raw EV > 0 after fees, spread
+# and slippage; model SL/TP; 120 s time stop; liquidation modelling (margin lost);
+# fees on every fill; the audit trail. Trading stops when equity falls below the
+# minimum tradable notional.
+profile = "experiment-max-leverage"
+execution_mode = "paper"
+paper_start_equity_inr = 100.0
+paper_slippage_bps = 2.0
+data_dir = "data/desk-experiment"   # separate audit store; QE_DATA_DIR overrides

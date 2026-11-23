@@ -82,6 +82,20 @@ pub enum CapitalMode {
     Protective,
 }
 
+/// Governor profile. `Standard` is the default and the only profile the desk
+/// uses unless the operator explicitly opts in to the paper experiment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Profile {
+    #[default]
+    Standard,
+    /// PAPER EXPERIMENT - UNGATED, MAX LEVERAGE. Paper only. No calibration
+    /// gate, no session-loss / high-water-mark stop; all equity committed as
+    /// margin at the highest exchange-permitted leverage, one position at a
+    /// time. Raw EV > 0 after costs, model SL/TP, the 120 s time stop, fees and
+    /// liquidation modelling are kept.
+    ExperimentMaxLeverage,
+}
+
 /// Hard ceilings. The governor may only tighten them, never loosen them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskPolicy {
@@ -100,6 +114,8 @@ pub struct RiskPolicy {
     pub exit_lead_ms: u64,
     pub entry_ack_timeout_ms: u64,
     pub exit_ack_timeout_ms: u64,
+    #[serde(default)]
+    pub profile: Profile,
 }
 
 impl RiskPolicy {
@@ -117,6 +133,7 @@ impl RiskPolicy {
             exit_lead_ms: 3_000,
             entry_ack_timeout_ms: 2_000,
             exit_ack_timeout_ms: 2_000,
+            profile: Profile::Standard,
         }
     }
     pub fn protective() -> Self {
@@ -133,7 +150,19 @@ impl RiskPolicy {
             exit_lead_ms: 3_000,
             entry_ack_timeout_ms: 2_000,
             exit_ack_timeout_ms: 2_000,
+            profile: Profile::Standard,
         }
+    }
+    /// Paper experiment policy: growth ceilings with [`Profile::ExperimentMaxLeverage`].
+    /// The desk only builds this when the operator opts in and execution is paper.
+    pub fn experiment_max_leverage() -> Self {
+        Self {
+            profile: Profile::ExperimentMaxLeverage,
+            ..Self::growth()
+        }
+    }
+    pub fn is_experiment(&self) -> bool {
+        self.profile == Profile::ExperimentMaxLeverage
     }
     /// Clamp a user/config-supplied policy to the mode's hard ceilings.
     pub fn clamped(mut self) -> Self {
@@ -380,15 +409,16 @@ impl RiskGovernor {
                 self.final_target
             ));
         }
+        let experiment = pol.is_experiment();
         let session_loss = -self.session_realised_pnl.min(0.0);
         let loss_limit = pol.max_session_loss_fraction * self.stage_start_equity;
-        if session_loss >= loss_limit {
+        if !experiment && session_loss >= loss_limit {
             r.push(format!(
                 "session loss {session_loss:.4} >= limit {loss_limit:.4}"
             ));
         }
         let hwm_floor = self.high_water_mark * (1.0 - pol.max_drawdown_from_hwm);
-        if acct.equity < hwm_floor {
+        if !experiment && acct.equity < hwm_floor {
             r.push(format!(
                 "equity {:.4} below high-water-mark floor {hwm_floor:.4}",
                 acct.equity
@@ -412,7 +442,7 @@ impl RiskGovernor {
         if !p.data_healthy {
             r.push("market data integrity not established".into());
         }
-        if !p.calibrated {
+        if !experiment && !p.calibrated {
             r.push("forecast uncalibrated: denied strategy authority".into());
         }
         if p.expected_net_edge.is_nan() || p.expected_net_edge <= pol.min_expected_net_edge {
@@ -437,6 +467,9 @@ impl RiskGovernor {
         }
         if !r.is_empty() {
             return self.reject(p, r, now_ms);
+        }
+        if experiment {
+            return self.size_experiment(p, inst, acct, stop_dist, now_ms);
         }
 
         // Sizing from the stop-loss risk budget, independent of leverage.
@@ -529,6 +562,129 @@ impl RiskGovernor {
         Decision::Approved(order)
     }
 
+    /// Experiment sizing: all available paper equity as margin at the highest
+    /// exchange-permitted leverage for the side and resulting notional tier.
+    /// Notional = margin * leverage, rounded down to the quantity increment;
+    /// below the exchange minimum it is rejected, never raised. Leverage is not
+    /// stepped down for the stop: a liquidation price is always estimated (with
+    /// mmr 0, i.e. at 1/L, when the exchange gives no rate) and enforced by the
+    /// lifecycle monitor.
+    fn size_experiment(
+        &mut self,
+        p: &TradeProposal,
+        inst: &InstrumentCapability,
+        acct: &AccountSnapshot,
+        stop_dist: f64,
+        now_ms: u64,
+    ) -> Decision {
+        let cap = self.policy.policy_max_leverage;
+        let margin_budget = acct.available_margin.min(acct.equity).max(0.0);
+        let fx = p.fx_to_account;
+        let min_notional_account = inst.min_notional * fx;
+        if margin_budget <= 0.0
+            || margin_budget
+                < min_notional_account
+                    / inst.max_leverage_long.max(inst.max_leverage_short).max(1.0)
+        {
+            return self.reject(
+                p,
+                vec![format!(
+                    "experiment stopped: equity {margin_budget:.4} below minimum tradable notional {min_notional_account:.4} at max leverage"
+                )],
+                now_ms,
+            );
+        }
+        // Highest leverage at the smallest notional, then step to the tier that
+        // admits margin * leverage (monotone, bounded by the number of tiers).
+        let mut lev = max_permitted_leverage(inst, p.side, 0.0, cap);
+        let mut notional_quote = margin_budget * lev / fx;
+        for _ in 0..=inst.tiers.len() + 1 {
+            let l2 = max_permitted_leverage(inst, p.side, notional_quote, cap);
+            if l2 >= lev {
+                break;
+            }
+            if l2 < 1.0 {
+                // Even the largest tier cannot hold margin * leverage: fill that tier.
+                if let Some(t) = inst
+                    .tiers
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| a.max_notional.total_cmp(&b.max_notional))
+                {
+                    lev = t.leverage.min(lev).max(1.0);
+                    notional_quote = t.max_notional.min(margin_budget * lev / fx);
+                }
+                break;
+            }
+            lev = l2;
+            notional_quote = margin_budget * lev / fx;
+        }
+        if lev < 1.0 {
+            return self.reject(
+                p,
+                vec!["no leverage tier admits this notional".into()],
+                now_ms,
+            );
+        }
+        let n_max = (notional_quote / p.entry_price).min(inst.max_quantity);
+        let qty = floor_to(n_max, inst.quantity_increment);
+        if qty <= 0.0 || qty < inst.min_quantity {
+            return self.reject(
+                p,
+                vec![format!(
+                    "min quantity {} exceeds max-leverage quantity {n_max:.8} (margin {margin_budget:.4} x {lev}x)",
+                    inst.min_quantity
+                )],
+                now_ms,
+            );
+        }
+        let notional_quote = qty * p.entry_price;
+        if notional_quote < inst.min_notional {
+            return self.reject(
+                p,
+                vec![format!(
+                    "min notional {} exceeds max-leverage notional {notional_quote:.4}; not raised",
+                    inst.min_notional
+                )],
+                now_ms,
+            );
+        }
+        let notional_account = notional_quote * fx;
+        let margin = notional_account / lev;
+        let liq = liquidation_price(
+            p.entry_price,
+            p.side,
+            lev,
+            Some(inst.maintenance_margin_rate.unwrap_or(0.0)),
+        );
+        let loss_per_unit = (stop_dist + p.cost_per_unit.max(0.0)) * fx;
+        let order = ApprovedOrder {
+            trace_id: p.trace_id.clone(),
+            pair: p.pair.clone(),
+            side: p.side,
+            qty,
+            leverage: lev,
+            entry_price: p.entry_price,
+            stop_loss: p.stop_loss,
+            take_profit: p.take_profit,
+            notional_account,
+            margin_account: margin,
+            risk_budget: margin_budget,
+            risk_at_stop: (qty * loss_per_unit).min(margin),
+            liquidation_price: liq,
+            risk_fraction_used: if acct.equity > 0.0 {
+                margin / acct.equity
+            } else {
+                0.0
+            },
+        };
+        self.open_positions += 1;
+        let mut detail = serde_json::to_value(&order).unwrap_or_default();
+        detail["profile"] = serde_json::json!("experiment_max_leverage");
+        self.log(now_ms, "approved", &p.trace_id, detail);
+        Decision::Approved(order)
+    }
+
     fn reject(&mut self, p: &TradeProposal, reasons: Vec<String>, now_ms: u64) -> Decision {
         self.log(
             now_ms,
@@ -554,6 +710,8 @@ pub enum ExitReason {
     TimeExpiry,
     Emergency,
     ProtectionFailed,
+    /// Paper experiment: the adverse move reached the estimated liquidation price.
+    Liquidated,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -884,6 +1042,33 @@ impl Position {
             return Some(pnl);
         }
         None
+    }
+
+    /// True when an open position's touch has reached its estimated liquidation
+    /// price (long: bid <= liq, short: ask >= liq).
+    pub fn liquidation_hit(&self, bid: f64, ask: f64) -> bool {
+        if !self.is_open() || self.filled_qty <= 0.0 {
+            return false;
+        }
+        match (self.order.liquidation_price, self.order.side) {
+            (Some(l), Side::Long) => bid <= l,
+            (Some(l), Side::Short) => ask >= l,
+            _ => false,
+        }
+    }
+
+    /// Close as liquidated: the position's margin is lost, plus the entry fee
+    /// already paid. Returns the realised net P&L (account currency, <= 0).
+    pub fn close_liquidated(&mut self, fx_to_account: f64) -> f64 {
+        let liq = self.order.liquidation_price.unwrap_or(self.avg_entry);
+        let open = self.filled_qty - self.exited_qty;
+        self.exited_qty = self.filled_qty;
+        self.exit_value += open * liq;
+        self.exit_reason = Some(ExitReason::Liquidated);
+        self.state = State::Closed;
+        let pnl = -(self.order.margin_account + self.entry_fees * fx_to_account);
+        self.realised_pnl = Some(pnl);
+        pnl
     }
 
     pub fn age_ms(&self, now_ms: u64) -> Option<u64> {
@@ -1407,5 +1592,121 @@ mod tests {
         assert_eq!(c.mode(), CapitalMode::Protective);
         c.on_realised(42_000.0);
         assert_eq!(c.stage, Stage::Complete);
+    }
+
+    fn exp_gov() -> RiskGovernor {
+        RiskGovernor::new(RiskPolicy::experiment_max_leverage(), 100.0, 18_000.0)
+    }
+
+    #[test]
+    fn experiment_sizes_all_equity_at_max_leverage() {
+        let mut g = exp_gov();
+        let mut p = prop(Side::Long);
+        p.calibrated = false; // calibration gate is off in the experiment
+        let mut i = inst();
+        i.tiers = vec![
+            LeverageTier {
+                leverage: 50.0,
+                max_notional: 10_000.0,
+            },
+            LeverageTier {
+                leverage: 20.0,
+                max_notional: 100_000.0,
+            },
+        ];
+        let o = approved(g.evaluate_proposal(&p, &i, &acct(100.0), 0));
+        // notional = 100 * 50 = 5000 -> 50 units at 100
+        assert_eq!(o.leverage, 50.0);
+        assert!((o.qty - 50.0).abs() < 1e-9);
+        assert!((o.notional_account - 5_000.0).abs() < 1e-6);
+        assert!((o.margin_account - 100.0).abs() < 1e-6);
+        // liq = 100 * (1 - (0.02 - 0.005)) = 98.5, inside the 99 stop is allowed
+        assert!((o.liquidation_price.unwrap() - 98.5).abs() < 1e-9);
+        // short uses the short side maximum
+        let mut g = exp_gov();
+        let o = approved(g.evaluate_proposal(&prop(Side::Short), &i, &acct(100.0), 0));
+        assert_eq!(o.leverage, 40.0);
+        assert!((o.qty - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn experiment_steps_to_the_tier_that_admits_the_notional() {
+        // 100 * 50 = 5000 > 1000 (50x tier) -> 20x tier: notional 2000
+        let mut g = exp_gov();
+        let o = approved(g.evaluate_proposal(&prop(Side::Long), &inst(), &acct(100.0), 0));
+        assert_eq!(o.leverage, 20.0);
+        assert!((o.notional_account - 2_000.0).abs() < 1e-6);
+        // quantity rounds down to the increment, never up
+        let mut g = exp_gov();
+        let o = approved(g.evaluate_proposal(&prop(Side::Long), &inst(), &acct(33.3337), 0));
+        assert!(o.qty * 100.0 <= 33.3337 * 20.0 + 1e-9);
+        assert!((o.qty - 6.666).abs() < 1e-9);
+    }
+
+    #[test]
+    fn experiment_keeps_ev_min_notional_and_one_position() {
+        let mut g = exp_gov();
+        let mut p = prop(Side::Long);
+        p.expected_net_edge = -0.001;
+        assert!(rejected(&g.evaluate_proposal(&p, &inst(), &acct(100.0), 0)));
+        let mut i = inst();
+        i.min_notional = 1_000_000.0;
+        let d = g.evaluate_proposal(&prop(Side::Long), &i, &acct(100.0), 0);
+        match d {
+            Decision::Rejected { reasons, .. } => {
+                assert!(
+                    reasons[0].contains("minimum tradable notional"),
+                    "{reasons:?}"
+                )
+            }
+            _ => panic!("approved below min notional"),
+        }
+        approved(g.evaluate_proposal(&prop(Side::Long), &inst(), &acct(100.0), 0));
+        assert!(rejected(&g.evaluate_proposal(
+            &prop(Side::Long),
+            &inst(),
+            &acct(100.0),
+            0
+        )));
+        // a big loss does not stop the experiment (no session/HWM stop), but
+        // equity below the tradable minimum does
+        g.record_realised(-60.0, 40.0, 1);
+        approved(g.evaluate_proposal(&prop(Side::Long), &inst(), &acct(40.0), 2));
+        g.record_realised(0.0, 40.0, 3);
+        assert!(rejected(&g.evaluate_proposal(
+            &prop(Side::Long),
+            &inst(),
+            &acct(0.0),
+            4
+        )));
+    }
+
+    #[test]
+    fn standard_profile_is_unchanged_by_default() {
+        assert_eq!(RiskPolicy::growth().profile, Profile::Standard);
+        assert_eq!(RiskPolicy::protective().profile, Profile::Standard);
+        let mut g = RiskGovernor::new(RiskPolicy::growth(), 100.0, 18_000.0);
+        let mut p = prop(Side::Long);
+        p.calibrated = false;
+        assert!(rejected(&g.evaluate_proposal(&p, &inst(), &acct(100.0), 0)));
+    }
+
+    #[test]
+    fn liquidation_closes_with_margin_lost() {
+        let mut g = exp_gov();
+        let o = approved(g.evaluate_proposal(&prop(Side::Long), &inst(), &acct(100.0), 0));
+        let liq = o.liquidation_price.unwrap();
+        let margin = o.margin_account;
+        let mut pos = Position::new(o, &g.policy);
+        pos.start(0);
+        pos.on_fill(pos.order.qty, 100.0, 1.0, 0);
+        pos.on_protection_confirmed();
+        assert!(!pos.liquidation_hit(liq + 0.01, liq + 0.02));
+        assert!(pos.liquidation_hit(liq, liq + 0.01));
+        let pnl = pos.close_liquidated(1.0);
+        assert!((pnl + margin + 1.0).abs() < 1e-9);
+        assert_eq!(pos.state, State::Closed);
+        assert_eq!(pos.exit_reason, Some(ExitReason::Liquidated));
+        assert!(!pos.liquidation_hit(0.0, 0.0));
     }
 }
