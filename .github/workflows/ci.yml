@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: [main, "fm/**"]
+    branches: [main, "fm/**", "campaign/**"]
   pull_request:
 permissions:
   contents: read
@@ -20,6 +20,9 @@ jobs:
       - run: cargo clippy -p qe-engine -p qe-desk -p qe-risk --all-targets --no-deps -- -D warnings
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+      # Spec: the whole workspace, all targets and features (incl. the compiled-in
+      # `live` order path), warnings denied.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
   dashboard:
     runs-on: ubuntu-latest
     defaults:
@@ -33,10 +36,12 @@ jobs:
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - run: npm ci
+      - run: npm run lint --if-present
+      - run: npm test --if-present
       - run: npm run build
   desk-artifact:
     # Release qe-desk + dashboard/dist for paper runs on machines that should not compile.
-    if: startsWith(github.ref, 'refs/heads/fm/')
+    if: startsWith(github.ref, 'refs/heads/fm/') || startsWith(github.ref, 'refs/heads/campaign/') || startsWith(github.head_ref, 'campaign/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +52,7 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
-      - run: cargo build --release -p qe-desk
+      - run: cargo build --release -p qe-desk --features live
       - run: npm ci && npm run build
         working-directory: dashboard
       - uses: actions/upload-artifact@v4

@@ -117,6 +117,8 @@ pub struct Settings {
     pub gamble: Option<qe_risk::gamble::GambleParams>,
     /// Gamble entries as passive limit (maker) orders; see [`MakerEntry`].
     pub gamble_maker_entry: bool,
+    /// Campaign bold-play stake toward the next hourly milestone (gamble profile).
+    pub campaign_bold: bool,
     /// Cancel an unfilled maker entry after this long; never chased with a taker.
     pub maker_timeout_ms: i64,
     /// Payoff per bet (`[payoff]` in the gamble config, qe_risk::gamble::payoff):
@@ -141,6 +143,7 @@ impl Default for Settings {
             protective: RiskPolicy::protective(),
             gamble: None,
             gamble_maker_entry: false,
+            campaign_bold: false,
             maker_timeout_ms: 4_000,
             payoff: None,
         }
@@ -594,6 +597,7 @@ impl Desk {
     pub fn new(settings: Settings) -> Self {
         let now = now_ms();
         let s = &settings;
+        let camp_cfg = campaign_cfg(s);
         let cap = CapitalController::new(s.plan(), dec(s.paper_start_equity_inr), true, now as u64);
         let policy = if s.is_experiment() && s.execution_mode == "paper" {
             RiskPolicy::experiment_max_leverage()
@@ -687,7 +691,7 @@ impl Desk {
             gamble_trades: HashMap::new(),
             gamble_sim: None,
             maker_stats: MakerStats::default(),
-            campaign: Campaign::new(CampaignConfig::default(), EquitySource::Paper),
+            campaign: Campaign::new(camp_cfg, EquitySource::Paper),
             campaign_error: None,
         };
         load_campaign(&mut desk);
@@ -1483,6 +1487,24 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             available_margin: (eq - d.used_margin()).max(0.0),
             paper: true,
         };
+        if d.campaign.cfg.bold_play {
+            // Bold play: margin so one TP win (net of cost) reaches the next hourly
+            // milestone, capped by equity above the owner floor; leverage is the
+            // owner setting capped by the instrument max for this side.
+            let next_h =
+                (d.campaign.checkpoints_done(now) + 1).min(qe_engine::campaign::CAMPAIGN_HOURS);
+            let next_req = dec_f64(d.campaign.cfg.checkpoint_required(next_h));
+            if let Some(g) = d.gov.policy.gamble.as_mut() {
+                let side_max = if side == Side::Long {
+                    c.max_leverage_long
+                } else {
+                    c.max_leverage_short
+                };
+                let lev = (g.leverage as f64).min(side_max).max(1.0);
+                let stake = d.campaign.cfg.bold_stake(eq, next_req, lev, tp - cost);
+                g.stake_inr = dec(stake).round_dp(2);
+            }
+        }
         match d.gov.evaluate_proposal(&proposal, &c, &acct, now as u64) {
             Decision::Approved(o) => {
                 // Campaign risk profile: planned loss = stop loss + round-trip fees
@@ -1594,10 +1616,6 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             gamble,
         });
         match crate::learn::record_decision(d, snap) {
-            Ok(()) if crate::live_exec::live_installed() && gamble => d.incident(
-                "live",
-                format!("{trace}: gamble mode is paper/research only, entry NOT sent live"),
-            ),
             Ok(()) if crate::live_exec::live_installed() => {
                 let lev = |x: f64| (x.is_finite() && x >= 1.0).then_some(x as u32);
                 let job = crate::live_exec::LiveJob {
@@ -3389,8 +3407,17 @@ fn campaign_path(d: &Desk) -> std::path::PathBuf {
 
 /// Restart recovery: resume the persisted campaign (a stop stays a stop). An
 /// unreadable or foreign state blocks entries instead of being reset silently.
+/// The campaign profile: bold play (owner floor) for the campaign gamble
+/// profile, otherwise the protective INR 1 / INR 5 profile.
+pub fn campaign_cfg(s: &Settings) -> CampaignConfig {
+    match (&s.gamble, s.campaign_bold) {
+        (Some(g), true) => CampaignConfig::bold(g.floor_inr),
+        _ => CampaignConfig::default(),
+    }
+}
+
 pub fn load_campaign(d: &mut Desk) {
-    let cfg = CampaignConfig::default();
+    let cfg = campaign_cfg(&d.settings);
     let src = if crate::live_exec::live_installed() {
         EquitySource::LiveExchange
     } else {

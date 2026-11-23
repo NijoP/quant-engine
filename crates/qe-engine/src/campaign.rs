@@ -8,11 +8,14 @@
 //! The hourly multiplier is `500 ^ (1/22) = 1.3264181...`, i.e. a required
 //! compounded growth of about 32.6418 % per hour.
 //!
-//! This curve is a **mathematical requirement, not a trading forecast**. It is a
-//! progress benchmark only: nothing in this module sizes, selects, forces or
-//! loosens a trade. Being behind the curve is a reporting condition; the campaign
-//! risk profile ([`CampaignConfig::trade_budget`]) is identical whether the
-//! campaign is ahead, on track or behind.
+//! This curve is a **mathematical requirement, not a trading forecast**. In the
+//! default protective profile it is a progress benchmark only: the per-trade
+//! budget ([`CampaignConfig::trade_budget`]) is identical whether the campaign is
+//! ahead, on track or behind. The owner-selected **bold-play** profile
+//! ([`CampaignConfig::bold`], configs/campaign-live.toml, owner instruction of
+//! 23 Nov 2026 23:21 IST) sizes each bet so one TP win reaches the next hourly
+//! milestone ([`CampaignConfig::bold_stake`]), capped by the equity above an
+//! owner-set floor; it has no proven edge and can lose everything above the floor.
 //!
 //! # Rounding (documented, applied consistently)
 //!
@@ -90,6 +93,12 @@ pub struct CampaignConfig {
     pub max_hold_secs: u32,
     /// Relative band around the required equity that counts as "on track".
     pub on_track_band: Decimal,
+    /// Owner-selected campaign bold-play profile (configs/campaign-live.toml):
+    /// the per-trade budget is all equity above the owner floor and the INR 1 /
+    /// INR 5 caps and the no-size-up-after-loss rule do not apply. Default false
+    /// (the protective INR 1 / INR 5 profile).
+    #[serde(default)]
+    pub bold_play: bool,
 }
 
 impl Default for CampaignConfig {
@@ -105,7 +114,39 @@ impl Default for CampaignConfig {
             max_open_positions: 1,
             max_hold_secs: 120,
             on_track_band: dec!(0.01),
+            bold_play: false,
         }
+    }
+}
+
+impl CampaignConfig {
+    /// Bold-play profile with an owner-set floor (required, no default).
+    pub fn bold(floor: Decimal) -> Self {
+        Self {
+            floor,
+            max_loss_per_trade: dec!(50000),
+            max_campaign_loss: dec!(100) - floor,
+            bold_play: true,
+            ..Self::default()
+        }
+    }
+
+    /// Bold-play margin so that one take-profit win (net of round-trip cost,
+    /// `net_tp_frac` of notional) lifts equity to the next hourly milestone,
+    /// capped by the equity above the floor. Returns INR margin (may be 0).
+    pub fn bold_stake(
+        &self,
+        equity: f64,
+        next_required: f64,
+        leverage: f64,
+        net_tp_frac: f64,
+    ) -> f64 {
+        let above = (equity - self.floor.to_f64().unwrap_or(f64::INFINITY)).max(0.0);
+        if !(leverage >= 1.0 && net_tp_frac > 0.0 && equity.is_finite()) {
+            return 0.0;
+        }
+        let need = (next_required - equity).max(0.0);
+        (need / (leverage * net_tp_frac)).min(above)
     }
 }
 
@@ -169,6 +210,9 @@ impl CampaignConfig {
     /// The per-trade planned-loss budget allowed right now. It depends only on the
     /// fixed limits, the equity and the loss already used: never on the schedule.
     pub fn trade_budget(&self, equity: Decimal, loss_used: Decimal) -> Decimal {
+        if self.bold_play {
+            return (equity - self.floor).max(Decimal::ZERO);
+        }
         let remaining = (self.max_campaign_loss - loss_used).max(Decimal::ZERO);
         let above_floor = (equity - self.floor).max(Decimal::ZERO);
         self.max_loss_per_trade
@@ -534,7 +578,7 @@ impl Campaign {
                 t.min_notional_inr.round_dp(4)
             ));
         }
-        if let Some(prev) = self.last_loss_planned {
+        if let Some(prev) = self.last_loss_planned.filter(|_| !self.cfg.bold_play) {
             if total > prev {
                 why.push(format!(
                     "no size increase after a loss: planned INR {} > previous INR {}",
@@ -1115,6 +1159,33 @@ mod tests {
         assert!(kinds.contains(&"trade_check"));
         assert!(kinds.contains(&"trade_closed"));
         assert!(kinds.contains(&"checkpoint"));
+    }
+
+    #[test]
+    fn bold_profile_keeps_floor_liquidation_and_one_position() {
+        let mut c = Campaign::new(CampaignConfig::bold(dec!(60)), P);
+        c.observe(CAMPAIGN_START_MS, Some(dec!(100)), P, Z, Z);
+        assert_eq!(c.risk_budget_now(), dec!(40));
+        let now = CAMPAIGN_START_MS + 1;
+        assert!(c.check_trade(now, &check("30", "1", "1")).is_ok());
+        assert!(
+            c.check_trade(now, &check("41", "0", "0")).is_err(),
+            "never beyond the floor"
+        );
+        let mut t = check("10", "0", "0");
+        t.liquidation_price = Some(99.5);
+        assert!(
+            c.check_trade(now, &t).is_err(),
+            "SL stays inside liquidation"
+        );
+        assert!(c.entry_gate(now, 1).is_err(), "one position");
+        c.observe(now + 1, Some(dec!(60)), P, dec!(-40), Z);
+        assert!(c.is_stopped(), "owner floor is a permanent stop");
+        // stake: need 133 - 100 = 33 with 10x and 1% net TP -> 330, capped at 40 above floor
+        let cfg = CampaignConfig::bold(dec!(60));
+        assert!((cfg.bold_stake(100.0, 133.0, 10.0, 0.01) - 40.0).abs() < 1e-9);
+        assert!((cfg.bold_stake(100.0, 101.0, 10.0, 0.01) - 10.0).abs() < 1e-9);
+        assert_eq!(cfg.bold_stake(100.0, 133.0, 10.0, -0.01), 0.0);
     }
 
     #[test]

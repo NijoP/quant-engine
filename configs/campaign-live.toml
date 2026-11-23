@@ -1,0 +1,32 @@
+# 24 NOV 2026 CAMPAIGN - BOLD PLAY profile (owner instruction 23 Nov 2026 23:21 IST).
+# Run: QE_GAMBLE_CONFIG=configs/campaign-live.toml qe-desk --profile gamble
+# PAPER by default. Live needs QE_EXECUTION_MODE=live, a `--features live` build
+# and the existing owner arming (qe-live-check); this file alone never trades live.
+#
+# Stake: each bet's margin is sized so ONE take-profit win (net of round-trip
+# cost) lifts equity to the NEXT hourly milestone (100 * 500^(h/22)), capped by
+# the equity above floor_inr. There is NO proven edge: each bet's expected value
+# after costs is usually negative, and a run of stops ends at the floor.
+# Kept, never removed: exchange SL + TP on every entry (flatten if protection is
+# not confirmed), SL inside liquidation, 120 SECOND time exit, one position,
+# kill switch, permanent floor stop, refusal on stale data / failed reconciliation.
+enabled = false                  # owner sets true
+# owner_ack = "I ACCEPT: gamble mode has no proven edge and can lose my stake down to the floor"
+# floor_inr = "60"               # REQUIRED, no default: permanent stop at/below this equity
+# leverage = 20                  # REQUIRED: whole number, capped by the instrument max per side/tier
+# stake_inr = "10"               # REQUIRED by the validator; overridden per bet by campaign_stake
+stake_policy = "fixed"
+campaign_stake = "next_milestone"
+entry = "maker"                  # post-only maker entry (#21); "taker" = taker entry
+execution_mode = "paper"
+paper_start_equity_inr = 100.0
+paper_slippage_bps = 2.0
+data_dir = "data/desk-campaign"
+
+[payoff]
+max_cost_share_of_tp = 0.25
+tp_range_share = 0.5
+sl_to_tp = 0.5
+maker_entry = true
+liq_buffer_frac = 0.001
+prior_weight = 20.0

@@ -206,6 +206,15 @@ fn load_settings() -> anyhow::Result<Settings> {
             .map_err(|e| anyhow::anyhow!("gamble profile refused: {e}"))?;
         debug_assert_eq!(p2.leverage, params.leverage);
         st.gamble = Some(p2);
+        // Campaign bold play (configs/campaign-live.toml): stake toward the next
+        // hourly milestone, capped by equity above the owner floor.
+        match t.get("campaign_stake").and_then(|v| v.as_str()) {
+            None | Some("fixed") => {}
+            Some("next_milestone") => st.campaign_bold = true,
+            Some(o) => anyhow::bail!(
+                "gamble profile refused: campaign_stake {o:?} (use \"fixed\" or \"next_milestone\")"
+            ),
+        }
         // Entry order type (docs/GAMBLE_MODE.md "Maker entries"): taker unless set.
         match t.get("entry").and_then(|v| v.as_str()).unwrap_or("taker") {
             "taker" => st.gamble_maker_entry = false,
