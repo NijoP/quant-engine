@@ -39,6 +39,12 @@ impl ReadOnlyAccount {
         }
     }
 
+    /// Point at another base URL (tests: a local mock server).
+    pub fn with_base_url(mut self, base: &str) -> Self {
+        self.client = self.client.with_base_url(base);
+        self
+    }
+
     pub async fn spot_balances(&self) -> Result<Vec<SpotBalance>, PrivateError> {
         self.client.spot_balances().await
     }
@@ -79,6 +85,65 @@ impl ReadOnlyAccount {
     }
 }
 
+/// Verified INR equity of the INR-margined futures wallet: `balance +
+/// locked_balance` of the wallet whose currency is INR. USDT wallets are never
+/// converted or added. Missing/duplicate/non-finite INR wallet -> error.
+pub fn inr_wallet_equity(wallets: &[FuturesWallet]) -> Result<f64, String> {
+    let inr: Vec<&FuturesWallet> = wallets
+        .iter()
+        .filter(|w| w.currency_short_name.as_deref() == Some("INR"))
+        .collect();
+    match inr.as_slice() {
+        [w] => {
+            let b = w.balance.ok_or("INR wallet balance missing")?;
+            let l = w.locked_balance.unwrap_or(0.0);
+            let e = b + l;
+            if e.is_finite() && e >= 0.0 {
+                Ok(e)
+            } else {
+                Err(format!("INR wallet balance not usable: {e}"))
+            }
+        }
+        [] => Err("no INR futures wallet in the account".into()),
+        _ => Err("more than one INR futures wallet: ambiguous".into()),
+    }
+}
+
+/// Redacted, human-readable summary for `qe-desk --readonly-check`.
+pub fn summary(s: &AccountSnapshot) -> String {
+    let mut out = String::from("READ-ONLY account check (no orders, secrets redacted)\n");
+    for w in &s.wallets {
+        out += &format!(
+            "futures wallet {}: balance {:?} locked {:?}\n",
+            w.currency_short_name.as_deref().unwrap_or("?"),
+            w.balance,
+            w.locked_balance
+        );
+    }
+    out += &format!(
+        "INR campaign equity: {}\n",
+        match inr_wallet_equity(&s.wallets) {
+            Ok(e) => format!("INR {e:.2} (INR futures wallet; USDT not converted)"),
+            Err(e) => format!("UNAVAILABLE ({e})"),
+        }
+    );
+    let nz: Vec<&SpotBalance> = s
+        .spot
+        .iter()
+        .filter(|b| b.balance.unwrap_or(0.0) != 0.0)
+        .collect();
+    out += &format!("spot balances (non-zero): {}\n", nz.len());
+    for b in nz {
+        out += &format!("  {b:?}\n");
+    }
+    out += &format!("open positions: {}\n", s.positions.len());
+    for p in &s.positions {
+        out += &format!("  {p:?}\n");
+    }
+    out += &format!("open orders: {}\n", s.open_orders.len());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +158,27 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("redacted"));
+    }
+
+    fn w(cur: &str, bal: Option<f64>, locked: Option<f64>) -> FuturesWallet {
+        FuturesWallet {
+            id: None,
+            currency_short_name: Some(cur.into()),
+            balance: bal,
+            locked_balance: locked,
+            cross_order_margin: None,
+            cross_user_margin: None,
+        }
+    }
+
+    #[test]
+    fn inr_equity_uses_the_inr_wallet_only() {
+        let ws = [w("USDT", Some(5.0), None), w("INR", Some(90.0), Some(10.0))];
+        assert_eq!(inr_wallet_equity(&ws).unwrap(), 100.0);
+        assert!(inr_wallet_equity(&[w("USDT", Some(5.0), None)]).is_err());
+        assert!(inr_wallet_equity(&[w("INR", None, None)]).is_err());
+        assert!(
+            inr_wallet_equity(&[w("INR", Some(1.0), None), w("INR", Some(2.0), None)]).is_err()
+        );
     }
 }

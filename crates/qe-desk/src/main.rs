@@ -1552,6 +1552,9 @@ async fn ws_push(mut sock: WebSocket, a: App) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--readonly-check") {
+        std::process::exit(readonly_check().await);
+    }
     let addr = std::env::var("QE_DESK_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
     let settings = match load_settings() {
         Ok(s) => s,
@@ -1610,6 +1613,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(book_loop(c.clone(), s.clone()));
     tokio::spawn(position_book_loop(c.clone(), s.clone()));
     tokio::spawn(lifecycle_loop(s.clone()));
+    if live_exec::live_installed() {
+        tokio::spawn(account_loop(s.clone()));
+    }
     // Metadata gets its own client (own 8 req/s pacing and breaker; the loop makes
     // 1 req/s): instrument records the exchange returns with null fields fail to
     // decode, and those must not open the market-data client's circuit breaker.
@@ -1653,4 +1659,74 @@ async fn main() -> anyhow::Result<()> {
     let l = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(l, app).await?;
     Ok(())
+}
+
+/// `qe-desk --readonly-check`: owner-run, read-only account check (balances,
+/// futures wallets, positions, open orders), secrets redacted. Places nothing.
+async fn readonly_check() -> i32 {
+    let (creds, status) = qe_coindcx::auth::load_credentials();
+    let Some(creds) = creds else {
+        eprintln!("credentials not configured ({status:?}); nothing read");
+        return 1;
+    };
+    let ro = qe_coindcx::private::readonly::ReadOnlyAccount::new(creds);
+    match ro.snapshot(&["INR", "USDT"]).await {
+        Ok(s) => {
+            println!("{}", qe_coindcx::private::readonly::summary(&s));
+            0
+        }
+        Err(e) => {
+            eprintln!("read-only check FAILED: {e}");
+            3
+        }
+    }
+}
+
+/// Live only: verified INR futures-wallet equity every 10 s, read-only. Any
+/// failed read (wallets, positions or open orders) marks the account
+/// unreconciled and the campaign refuses entries until a read succeeds.
+async fn account_loop(s: S) {
+    let (creds, _) = qe_coindcx::auth::load_credentials();
+    let Some(creds) = creds else {
+        s.write().await.live_account_err = Some("credentials not configured".into());
+        return;
+    };
+    let ro = qe_coindcx::private::readonly::ReadOnlyAccount::new(creds);
+    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        tick.tick().await;
+        let r = ro.snapshot(&["INR"]).await;
+        let now = now_ms();
+        let mut d = s.write().await;
+        let res = r.map_err(|e| e.to_string()).and_then(|snap| {
+            qe_coindcx::private::readonly::inr_wallet_equity(&snap.wallets)
+                .map(|e| (e, snap.positions.len(), snap.open_orders.len()))
+        });
+        match res {
+            Ok((e, np, no)) => {
+                if d.live_account_err.take().is_some() {
+                    d.audit(
+                        "account",
+                        "read-only account reads recovered".into(),
+                        Value::Null,
+                    );
+                }
+                d.live_inr_equity = Some((now, e));
+                d.agent_ok(
+                    "account_reader",
+                    now,
+                    format!("INR equity {e:.2}; {np} position(s), {no} open order(s)"),
+                );
+            }
+            Err(e) => {
+                if d.live_account_err.is_none() {
+                    d.incident(
+                        "account",
+                        format!("read-only account read failed, entries refused: {e}"),
+                    );
+                }
+                d.live_account_err = Some(e);
+            }
+        }
+    }
 }

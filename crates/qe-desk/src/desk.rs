@@ -427,6 +427,10 @@ pub struct Desk {
     /// 24 Nov 2026 campaign controller (benchmark + campaign risk profile).
     pub campaign: Campaign,
     pub campaign_error: Option<String>,
+    /// Live only: (read at ms, verified INR futures-wallet equity) from the
+    /// read-only account loop; stale after LIVE_EQUITY_MAX_AGE_MS.
+    pub live_inr_equity: Option<(i64, f64)>,
+    pub live_account_err: Option<String>,
 }
 
 pub type WsPrice = (i64, f64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
@@ -693,6 +697,8 @@ impl Desk {
             maker_stats: MakerStats::default(),
             campaign: Campaign::new(camp_cfg, EquitySource::Paper),
             campaign_error: None,
+            live_inr_equity: None,
+            live_account_err: None,
         };
         load_campaign(&mut desk);
         desk.learn = crate::learn::LearnCtx::open(&desk.store.dir);
@@ -3446,11 +3452,11 @@ pub fn load_campaign(d: &mut Desk) {
 /// audit every campaign event and persist the state.
 pub fn campaign_tick(d: &mut Desk, now: i64) {
     let live = crate::live_exec::live_installed();
-    // Live: the paper ledger is never real capital. No verified exchange balance
-    // is wired into this build, so live equity is reported as unknown (null) and
-    // the campaign gate refuses entries.
+    // Live: the paper ledger is never real capital. Equity is the verified INR
+    // futures-wallet balance from the read-only account loop (every 10 s); a
+    // failed or stale read makes it unknown (null) and the gate refuses entries.
     let (eq, src) = if live {
-        (None, EquitySource::LiveExchange)
+        (live_campaign_equity(d, now), EquitySource::LiveExchange)
     } else {
         (Some(d.cap.equity), EquitySource::Paper)
     };
@@ -3555,6 +3561,19 @@ pub fn campaign_tick(d: &mut Desk, now: i64) {
     }
 }
 
+/// A live balance older than this is not used (the read loop runs every 10 s).
+pub const LIVE_EQUITY_MAX_AGE_MS: i64 = 30_000;
+
+/// Verified live INR equity, or None when the last read failed or is stale.
+pub fn live_campaign_equity(d: &Desk, now: i64) -> Option<Decimal> {
+    if d.live_account_err.is_some() {
+        return None;
+    }
+    d.live_inr_equity
+        .filter(|(t, v)| now - *t <= LIVE_EQUITY_MAX_AGE_MS && v.is_finite())
+        .map(|(_, v)| dec(v))
+}
+
 fn persist_campaign(d: &mut Desk) {
     let Ok(txt) = serde_json::to_string(&d.campaign) else {
         return;
@@ -3586,7 +3605,7 @@ pub fn campaign_json(d: &Desk, now: i64) -> Value {
         });
     let note = match d.campaign.equity_source {
         EquitySource::Paper => "PAPER ledger in INR (simulated, not real capital); USDT P&L converted at the CoinDCX USDTINR spot mid",
-        EquitySource::LiveExchange => "live: no verified CoinDCX INR balance in this build (null); INR and USDT are never combined without a stated rate",
+        EquitySource::LiveExchange => "LIVE: CoinDCX INR futures wallet (balance + locked), read-only every 10 s; null if the read failed or is older than 30 s; USDT wallets are never converted or added",
     };
     let mut j = d.campaign.to_json(now, open, note);
     j["error"] = json!(d.campaign_error);
@@ -3608,5 +3627,48 @@ mod campaign_tests {
         assert_eq!(j["deadline"], "2026-11-24T22:00:00+05:30");
         assert_eq!(j["milestones"].as_array().unwrap().len(), 23);
         assert_eq!(j["equity_source"], "paper");
+    }
+
+    #[test]
+    fn live_equity_must_be_fresh_and_error_free() {
+        let mut d = Desk::new(Settings::default());
+        let now = 1_000_000;
+        assert_eq!(live_campaign_equity(&d, now), None);
+        d.live_inr_equity = Some((now - 5_000, 100.0));
+        assert_eq!(live_campaign_equity(&d, now), Some(dec(100.0)));
+        d.live_inr_equity = Some((now - LIVE_EQUITY_MAX_AGE_MS - 1, 100.0));
+        assert_eq!(live_campaign_equity(&d, now), None, "stale read refused");
+        d.live_inr_equity = Some((now, 100.0));
+        d.live_account_err = Some("401".into());
+        assert_eq!(live_campaign_equity(&d, now), None, "failed read refused");
+    }
+
+    /// Mocked HTTP: the read-only account reads wallets/positions/orders/balances
+    /// from a local server; no credentials or exchange are involved.
+    #[tokio::test]
+    async fn readonly_account_reads_inr_equity_from_mock_http() {
+        use axum::{routing::any, Router};
+        let app = Router::new()
+            .route(
+                "/exchange/v1/derivatives/futures/wallets",
+                any(|| async {
+                    r#"[{"currency_short_name":"INR","balance":"97.5","locked_balance":"2.5"},{"currency_short_name":"USDT","balance":"3"}]"#
+                }),
+            )
+            .fallback(any(|| async { "[]" }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let creds = qe_coindcx::auth::Credentials::new("k-test".into(), "s-test".into()).unwrap();
+        let ro = qe_coindcx::private::readonly::ReadOnlyAccount::new(creds)
+            .with_base_url(&format!("http://{addr}"));
+        let snap = ro.snapshot(&["INR"]).await.unwrap();
+        let eq = qe_coindcx::private::readonly::inr_wallet_equity(&snap.wallets).unwrap();
+        assert_eq!(eq, 100.0);
+        let txt = qe_coindcx::private::readonly::summary(&snap);
+        assert!(
+            txt.contains("INR 100.00") && !txt.contains("s-test"),
+            "{txt}"
+        );
     }
 }
