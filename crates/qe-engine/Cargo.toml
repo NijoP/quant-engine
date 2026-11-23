@@ -1,0 +1,11 @@
+[package]
+name = "qe-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qe-math = { path = "../qe-math" }
+qe-coindcx = { path = "../qe-coindcx" }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "qe-coindcx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Live order submission is compiled OUT by default. Even when this feature is
+# enabled the runtime gate (operator flag + credentials) must also pass.
+live-orders = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
