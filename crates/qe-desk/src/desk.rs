@@ -943,7 +943,14 @@ pub fn scan(d: &mut Desk) {
             .and_then(|c| c.get(&ContextTf::M1))
             .map(|c| c.sigma);
         let regime = d.regimes.get(pair).map(|r| r.join(","));
+        // Known-ineligible INR contracts (e.g. null exchange max leverage) rank last so
+        // the order-book / trade shortlist is spent on instruments that can trade.
+        let tradable = d
+            .instruments
+            .get(&format!("{pair}|{TRADE_MARGIN}"))
+            .map(|(_, i)| i.is_tradable());
         rows.push(json!({
+            "tradable": tradable,
             "pair": pair, "margin": if d.fut_inr.contains(pair) { "INR" } else { "USDT" },
             "last": last, "mark": mark, "funding_rate": fr, "change_24h_pct": pc, "volume_24h": vol,
             "ret_10s": r10, "ret_30s": ret_over(h, 30_000), "ret_60s": ret_over(h, 60_000), "ret_300s": ret_over(h, 300_000),
@@ -953,10 +960,13 @@ pub fn scan(d: &mut Desk) {
         }));
     }
     rows.sort_by(|a, b| {
-        b["score"]
-            .as_f64()
-            .unwrap_or(0.0)
-            .total_cmp(&a["score"].as_f64().unwrap_or(0.0))
+        let dead = |r: &Value| r["tradable"] == json!(false);
+        dead(a).cmp(&dead(b)).then_with(|| {
+            b["score"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .total_cmp(&a["score"].as_f64().unwrap_or(0.0))
+        })
     });
     for (i, r) in rows.iter_mut().enumerate() {
         r["rank"] = json!(i + 1);
