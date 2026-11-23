@@ -112,6 +112,10 @@ pub struct Settings {
     pub protective: RiskPolicy,
     /// Owner gamble parameters (Some only for the gamble profile).
     pub gamble: Option<qe_risk::gamble::GambleParams>,
+    /// Gamble entries as passive limit (maker) orders; see [`MakerEntry`].
+    pub gamble_maker_entry: bool,
+    /// Cancel an unfilled maker entry after this long; never chased with a taker.
+    pub maker_timeout_ms: i64,
 }
 
 impl Default for Settings {
@@ -130,6 +134,8 @@ impl Default for Settings {
             growth: RiskPolicy::growth(),
             protective: RiskPolicy::protective(),
             gamble: None,
+            gamble_maker_entry: false,
+            maker_timeout_ms: 4_000,
         }
     }
 }
@@ -165,9 +171,34 @@ pub struct PaperPos {
     pub margin: String,
     pub fx: f64,
     pub taker_fee: f64,
+    pub maker_fee: f64,
     pub mark: f64,
     pub entry_ref_mid: f64,
     pub proposal: Value,
+    /// Resting paper maker entry, until filled or cancelled.
+    pub maker: Option<MakerEntry>,
+}
+
+/// A paper passive-limit entry resting at the touch (buy at the bid, sell at
+/// the ask). It fills only when public trades print strictly THROUGH its price
+/// after it was placed (a print at the price is not enough: our queue position
+/// is unknown, so we assume we are last in the queue). Fills are at the limit
+/// price and pay the instrument's maker fee. Unfilled at the deadline: the
+/// remainder is cancelled (no taker chase).
+#[derive(Debug, Clone)]
+pub struct MakerEntry {
+    pub price: f64,
+    pub placed_ms: i64,
+    pub deadline_ms: i64,
+}
+
+/// Paper maker-entry counters for `/api/state.gamble.maker`.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct MakerStats {
+    pub placed: u32,
+    pub filled: u32,
+    pub partial: u32,
+    pub cancelled: u32,
 }
 
 /// One forecast awaiting its 120 s outcome (forward, chronological: no lookahead).
@@ -382,6 +413,7 @@ pub struct Desk {
     pub gamble_trades: HashMap<(String, bool), qe_risk::gamble::HitCounts>,
     /// Latest target-probability Monte Carlo (refreshed by the monitor loop).
     pub gamble_sim: Option<Value>,
+    pub maker_stats: MakerStats,
 }
 
 pub type WsPrice = (i64, f64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
@@ -644,6 +676,7 @@ impl Desk {
             gamble_board: HashMap::new(),
             gamble_trades: HashMap::new(),
             gamble_sim: None,
+            maker_stats: MakerStats::default(),
         };
         desk.learn = crate::learn::LearnCtx::open(&desk.store.dir);
         if let Some(e) = desk.learn.error.clone() {
@@ -1092,8 +1125,15 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     let fee = cap.as_ref().map(|c| c.taker_fee);
     let slip = d.settings.paper_slippage_bps / 1e4;
     let fee_used = fee.unwrap_or(f64::NAN);
-    // C = 2 * taker fee + spread + 2 * slippage (round trip, charged once)
-    let cost = 2.0 * fee_used + (ask - bid) / mid + 2.0 * slip;
+    let maker_entry = d.settings.gamble_maker_entry && d.gov.policy.is_gamble();
+    let cost = if maker_entry {
+        // Maker entry rests at the near touch and the taker exit leaves from
+        // the same side: maker fee + taker fee + exit slippage, no spread.
+        cap.as_ref().map_or(f64::NAN, |c| c.maker_fee) + fee_used + slip
+    } else {
+        // C = 2 * taker fee + spread + 2 * slippage (round trip, charged once)
+        2.0 * fee_used + (ask - bid) / mid + 2.0 * slip
+    };
 
     let mut sides = vec![];
     for (side, m) in [(Side::Long, mu), (Side::Short, -mu)] {
@@ -1172,7 +1212,10 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
                 && c.max_leverage_long >= 1.0
                 && c.max_leverage_short >= 1.0
                 && c.supports_market_order
-        });
+        }) && (!maker_entry
+            || meta
+                .as_ref()
+                .is_some_and(|m| m.order_types.iter().any(|o| o == "limit_order")));
         if tradable {
             d.gamble_board
                 .insert((pair.to_string(), me.long), me.clone());
@@ -1200,7 +1243,10 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             net = pt * tp - ps * sl + fp.p_neither * fp.e_ret_neither - cost;
         }
     }
-    let entry = if side == Side::Long { ask } else { bid };
+    let entry = match (side == Side::Long, maker_entry) {
+        (true, false) | (false, true) => ask,
+        (true, true) | (false, false) => bid,
+    };
     let dir = if side == Side::Long { 1.0 } else { -1.0 };
     let inc = cap.as_ref().map_or(0.0, |c| c.price_increment);
     let tp_price = round_to(entry * (dir * tp).exp(), inc);
@@ -1216,7 +1262,8 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             "barriers": "TP = K_TARGET * sigma_1s * sqrt(120), SL = K_STOP * sigma_1s * sqrt(120)",
             "first_passage": "binomial lattice dt=0.5 s, horizon 120 s",
             "ev": "EV = P(TP) W - P(SL) L + P(neither) E[R|neither] - C",
-            "cost": "C = 2 * taker_fee(live instrument) + (ask-bid)/mid + 2 * paper_slippage",
+            "cost": if maker_entry { "C = maker_fee + taker_fee + paper_slippage (maker entry at the near touch)" }
+                else { "C = 2 * taker_fee(live instrument) + (ask-bid)/mid + 2 * paper_slippage" },
         },
         "inputs": {"bid": bid, "ask": ask, "mid": mid, "obi_10": obi, "spread_bps": spread_bps, "r_60": m60 * 60.0,
             "sigma_1s": sig, "book_age_ms": book_age, "lambda_mom": LAMBDA_MOM, "gamma_obi": GAMMA_OBI,
@@ -1395,6 +1442,9 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
                             c.max_leverage_short
                         }),
                         governor_approved: true,
+                        entry_limit: maker_entry.then_some(o.entry_price),
+                        fill_timeout_ms: maker_entry
+                            .then_some(d.settings.maker_timeout_ms.max(1) as u64),
                     },
                     risk_at_stop: o.risk_at_stop,
                     risk_fraction: d.gov.policy.risk_fraction,
@@ -1428,6 +1478,11 @@ fn open_paper(
 ) {
     let now = now_ms() as u64;
     let policy = d.gov.policy.clone();
+    let maker = (d.settings.gamble_maker_entry && policy.is_gamble()).then(|| MakerEntry {
+        price: o.entry_price,
+        placed_ms: now as i64,
+        deadline_ms: now as i64 + d.settings.maker_timeout_ms,
+    });
     let mut pos = Position::new(o, &policy);
     let actions = pos.start(now);
     d.positions.push(PaperPos {
@@ -1435,9 +1490,11 @@ fn open_paper(
         margin: TRADE_MARGIN.into(),
         fx,
         taker_fee: c.taker_fee,
+        maker_fee: c.maker_fee,
         mark: mid,
         entry_ref_mid: mid,
         proposal: rec,
+        maker,
     });
     let idx = d.positions.len() - 1;
     run_actions(d, idx, actions);
@@ -1445,6 +1502,18 @@ fn open_paper(
 }
 
 fn fill_rec(d: &mut Desk, idx: usize, buy: bool, f: qe_risk::Fill, ref_mid: f64, reason: &str) {
+    fill_rec_liq(d, idx, buy, f, ref_mid, reason, "taker")
+}
+
+fn fill_rec_liq(
+    d: &mut Desk,
+    idx: usize,
+    buy: bool,
+    f: qe_risk::Fill,
+    ref_mid: f64,
+    reason: &str,
+    liquidity: &str,
+) {
     let p = &d.positions[idx];
     let slip_bps = if buy {
         (f.price - ref_mid) / ref_mid * 1e4
@@ -1453,7 +1522,7 @@ fn fill_rec(d: &mut Desk, idx: usize, buy: bool, f: qe_risk::Fill, ref_mid: f64,
     };
     let rec = json!({"id": format!("{}-{}", p.pos.order.trace_id, d.fills.len()), "position_id": p.pos.order.trace_id,
         "pair": p.pos.order.pair, "side": if buy {"buy"} else {"sell"}, "qty": f.qty, "price": f.price,
-        "ref_mid": ref_mid, "slippage_bps": slip_bps, "fee": f.fee, "fee_inr": f.fee * p.fx, "liquidity": "taker",
+        "ref_mid": ref_mid, "slippage_bps": slip_bps, "fee": f.fee, "fee_inr": f.fee * p.fx, "liquidity": liquidity,
         "reason": reason, "ts_ms": now_ms(), "paper": true});
     d.store.append("fills", &rec);
     d.fills.push_front(rec);
@@ -1498,6 +1567,20 @@ pub fn run_actions(d: &mut Desk, idx: usize, actions: Vec<Action>) {
                 qty,
             } => {
                 let buy = side == Side::Long;
+                if let Some(m) = d.positions[idx].maker.clone() {
+                    d.maker_stats.placed += 1;
+                    d.audit(
+                        "execution",
+                        format!(
+                            "paper maker entry {client_id} resting: {} {qty} @ {} (limit, GTC, cancel after {} ms)",
+                            if buy { "buy" } else { "sell" },
+                            m.price,
+                            m.deadline_ms - m.placed_ms
+                        ),
+                        Value::Null,
+                    );
+                    continue;
+                }
                 let (inc, minq) = d
                     .instruments
                     .get(&format!("{pair}|{TRADE_MARGIN}"))
@@ -1739,6 +1822,10 @@ pub fn hold_edge(d: &Desk, pp: &PaperPos, now: i64) -> f64 {
 pub fn lifecycle_tick(d: &mut Desk) {
     let now = now_ms();
     for idx in 0..d.positions.len() {
+        if d.positions[idx].maker.is_some() {
+            maker_tick(d, idx, now);
+            continue;
+        }
         let pair = d.positions[idx].pos.order.pair.clone();
         let book = d.books.get(&pair).filter(|b| b.is_sane()).cloned();
         let actions = match book {
@@ -1773,6 +1860,122 @@ pub fn lifecycle_tick(d: &mut Desk) {
     capital_tick(d, now);
     report_tick(d, now);
     crate::learn::resolve(d, now);
+}
+
+/// Quantity that public trades printed strictly through a resting limit after
+/// it was placed (buy limit: prints below it; sell limit: prints above it).
+pub fn maker_through_qty(trades: &VecDeque<timeframe::Trade>, buy: bool, m: &MakerEntry) -> f64 {
+    trades
+        .iter()
+        .filter(|t| t.ts_ms >= m.placed_ms)
+        .filter(|t| {
+            if buy {
+                t.price < m.price
+            } else {
+                t.price > m.price
+            }
+        })
+        .map(|t| t.qty)
+        .sum()
+}
+
+/// Advance a resting paper maker entry: fill it when enough volume printed
+/// through its price; at the deadline fill what printed through (if it meets
+/// the exchange minimum) and cancel the rest. No taker chase.
+fn maker_tick(d: &mut Desk, idx: usize, now: i64) {
+    let Some(m) = d.positions[idx].maker.clone() else {
+        return;
+    };
+    let pp = &d.positions[idx];
+    let pair = pp.pos.order.pair.clone();
+    let buy = pp.pos.order.side == Side::Long;
+    let want = pp.pos.order.qty;
+    let client_id = pp.pos.entry_id();
+    let through = d
+        .trades
+        .get(&pair)
+        .map_or(0.0, |t| maker_through_qty(t, buy, &m));
+    let expired = now >= m.deadline_ms;
+    let (inc, minq) = d
+        .instruments
+        .get(&format!("{pair}|{TRADE_MARGIN}"))
+        .map(|c| capability(&c.1))
+        .map_or((0.0, 0.0), |c| (c.quantity_increment, c.min_quantity));
+    let qty = if through + 1e-12 >= want {
+        want
+    } else if expired {
+        let q = if inc > 0.0 {
+            (through / inc + 1e-9).floor() * inc
+        } else {
+            through
+        };
+        if q >= minq.max(1e-12) {
+            q
+        } else {
+            0.0
+        }
+    } else {
+        return;
+    };
+    d.positions[idx].maker = None;
+    if qty <= 0.0 {
+        d.maker_stats.cancelled += 1;
+        d.audit(
+            "execution",
+            format!("paper maker entry {client_id} unfilled after {} ms: cancelled, no taker chase; re-evaluating", now - m.placed_ms),
+            Value::Null,
+        );
+        let more = d.positions[idx].pos.on_entry_rejected();
+        run_actions(d, idx, more);
+        return;
+    }
+    let partial = qty + 1e-12 < want;
+    if partial {
+        d.maker_stats.partial += 1;
+    } else {
+        d.maker_stats.filled += 1;
+    }
+    let f = qe_risk::Fill {
+        qty,
+        price: m.price,
+        fee: qty * m.price * d.positions[idx].maker_fee,
+    };
+    let ref_mid = d
+        .books
+        .get(&pair)
+        .filter(|b| b.is_sane())
+        .map_or(m.price, |b| {
+            micro::mid(b.best_bid().unwrap(), b.best_ask().unwrap())
+        });
+    fill_rec_liq(
+        d,
+        idx,
+        buy,
+        f,
+        ref_mid,
+        if partial { "entry_partial" } else { "entry" },
+        "maker",
+    );
+    if let Some(fr) = d.fills.front_mut() {
+        fr["latency_ms"] = json!(now - m.placed_ms);
+        fr["partial"] = json!(partial);
+    }
+    d.audit(
+        "execution",
+        format!(
+            "paper maker entry {client_id} filled {qty} @ {} after {} ms",
+            m.price,
+            now - m.placed_ms
+        ),
+        Value::Null,
+    );
+    let mut more = d.positions[idx]
+        .pos
+        .on_fill(qty, m.price, f.fee, now as u64);
+    if partial {
+        more.extend(d.positions[idx].pos.on_entry_done_partial());
+    }
+    run_actions(d, idx, more);
 }
 
 /// Drive the capital plan: stage transitions and the checkpoint workflow
@@ -2148,6 +2351,13 @@ pub fn gamble_json(d: &Desk) -> Value {
         "stopped_reason": d.gov.gamble_stopped.clone().or_else(|| d.gov.killed.then(|| "kill switch engaged".to_string())),
         "paper": !crate::live_exec::live_installed(),
         "simulation": sim,
+        "entry": if d.settings.gamble_maker_entry { "maker" } else { "taker" },
+        "maker": {"placed": d.maker_stats.placed, "filled": d.maker_stats.filled,
+            "partial": d.maker_stats.partial, "cancelled": d.maker_stats.cancelled,
+            "fill_rate": if d.maker_stats.placed > 0 {
+                Some((d.maker_stats.filled + d.maker_stats.partial) as f64 / d.maker_stats.placed as f64) } else { None },
+            "timeout_ms": d.settings.maker_timeout_ms,
+            "note": "paper fills only when trades print strictly through the resting price (queue position unknown, assumed last); CoinDCX futures post_only is documented as unsupported, so live limits can still fill as taker"},
         "candidates": board.iter().take(8).collect::<Vec<_>>(),
         "ev_note": "Each bet's estimated expected value after costs is shown per candidate; it is usually negative (round trip ~13-16 bps, no measured edge). Gamble mode bets anyway by the owner's choice; the ranking only picks the least-bad bet.",
     })
@@ -2157,6 +2367,12 @@ pub fn flatten(d: &mut Desk, why: &str) -> usize {
     let now = now_ms() as u64;
     let mut n = 0;
     for idx in 0..d.positions.len() {
+        if d.positions[idx].maker.take().is_some() {
+            d.maker_stats.cancelled += 1;
+            d.positions[idx].pos.on_entry_rejected();
+            n += 1;
+            continue;
+        }
         let a = d.positions[idx].pos.emergency_exit(now);
         n += a.len();
         run_actions(d, idx, a);
@@ -2662,18 +2878,8 @@ mod tests {
         }
     }
 
-    fn desk_with(side: Side) -> Desk {
-        std::env::set_var(
-            "QE_DATA_DIR",
-            std::env::temp_dir()
-                .join("qe-desk-test")
-                .to_string_lossy()
-                .to_string(),
-        );
-        let mut d = Desk::new(Settings::default());
-        d.books.insert("B-X_USDT".into(), book(99.95, 100.05));
-        d.gov.open_positions = 1;
-        let c = InstrumentCapability {
+    fn cap_x() -> InstrumentCapability {
+        InstrumentCapability {
             pair: "B-X_USDT".into(),
             margin_currency: "INR".into(),
             active: true,
@@ -2691,7 +2897,21 @@ mod tests {
             maintenance_margin_rate: None,
             margin_modes: vec![],
             supports_market_order: true,
-        };
+        }
+    }
+
+    fn desk_with(side: Side) -> Desk {
+        std::env::set_var(
+            "QE_DATA_DIR",
+            std::env::temp_dir()
+                .join("qe-desk-test")
+                .to_string_lossy()
+                .to_string(),
+        );
+        let mut d = Desk::new(Settings::default());
+        d.books.insert("B-X_USDT".into(), book(99.95, 100.05));
+        d.gov.open_positions = 1;
+        let c = cap_x();
         open_paper(&mut d, order(side), c, 1.0, 100.0, Value::Null);
         d
     }
@@ -2884,6 +3104,82 @@ mod tests {
         assert!(!d.gov.pause_entries(false, 0).ok);
         assert!(d.store.dir.join(GAMBLE_STOP_FILE).exists());
         let _ = std::fs::remove_file(d.store.dir.join(GAMBLE_STOP_FILE));
+    }
+
+    fn trade(ts_ms: i64, price: f64, qty: f64) -> timeframe::Trade {
+        timeframe::Trade {
+            ts_ms,
+            price,
+            qty,
+            buyer_aggressor: None,
+        }
+    }
+
+    fn maker_desk(side: Side) -> Desk {
+        let mut d = desk_with(Side::Long);
+        d.positions.clear();
+        d.gov.policy = gamble_desk(side).gov.policy;
+        d.settings.gamble_maker_entry = true;
+        d.settings.maker_timeout_ms = 60_000;
+        open_paper(&mut d, order(side), cap_x(), 1.0, 100.0, Value::Null);
+        d
+    }
+
+    #[test]
+    fn maker_entry_rests_until_trades_print_through() {
+        let mut d = maker_desk(Side::Long);
+        let pair = d.positions[0].pos.order.pair.clone();
+        let px = d.positions[0].maker.as_ref().unwrap().price;
+        let qty = d.positions[0].pos.order.qty;
+        assert_eq!(d.positions[0].pos.state, State::EntrySubmitted);
+        assert_eq!(d.maker_stats.placed, 1);
+        // a print AT the price does not fill (queue position unknown)
+        d.trades
+            .entry(pair.clone())
+            .or_default()
+            .push_back(trade(now_ms(), px, qty * 10.0));
+        lifecycle_tick(&mut d);
+        assert!(d.positions[0].maker.is_some());
+        // prints through the price fill at the limit with the maker fee
+        d.trades
+            .entry(pair)
+            .or_default()
+            .push_back(trade(now_ms(), px * 0.999, qty));
+        lifecycle_tick(&mut d);
+        let p = &d.positions[0];
+        assert!(p.maker.is_none());
+        assert_eq!(p.pos.state, State::Protected);
+        assert_eq!(p.pos.avg_entry, px);
+        assert!((p.pos.entry_fees - qty * px * p.maker_fee).abs() < 1e-12);
+        assert_eq!(d.fills[0]["liquidity"], "maker");
+        assert_eq!(d.maker_stats.filled, 1);
+    }
+
+    #[test]
+    fn maker_entry_times_out_and_is_cancelled_without_a_chase() {
+        let mut d = maker_desk(Side::Short);
+        let px = d.positions[0].maker.as_ref().unwrap().price;
+        let pair = d.positions[0].pos.order.pair.clone();
+        // a print below a sell limit is not through it
+        d.trades
+            .entry(pair)
+            .or_default()
+            .push_back(trade(now_ms(), px * 0.99, 1e9));
+        d.positions[0].maker.as_mut().unwrap().deadline_ms = 0;
+        let fills = d.fills.len();
+        lifecycle_tick(&mut d);
+        assert!(d.positions.is_empty(), "rejected entry swept");
+        assert_eq!(d.fills.len(), fills, "no taker fill");
+        assert_eq!(d.maker_stats.cancelled, 1);
+        assert_eq!(gamble_json(&d)["maker"]["fill_rate"], 0.0);
+    }
+
+    #[test]
+    fn flatten_cancels_a_resting_maker_entry() {
+        let mut d = maker_desk(Side::Long);
+        flatten(&mut d, "test");
+        assert!(d.positions.is_empty());
+        assert_eq!(d.maker_stats.cancelled, 1);
     }
 
     #[test]

@@ -206,6 +206,21 @@ fn load_settings() -> anyhow::Result<Settings> {
             .map_err(|e| anyhow::anyhow!("gamble profile refused: {e}"))?;
         debug_assert_eq!(p2.leverage, params.leverage);
         st.gamble = Some(p2);
+        // Entry order type (docs/GAMBLE_MODE.md "Maker entries"): taker unless set.
+        match t.get("entry").and_then(|v| v.as_str()).unwrap_or("taker") {
+            "taker" => st.gamble_maker_entry = false,
+            "maker" => st.gamble_maker_entry = true,
+            o => anyhow::bail!("gamble profile refused: entry {o:?} (use \"maker\" or \"taker\")"),
+        }
+        if let Some(v) = t
+            .get("maker_timeout_s")
+            .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
+        {
+            if !(v > 0.0 && v <= 30.0) {
+                anyhow::bail!("gamble profile refused: maker_timeout_s {v} must be in (0, 30]");
+            }
+            st.maker_timeout_ms = (v * 1000.0) as i64;
+        }
         if std::env::var_os("QE_DATA_DIR").is_none() {
             let dd = t
                 .get("data_dir")
