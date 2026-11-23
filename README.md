@@ -8,6 +8,21 @@ can satisfy, and which still requires checks that have not been run).
 Paper equity is a configured value (INR 100 by default) and is labelled PAPER everywhere. It is
 not a CoinDCX balance.
 
+## 24 NOVEMBER CAMPAIGN (current)
+
+One continuous campaign: **INR 100 → INR 50,000, 24 Nov 2026 00:00 → 22:00 IST** (22 h, 500x,
+no intermediate withdrawals). The hourly schedule is `target_equity(h) = 100 · 500^(h/22)`
+(+32.6418 % per hour compounded). It is a **mathematical requirement, not a trading forecast**,
+and it never changes risk. Campaign risk profile: floor INR 95, at most INR 1 planned loss per
+trade (fees, slippage and stop included), at most INR 5 cumulative campaign loss, one position,
+120 s maximum hold, isolated margin, no martingale or size-up. At 22:00 IST the desk turns
+exit-only. Live execution stays owner-controlled and disabled by default. Full maths, table,
+rounding and deadline procedure: [docs/CAMPAIGN_24NOV.md](docs/CAMPAIGN_24NOV.md). Example
+profile: `configs/campaign-24nov.toml`.
+
+Earlier targets (INR 18,000; INR 3,000 at 22:30 IST plus an INR 2,000 withdrawal; INR 50,000 by
+17:00 IST) are **historical** and superseded.
+
 ## Run
 
 ```bash
@@ -53,7 +68,7 @@ DATA → MATHEMATICS → PROBABILISTIC FORECAST → STRATEGY → RISK GOVERNOR �
 | Calibration | Forecast authority comes from the s2-calib walk-forward registry (`crates/qe-research/calibration.json`, model `desk.fp.v1`, targets `tp_first_{long,short}`; `QE_CALIBRATION_FILE` overrides; reloaded every 10 s). A missing file means no authority. A live forward monitor resolves each P(TP first) on the next 120 s of 1 s prices and revokes authority when, at n ≥ 200, ECE > 0.05 or Brier ≥ climatology. With authority, the registry's recalibrated probability drives EV | live; **no model calibrated** |
 | Risk governor | `qe_risk::RiskGovernor` evaluates every candidate: kill/pause, session loss, high-water-mark floor, exit-only, data integrity, calibration, net edge, sizing from the stop-loss budget, highest exchange leverage stepped down for the liquidation buffer, min notional/quantity (rejected, never raised), margin | live |
 | Paper execution | `qe_risk::Position` lifecycle with an independent 250 ms server-side timer: taker fills at the touch + slippage + live fee, simulated protection, exits on SL/TP/edge-negative/data integrity/time (117 s lead, 120 s max), reconcile on ack timeout, flatten, kill | unit-tested; live-wired |
-| Capital / target | Growth → checkpoint (22:00 IST: pause + flatten) → user-confirmed withdrawal → protective. Trade-frequency scenarios and a seeded Monte-Carlo target simulation | live, paper ledger |
+| Capital / target | 24 Nov campaign schedule and controller (see [docs/CAMPAIGN_24NOV.md](docs/CAMPAIGN_24NOV.md)): reporting only, never sizes trades; floor and loss-budget stop; exit-only at 22:00 IST. The older Growth → checkpoint → withdrawal → protective stage plan is historical. Trade-frequency scenarios and a seeded Monte-Carlo target simulation | paper ledger |
 | Audit | JSONL: decisions (full numeric explanation), governor, fills, closed trades, equity, incidents, audit | live |
 
 ## Crates
@@ -70,6 +85,8 @@ DATA → MATHEMATICS → PROBABILISTIC FORECAST → STRATEGY → RISK GOVERNOR �
 ## Known limits (honest)
 
 - Forecast parameters are priors. The committed s2-calib registry calibrates no model (`desk.fp.v1`: ECE 0.080, Brier skill 0.005), so the governor rejects every entry ("forecast uncalibrated"). Release run results: [docs/RELEASE_REPORT_SPRINT2.md](docs/RELEASE_REPORT_SPRINT2.md).
-- At INR 100 paper equity, a 1 % risk budget (INR 1) is below the risk at minimum order size for most contracts, so the governor rejects them rather than raising the budget.
+- At INR 100 equity, the INR 1 per-trade loss cap is below the risk at minimum order size for most contracts: at a ~INR 625 minimum notional, INR 1 is 0.16 % of notional for costs and stop together, against ~0.10–0.16 % round-trip cost. The governor rejects these trades rather than raising the budget.
+- Gamble mode skips the calibration and positive-EV gates, so it is a paper/research profile and is not part of the campaign's live path ([docs/GAMBLE_MODE.md](docs/GAMBLE_MODE.md)).
+- Live trading is blocked: no authenticated path has run against the real account, and no model has calibration authority.
 - Paper TP/SL is enforced by the server-side monitor; exchange-side protective orders are not used in paper.
 - INR-margin conversion uses the spot USDTINR mid, which approximates the exchange's own conversion rate.

@@ -4,6 +4,14 @@ Gamble mode is an execution profile only the account owner can turn on. It
 places bets without waiting for the forecast to prove a calibrated edge. It is
 **off by default**. No target, schedule or agent can enable it.
 
+> **Paper / research profile.** Gamble mode relaxes model authority: it skips the
+> calibration and positive-net-EV gates. It is therefore **not** part of the
+> 24 Nov campaign's live execution path ([CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md)),
+> where both gates stay mandatory. Use it for paper simulation and research. Its
+> owner floor is separate from the campaign's INR 95 floor and INR 1 / INR 5
+> loss caps, and does not replace them. The live steps below describe code that
+> exists at this commit. They are not a campaign recommendation.
+
 ## Honest expectation
 
 - Round-trip cost is about 13-16 bps of notional (2 x taker fee + spread + 2 x slippage).
@@ -83,9 +91,12 @@ the leverage cap and the exchange minimum notional:
 - the win rate and payoff ratio come from realised gamble bets once >= 10 exist;
   before that, from the best current candidate's estimate (P(win) conditional on a
   barrier being hit; time exits are not modelled separately);
-- bets remaining = hours to the 17:00 IST 24 Nov deadline x bets per hour (the
+- bets remaining = hours to the deadline x bets per hour. The deadline is
+  `stage2_deadline_ms` from `configs/risk-limits.toml`. When this was written it
+  was 17:00 IST 24 Nov, which is now **historical**: the campaign deadline is
+  22:00 IST. Bets per hour is the
   measured rate once >= 5 bets have closed; otherwise 20/h, which assumes one
-  position and holds of 120 s or less).
+  position and holds of 120 s or less.
 
 ### Stake policies
 

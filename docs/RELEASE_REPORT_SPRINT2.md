@@ -1,5 +1,9 @@
 # Sprint 2 release report (s2-desk) — 23 Nov 2026
 
+> **Historical report.** Figures are as recorded on 23 Nov 2026. The INR 18,000 target below is
+> superseded by the 24 Nov campaign (INR 100 → INR 50,000 by 22:00 IST, [CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md)).
+> Re-checked at main `22fabe5`: live execution is still not validated and no model is calibrated.
+
 **Final decision: PAPER TRADING READY (pipeline) — no paper trade was taken, because no forecast has
 authority and no candidate has positive expected net edge after costs. LIVE EXECUTION: NOT READY,
 refused by construction.**
