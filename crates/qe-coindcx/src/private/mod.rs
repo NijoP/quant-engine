@@ -17,6 +17,7 @@
 pub mod client;
 pub mod error;
 pub mod ratelimit;
+pub mod readonly;
 pub mod reconcile;
 pub mod socket;
 pub mod types;
