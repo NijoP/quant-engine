@@ -25,8 +25,14 @@
 //! Targets: `tp_first_{long,short}`, `sl_first_{long,short}` (120 s), `up_{h}s`
 //! for h in 1, 2, 5, 10, 15, 30, 60, 90, 120 (RT) or 60, 120 (1m).
 //! The status rule is documented in [`calibration`]; results in docs/CALIBRATION.md.
+//!
+//! # API for s3-learn / s3-desk: champion/challenger registry
+//! [`registry::ModelRegistry::load_or_default`]`("crates/qe-research/models.json")`, then
+//! `champion()`, `model(id)`, `is_promotable(id)`. Built by `qe-research challenge` ([`challenger`]).
 pub mod calibration;
+pub mod challenger;
 pub mod eval;
 pub mod history;
 pub mod record;
+pub mod registry;
 pub mod report;

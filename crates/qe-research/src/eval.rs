@@ -272,7 +272,7 @@ pub fn load_recording(dir: &Path) -> Result<Recording> {
     })
 }
 
-fn sigma_per_s(h: &[(i64, f64)]) -> Option<f64> {
+pub fn sigma_per_s(h: &[(i64, f64)]) -> Option<f64> {
     if h.len() < 30 {
         return None;
     }

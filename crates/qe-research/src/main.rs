@@ -4,7 +4,9 @@
 //! qe-research record   --out DIR [--minutes 30] [--focus 10]
 //! qe-research history  --out DIR [--pairs 30] [--days 7]
 //! qe-research evaluate --rec DIR [--hist DIR] --out calibration.json [--folds 5] [--stride 5]
+//! qe-research challenge --rec DIR --out models.json [--folds 5] [--stride 2]
 //! ```
+//! `challenge` writes the champion/challenger registry (see `registry`).
 //! `evaluate` prints a compact summary and writes the full `CalibrationReport`.
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -65,8 +67,31 @@ async fn main() -> Result<()> {
             std::fs::write(&path, serde_json::to_vec_pretty(&r)?)?;
             println!("{}", qe_research::report::summary(&r));
         }
+        "challenge" => {
+            let r = qe_research::challenger::run(
+                &dir("rec")?,
+                get(&f, "stride", 2.0),
+                get(&f, "folds", 5),
+            )?;
+            std::fs::write(dir("out")?, serde_json::to_vec_pretty(&r)?)?;
+            let rows: Vec<_> = r
+                .models
+                .iter()
+                .map(|m| {
+                    serde_json::json!({"id": m.id, "promotable": m.promotable,
+                    "calibration": m.calibration, "taker_taker": m.trading["taker_taker"],
+                    "failures": m.promotion_failures})
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"data": r.data, "champion": r.champion, "reason": r.champion_reason, "models": rows})
+                )?
+            );
+        }
         _ => {
-            eprintln!("usage: qe-research record|history|evaluate (see crate docs)");
+            eprintln!("usage: qe-research record|history|evaluate|challenge (see crate docs)");
             std::process::exit(2);
         }
     }
