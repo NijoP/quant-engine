@@ -2793,4 +2793,65 @@ mod tests {
             "experiment stops below the tradable minimum"
         );
     }
+
+    fn gamble_desk(side: Side) -> Desk {
+        let mut d = desk_with(side);
+        let raw = qe_risk::gamble::RawGamble {
+            enabled: Some(true),
+            owner_ack: Some(qe_risk::gamble::OWNER_ACK.into()),
+            stake_inr: Some("10".into()),
+            leverage: Some("10".into()),
+            floor_inr: Some("50".into()),
+            stake_policy: None,
+        };
+        d.gov.policy = RiskPolicy::gamble(qe_risk::gamble::validate(&raw, 100.0).unwrap());
+        d
+    }
+
+    #[test]
+    fn gamble_bet_exits_on_120s_and_records_mode() {
+        let mut d = gamble_desk(Side::Long);
+        let opened = d.positions[0].pos.opened_at_ms.unwrap();
+        d.positions[0].pos.opened_at_ms = Some(opened - 117_500);
+        lifecycle_tick(&mut d);
+        assert!(d.positions.is_empty());
+        assert_eq!(d.closed[0]["exit_reason"], "time_stop");
+        assert_eq!(d.closed[0]["mode"], "gamble");
+        assert_eq!(gamble_json(&d)["trades"], 1);
+        assert_eq!(profile_json(&d)["banner"], GAMBLE_BANNER);
+    }
+
+    #[test]
+    fn gamble_kill_switch_flattens_and_blocks() {
+        let mut d = gamble_desk(Side::Short);
+        d.gov.kill_switch(0);
+        flatten(&mut d, "kill switch");
+        assert!(d.positions.is_empty());
+        assert_eq!(d.closed[0]["exit_reason"], "flatten");
+        assert_eq!(gamble_json(&d)["enabled"], false);
+        assert_eq!(gamble_json(&d)["stopped_reason"], "kill switch engaged");
+    }
+
+    #[test]
+    fn gamble_floor_stop_fires_after_a_loss_to_the_floor() {
+        let mut d = gamble_desk(Side::Long);
+        // order() margin 200 vs equity 100: a stop-out books a loss; then equity
+        // is forced to the floor to check the permanent stop
+        d.books.insert("B-X_USDT".into(), book(98.9, 99.0));
+        lifecycle_tick(&mut d);
+        assert!(d.gov.gamble_stopped.is_none(), "still above the floor");
+        d.cap.on_realised(dec(50.0 - d.cap.equity_f64()), dec(0.0));
+        gamble_stop_check(&mut d);
+        assert!(d.gov.gamble_stopped.is_some());
+        assert!(d.gov.entries_paused);
+        assert!(!d.gov.pause_entries(false, 0).ok);
+        assert!(d.store.dir.join(GAMBLE_STOP_FILE).exists());
+        let _ = std::fs::remove_file(d.store.dir.join(GAMBLE_STOP_FILE));
+    }
+
+    #[test]
+    fn iso_utc_formats_the_deadline() {
+        assert_eq!(iso_utc(1_795_519_800_000), "2026-11-24T11:30:00Z");
+        assert_eq!(gamble_json(&Desk::new(Settings::default())), Value::Null);
+    }
 }
