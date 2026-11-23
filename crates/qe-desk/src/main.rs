@@ -61,7 +61,7 @@ fn requested_profile() -> Option<String> {
 
 fn load_settings() -> anyhow::Result<Settings> {
     let mut st = Settings::default();
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+    let dir = repo_root().join("configs");
     let read = |f: &str| -> Option<toml::Table> {
         std::fs::read_to_string(dir.join(f))
             .ok()?
@@ -185,9 +185,7 @@ fn load_settings() -> anyhow::Result<Settings> {
         }
         if std::env::var_os("QE_DATA_DIR").is_none() {
             if let Some(dd) = t.get("data_dir").and_then(|v| v.as_str()) {
-                let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../..")
-                    .join(dd);
+                let p = repo_root().join(dd);
                 std::env::set_var("QE_DATA_DIR", p);
             }
         }
@@ -206,14 +204,50 @@ fn load_settings() -> anyhow::Result<Settings> {
             .map_err(|e| anyhow::anyhow!("gamble profile refused: {e}"))?;
         debug_assert_eq!(p2.leverage, params.leverage);
         st.gamble = Some(p2);
+        // Campaign bold play (configs/campaign-live.toml): stake toward the next
+        // hourly milestone, capped by equity above the owner floor.
+        match t.get("campaign_stake").and_then(|v| v.as_str()) {
+            None | Some("fixed") => {}
+            Some("next_milestone") => st.campaign_bold = true,
+            Some(o) => anyhow::bail!(
+                "gamble profile refused: campaign_stake {o:?} (use \"fixed\" or \"next_milestone\")"
+            ),
+        }
+        // Entry order type (docs/GAMBLE_MODE.md "Maker entries"): taker unless set.
+        match t.get("entry").and_then(|v| v.as_str()).unwrap_or("taker") {
+            "taker" => st.gamble_maker_entry = false,
+            "maker" => st.gamble_maker_entry = true,
+            o => anyhow::bail!("gamble profile refused: entry {o:?} (use \"maker\" or \"taker\")"),
+        }
+        if let Some(pv) = t.get("payoff") {
+            let pc: qe_risk::gamble::payoff::PayoffCfg = pv
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("gamble profile refused: [payoff]: {e}"))?;
+            pc.validate()
+                .map_err(|e| anyhow::anyhow!("gamble profile refused: {e}"))?;
+            // The cost the plan ranks on must be the order type actually sent.
+            if t.get("entry").is_some() && st.gamble_maker_entry != pc.maker_entry {
+                anyhow::bail!("gamble profile refused: entry and payoff.maker_entry disagree");
+            }
+            st.gamble_maker_entry = pc.maker_entry;
+            st.payoff = Some(pc);
+        }
+        if let Some(v) = t
+            .get("maker_timeout_s")
+            .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
+        {
+            if !(v > 0.0 && v <= 30.0) {
+                anyhow::bail!("gamble profile refused: maker_timeout_s {v} must be in (0, 30]");
+            }
+            st.maker_timeout_ms = (v * 1000.0) as i64;
+        }
         if std::env::var_os("QE_DATA_DIR").is_none() {
             let dd = t
                 .get("data_dir")
                 .and_then(|v| v.as_str())
                 .unwrap_or("data/desk-gamble");
-            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join(dd);
+            let p = repo_root().join(dd);
             std::env::set_var("QE_DATA_DIR", p);
         }
         let dir = std::path::PathBuf::from(std::env::var("QE_DATA_DIR").unwrap_or_default());
@@ -233,6 +267,7 @@ fn load_settings() -> anyhow::Result<Settings> {
             }
         }
     }
+    desk::validate_campaign_schedule(&st).map_err(|e| anyhow::anyhow!(e))?;
     Ok(st)
 }
 
@@ -264,9 +299,7 @@ fn load_gamble(
 ) -> anyhow::Result<(toml::Table, qe_risk::gamble::GambleParams)> {
     let path = std::env::var("QE_GAMBLE_CONFIG")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/gamble.toml")
-        });
+        .unwrap_or_else(|_| repo_root().join("configs/gamble.toml"));
     let t: toml::Table = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("gamble profile: {}: {e}", path.display()))?
         .parse()
@@ -661,6 +694,23 @@ async fn meta_loop(c: PublicClient, s: S) {
                         format!("{p} ({m}) metadata; {n} instrument records cached"),
                     );
                 }
+                Err(e) if qe_coindcx::client::is_circuit_open(&e) => {
+                    // Throttled / breaker open: a property of the connection, not of
+                    // this instrument. Keep any cached record, record no failure (a
+                    // failure would reject the pair for 10 min) and wait out the
+                    // cooldown instead of burning the queue on fast-fails.
+                    let wait = c.breaker_retry_in().await.max(Duration::from_secs(1));
+                    s.write().await.agent_err(
+                        "metadata",
+                        t0,
+                        format!(
+                            "{p} {m}: {e}; pausing metadata fetch {:.0}s",
+                            wait.as_secs_f64()
+                        ),
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
                 Err(e) => {
                     let mut d = s.write().await;
                     let why = if e.to_string().contains("decode") {
@@ -775,6 +825,36 @@ async fn mtf_loop(c: PublicClient, s: S) {
         }
         drop(d);
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Every public-REST circuit-breaker open/close becomes an incident
+/// (`incidents.jsonl` + audit log), with the client, reason, cooldown, time open
+/// and the number of calls refused while open.
+async fn breaker_incident_loop(clients: Vec<PublicClient>, s: S) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for c in &clients {
+            let evs = c.take_breaker_events().await;
+            if evs.is_empty() {
+                continue;
+            }
+            let mut d = s.write().await;
+            for e in evs {
+                let detail = if e.transition == "open" {
+                    format!(
+                        "{} client breaker OPEN: {} (cooldown {:.0}s, request spacing {} ms)",
+                        e.client, e.reason, e.cooldown_s, e.interval_ms
+                    )
+                } else {
+                    format!(
+                        "{} client breaker CLOSED after {:.1}s open; {} call(s) refused while open",
+                        e.client, e.open_for_s, e.rejected_while_open
+                    )
+                };
+                d.incident(&format!("rest_breaker_{}", e.transition), detail);
+            }
+        }
     }
 }
 
@@ -1041,6 +1121,7 @@ fn state_json(d: &Desk) -> Value {
         "agents": d.agents.values().collect::<Vec<_>>(), "controls": controls_json(d),
         "calibration": d.calibration_json(), "readiness": readiness(d),
         "gamble": gamble_json(d),
+        "campaign": campaign_json(d, now),
         "audit": d.audit,
     })
 }
@@ -1466,6 +1547,9 @@ async fn ws_push(mut sock: WebSocket, a: App) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--readonly-check") {
+        std::process::exit(readonly_check().await);
+    }
     let addr = std::env::var("QE_DESK_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
     let settings = match load_settings() {
         Ok(s) => s,
@@ -1510,7 +1594,7 @@ async fn main() -> anyhow::Result<()> {
             st,
         );
     }
-    let c = PublicClient::new();
+    let c = PublicClient::named("market-data");
     let w = ws::spawn(ws::WsConfig {
         channels: vec![Channel::CurrentPrices],
         rest_bootstrap: Some(ws::RestBootstrap(c.clone())),
@@ -1524,13 +1608,18 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(book_loop(c.clone(), s.clone()));
     tokio::spawn(position_book_loop(c.clone(), s.clone()));
     tokio::spawn(lifecycle_loop(s.clone()));
+    if live_exec::live_installed() {
+        tokio::spawn(account_loop(s.clone()));
+    }
     // Metadata gets its own client (own 8 req/s pacing and breaker; the loop makes
     // 1 req/s): instrument records the exchange returns with null fields fail to
     // decode, and those must not open the market-data client's circuit breaker.
-    tokio::spawn(meta_loop(PublicClient::new(), s.clone()));
+    let meta = PublicClient::named("metadata");
+    tokio::spawn(meta_loop(meta.clone(), s.clone()));
+    tokio::spawn(breaker_incident_loop(vec![c.clone(), meta], s.clone()));
     tokio::spawn(mtf_loop(c.clone(), s.clone()));
     tokio::spawn(monitor_loop(c.clone(), s.clone()));
-    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/dist");
+    let dist = repo_root().join("dashboard/dist");
     let app = Router::new()
         .route("/api/state", get(h_state))
         .route("/api/status", get(h_status))
@@ -1565,4 +1654,74 @@ async fn main() -> anyhow::Result<()> {
     let l = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(l, app).await?;
     Ok(())
+}
+
+/// `qe-desk --readonly-check`: owner-run, read-only account check (balances,
+/// futures wallets, positions, open orders), secrets redacted. Places nothing.
+async fn readonly_check() -> i32 {
+    let (creds, status) = qe_coindcx::auth::load_credentials();
+    let Some(creds) = creds else {
+        eprintln!("credentials not configured ({status:?}); nothing read");
+        return 1;
+    };
+    let ro = qe_coindcx::private::readonly::ReadOnlyAccount::new(creds);
+    match ro.snapshot(&["INR", "USDT"]).await {
+        Ok(s) => {
+            println!("{}", qe_coindcx::private::readonly::summary(&s));
+            0
+        }
+        Err(e) => {
+            eprintln!("read-only check FAILED: {e}");
+            3
+        }
+    }
+}
+
+/// Live only: verified INR futures-wallet equity every 10 s, read-only. Any
+/// failed read (wallets, positions or open orders) marks the account
+/// unreconciled and the campaign refuses entries until a read succeeds.
+async fn account_loop(s: S) {
+    let (creds, _) = qe_coindcx::auth::load_credentials();
+    let Some(creds) = creds else {
+        s.write().await.live_account_err = Some("credentials not configured".into());
+        return;
+    };
+    let ro = qe_coindcx::private::readonly::ReadOnlyAccount::new(creds);
+    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        tick.tick().await;
+        let r = ro.snapshot(&["INR"]).await;
+        let now = now_ms();
+        let mut d = s.write().await;
+        let res = r.map_err(|e| e.to_string()).and_then(|snap| {
+            qe_coindcx::private::readonly::inr_wallet_equity(&snap.wallets)
+                .map(|e| (e, snap.positions.len(), snap.open_orders.len()))
+        });
+        match res {
+            Ok((e, np, no)) => {
+                if d.live_account_err.take().is_some() {
+                    d.audit(
+                        "account",
+                        "read-only account reads recovered".into(),
+                        Value::Null,
+                    );
+                }
+                d.live_inr_equity = Some((now, e));
+                d.agent_ok(
+                    "account_reader",
+                    now,
+                    format!("INR equity {e:.2}; {np} position(s), {no} open order(s)"),
+                );
+            }
+            Err(e) => {
+                if d.live_account_err.is_none() {
+                    d.incident(
+                        "account",
+                        format!("read-only account read failed, entries refused: {e}"),
+                    );
+                }
+                d.live_account_err = Some(e);
+            }
+        }
+    }
 }

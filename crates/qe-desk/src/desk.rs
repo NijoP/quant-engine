@@ -6,6 +6,9 @@
 //! loops in `main.rs`, never while a decision is being computed.
 use crate::store::Store;
 use qe_coindcx::types::{Book, FuturesInstrument, SpotMarketDetail};
+use qe_engine::campaign::{
+    Campaign, CampaignConfig, DeadlineStep, EquitySource, PlannedLoss, TradeCheck,
+};
 use qe_engine::capital::{CapitalController, CapitalPlan, Stage, Step};
 use qe_engine::paper::SimFill;
 use qe_engine::Decimal;
@@ -90,6 +93,19 @@ pub fn experiment_guard(
     Ok(())
 }
 
+/// Repository root for configs, data, calibration and the dashboard: `QE_REPO_ROOT`,
+/// else the current directory when it holds `configs/` (a prebuilt CI artifact run
+/// from a checkout), else the compile-time source tree.
+pub fn repo_root() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("QE_REPO_ROOT") {
+        return p.into();
+    }
+    if std::path::Path::new("configs").is_dir() {
+        return ".".into();
+    }
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
 pub fn now_ms() -> i64 {
     qe_coindcx::auth::request_timestamp_ms()
 }
@@ -112,6 +128,15 @@ pub struct Settings {
     pub protective: RiskPolicy,
     /// Owner gamble parameters (Some only for the gamble profile).
     pub gamble: Option<qe_risk::gamble::GambleParams>,
+    /// Gamble entries as passive limit (maker) orders; see [`MakerEntry`].
+    pub gamble_maker_entry: bool,
+    /// Campaign bold-play stake toward the next hourly milestone (gamble profile).
+    pub campaign_bold: bool,
+    /// Cancel an unfilled maker entry after this long; never chased with a taker.
+    pub maker_timeout_ms: i64,
+    /// Payoff per bet (`[payoff]` in the gamble config, qe_risk::gamble::payoff):
+    /// cost-aware exclusion and volatility-scaled TP/SL. None = legacy sigma barriers.
+    pub payoff: Option<qe_risk::gamble::payoff::PayoffCfg>,
 }
 
 impl Default for Settings {
@@ -130,6 +155,10 @@ impl Default for Settings {
             growth: RiskPolicy::growth(),
             protective: RiskPolicy::protective(),
             gamble: None,
+            gamble_maker_entry: false,
+            campaign_bold: false,
+            maker_timeout_ms: 4_000,
+            payoff: None,
         }
     }
 }
@@ -165,9 +194,34 @@ pub struct PaperPos {
     pub margin: String,
     pub fx: f64,
     pub taker_fee: f64,
+    pub maker_fee: f64,
     pub mark: f64,
     pub entry_ref_mid: f64,
     pub proposal: Value,
+    /// Resting paper maker entry, until filled or cancelled.
+    pub maker: Option<MakerEntry>,
+}
+
+/// A paper passive-limit entry resting at the touch (buy at the bid, sell at
+/// the ask). It fills only when public trades print strictly THROUGH its price
+/// after it was placed (a print at the price is not enough: our queue position
+/// is unknown, so we assume we are last in the queue). Fills are at the limit
+/// price and pay the instrument's maker fee. Unfilled at the deadline: the
+/// remainder is cancelled (no taker chase).
+#[derive(Debug, Clone)]
+pub struct MakerEntry {
+    pub price: f64,
+    pub placed_ms: i64,
+    pub deadline_ms: i64,
+}
+
+/// Paper maker-entry counters for `/api/state.gamble.maker`.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct MakerStats {
+    pub placed: u32,
+    pub filled: u32,
+    pub partial: u32,
+    pub cancelled: u32,
 }
 
 /// One forecast awaiting its 120 s outcome (forward, chronological: no lookahead).
@@ -382,6 +436,14 @@ pub struct Desk {
     pub gamble_trades: HashMap<(String, bool), qe_risk::gamble::HitCounts>,
     /// Latest target-probability Monte Carlo (refreshed by the monitor loop).
     pub gamble_sim: Option<Value>,
+    pub maker_stats: MakerStats,
+    /// 24 Nov 2026 campaign controller (benchmark + campaign risk profile).
+    pub campaign: Campaign,
+    pub campaign_error: Option<String>,
+    /// Live only: (read at ms, verified INR futures-wallet equity) from the
+    /// read-only account loop; stale after LIVE_EQUITY_MAX_AGE_MS.
+    pub live_inr_equity: Option<(i64, f64)>,
+    pub live_account_err: Option<String>,
 }
 
 pub type WsPrice = (i64, f64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
@@ -401,10 +463,7 @@ impl Desk {
     pub fn load_calibration(&mut self) {
         let path = std::env::var("QE_CALIBRATION_FILE")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../qe-research/calibration.json")
-            });
+            .unwrap_or_else(|_| repo_root().join("crates/qe-research/calibration.json"));
         self.calib_report_src = path.display().to_string();
         match qe_research::calibration::CalibrationReport::load(&path) {
             Ok(r) => {
@@ -552,6 +611,7 @@ impl Desk {
     pub fn new(settings: Settings) -> Self {
         let now = now_ms();
         let s = &settings;
+        let camp_cfg = campaign_cfg(s);
         let cap = CapitalController::new(s.plan(), dec(s.paper_start_equity_inr), true, now as u64);
         let policy = if s.is_experiment() && s.execution_mode == "paper" {
             RiskPolicy::experiment_max_leverage()
@@ -644,7 +704,13 @@ impl Desk {
             gamble_board: HashMap::new(),
             gamble_trades: HashMap::new(),
             gamble_sim: None,
+            maker_stats: MakerStats::default(),
+            campaign: Campaign::new(camp_cfg, EquitySource::Paper),
+            campaign_error: None,
+            live_inr_equity: None,
+            live_account_err: None,
         };
+        load_campaign(&mut desk);
         desk.learn = crate::learn::LearnCtx::open(&desk.store.dir);
         if let Some(e) = desk.learn.error.clone() {
             desk.incident("learning", e);
@@ -808,6 +874,34 @@ pub fn ret_over(h: &VecDeque<(i64, f64, f64)>, w_ms: i64) -> Option<f64> {
 
 /// Per-second volatility from 1-step log returns of the 1 s RT samples:
 /// sigma_1s = RV_step / sqrt(mean dt).
+/// Median high-low range / mean price over consecutive 120 s buckets of the
+/// price history (newest first; buckets with fewer than 20 prints are skipped).
+pub fn range_120s_frac(h: &VecDeque<(i64, f64, f64)>) -> Option<f64> {
+    let end = h.back()?.0;
+    let mut v = vec![];
+    for k in 0..5i64 {
+        let (lo_t, hi_t) = (end - (k + 1) * 120_000, end - k * 120_000);
+        let p: Vec<f64> = h
+            .iter()
+            .filter(|x| x.0 > lo_t && x.0 <= hi_t && x.1 > 0.0)
+            .map(|x| x.1)
+            .collect();
+        if p.len() < 20 {
+            continue;
+        }
+        let (lo, hi) = p
+            .iter()
+            .fold((f64::INFINITY, 0.0f64), |a, x| (a.0.min(*x), a.1.max(*x)));
+        let mean = p.iter().sum::<f64>() / p.len() as f64;
+        v.push((hi - lo) / mean);
+    }
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f64::total_cmp);
+    Some(v[v.len() / 2])
+}
+
 pub fn sigma_per_s(h: &VecDeque<(i64, f64, f64)>) -> Option<f64> {
     if h.len() < 30 {
         return None;
@@ -1026,6 +1120,7 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     };
     let book_age = now - b.ts;
     let (bid, ask) = (b.best_bid().unwrap(), b.best_ask().unwrap());
+    let (bid_lv, ask_lv) = (b.bids.clone(), b.asks.clone());
     let mid = micro::mid(bid, ask);
     let obi = micro::obi(&b.bids, &b.asks, 10).unwrap_or(0.0);
     let spread_bps = micro::spread_bps(bid, ask);
@@ -1092,8 +1187,15 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     let fee = cap.as_ref().map(|c| c.taker_fee);
     let slip = d.settings.paper_slippage_bps / 1e4;
     let fee_used = fee.unwrap_or(f64::NAN);
-    // C = 2 * taker fee + spread + 2 * slippage (round trip, charged once)
-    let cost = 2.0 * fee_used + (ask - bid) / mid + 2.0 * slip;
+    let maker_entry = d.settings.gamble_maker_entry && d.gov.policy.is_gamble();
+    let cost = if maker_entry {
+        // Maker entry rests at the near touch and the taker exit leaves from
+        // the same side: maker fee + taker fee + exit slippage, no spread.
+        cap.as_ref().map_or(f64::NAN, |c| c.maker_fee) + fee_used + slip
+    } else {
+        // C = 2 * taker fee + spread + 2 * slippage (round trip, charged once)
+        2.0 * fee_used + (ask - bid) / mid + 2.0 * slip
+    };
 
     let mut sides = vec![];
     for (side, m) in [(Side::Long, mu), (Side::Short, -mu)] {
@@ -1129,6 +1231,7 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     let gamble = d.gov.policy.is_gamble();
     let mut gamble_skip: Option<String> = None;
     let mut gamble_est: Option<qe_risk::gamble::BetEstimate> = None;
+    let mut payoff_plan: Option<qe_risk::gamble::payoff::PayoffPlan> = None;
     let mut best = if sides[0].3 >= sides[1].3 { 0 } else { 1 };
     if gamble {
         // Rank by the best available estimate of P(win) and payoff after costs.
@@ -1159,11 +1262,98 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             })
             .collect();
         best = if ests[0].score >= ests[1].score { 0 } else { 1 };
-        let me = ests[best].clone();
+        let mut me = ests[best].clone();
+        if let Some(pc) = d.settings.payoff {
+            // Payoff per bet: volatility-scaled TP/SL, maker/taker cost with
+            // spread and depth impact, exclusion when cost eats the TP.
+            let fx_v = d.fx_usdtinr().unwrap_or(f64::NAN);
+            let range = d.hist.get(pair).and_then(range_120s_frac).unwrap_or(0.0);
+            let owner_lev = d.gov.policy.gamble.as_ref().map_or(1, |g| g.leverage);
+            let room = d.equity() - d.gov.policy.gamble.as_ref().map_or(0.0, |g| g.floor());
+            let notional = (room.max(0.0) * owner_lev as f64).max(1.0);
+            let quotes: Vec<_> = [true, false]
+                .iter()
+                .map(|&long| {
+                    let lv = |x: f64| {
+                        if x.is_finite() && x >= 1.0 {
+                            x as u32
+                        } else {
+                            0
+                        }
+                    };
+                    let (lvls, mlev) = if long {
+                        (&bid_lv, cap.as_ref().map_or(0, |c| lv(c.max_leverage_long)))
+                    } else {
+                        (
+                            &ask_lv,
+                            cap.as_ref().map_or(0, |c| lv(c.max_leverage_short)),
+                        )
+                    };
+                    let depth = lvls.iter().take(5).map(|(p, q)| p * q).sum::<f64>() * fx_v;
+                    qe_risk::gamble::payoff::InstrumentQuote {
+                        pair: pair.to_string(),
+                        long,
+                        maker_fee: cap.as_ref().map_or(f64::NAN, |c| c.maker_fee),
+                        taker_fee: fee_used,
+                        spread_frac: (ask - bid) / mid,
+                        depth_inr: if depth.is_finite() { depth } else { 0.0 },
+                        max_leverage: mlev,
+                        maint_margin_frac: cap
+                            .as_ref()
+                            .and_then(|c| c.maintenance_margin_rate)
+                            .unwrap_or(0.0),
+                        range_120s_frac: range,
+                        sigma_120s_frac: s120,
+                        measured: d
+                            .gamble_trades
+                            .get(&(pair.to_string(), long))
+                            .map(|h| (h.n, h.hits)),
+                    }
+                })
+                .collect();
+            let plans: Vec<_> = quotes
+                .iter()
+                .map(|q| qe_risk::gamble::payoff::plan(q, &pc, owner_lev, notional))
+                .collect();
+            let pick = match (&plans[0], &plans[1]) {
+                (Ok(a), Ok(b)) if (a.ev_per_margin - b.ev_per_margin).abs() > 1e-15 => {
+                    if a.ev_per_margin > b.ev_per_margin {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                (Ok(_), Ok(_)) => best,
+                (Ok(_), Err(_)) => 0,
+                (Err(_), Ok(_)) => 1,
+                (Err(e), Err(_)) => {
+                    gamble_skip = Some(format!("gamble: skipped, {e}"));
+                    best
+                }
+            };
+            best = pick;
+            if let Ok(pl) = &plans[pick] {
+                me = qe_risk::gamble::BetEstimate::new(
+                    pair,
+                    pl.long,
+                    now,
+                    pl.win_p,
+                    pl.win_p,
+                    0.0,
+                    0.0,
+                    pl.tp_frac,
+                    pl.sl_frac,
+                    pl.cost_frac,
+                );
+                payoff_plan = Some(pl.clone());
+            }
+        }
         d.gamble_board
             .retain(|_, b| now - b.ts_ms <= GAMBLE_BOARD_MS && b.pair != pair);
         let board: Vec<_> = d.gamble_board.values().cloned().collect();
-        gamble_skip = qe_risk::gamble::skip_reason(&me, &board);
+        if gamble_skip.is_none() {
+            gamble_skip = qe_risk::gamble::skip_reason(&me, &board);
+        }
         // Only instruments the account can actually trade compete for the bet;
         // an ineligible one (e.g. null exchange leverage) must not block others.
         let tradable = cap.as_ref().is_some_and(|c| {
@@ -1172,14 +1362,21 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
                 && c.max_leverage_long >= 1.0
                 && c.max_leverage_short >= 1.0
                 && c.supports_market_order
-        });
-        if tradable {
+        }) && (!maker_entry
+            || meta
+                .as_ref()
+                .is_some_and(|m| m.order_types.iter().any(|o| o == "limit_order")));
+        if tradable && (d.settings.payoff.is_none() || payoff_plan.is_some()) {
             d.gamble_board
                 .insert((pair.to_string(), me.long), me.clone());
         }
         gamble_est = Some(me);
     }
     let (side, fp, _gross, mut net) = sides[best];
+    // With [payoff], the bet uses the plan's barriers and cost.
+    let (tp, sl, cost) = payoff_plan
+        .as_ref()
+        .map_or((tp, sl, cost), |p| (p.tp_frac, p.sl_frac, p.cost_frac));
     if let Some(e) = &gamble_est {
         net = e.ev_frac;
     }
@@ -1200,7 +1397,10 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             net = pt * tp - ps * sl + fp.p_neither * fp.e_ret_neither - cost;
         }
     }
-    let entry = if side == Side::Long { ask } else { bid };
+    let entry = match (side == Side::Long, maker_entry) {
+        (true, false) | (false, true) => ask,
+        (true, true) | (false, false) => bid,
+    };
     let dir = if side == Side::Long { 1.0 } else { -1.0 };
     let inc = cap.as_ref().map_or(0.0, |c| c.price_increment);
     let tp_price = round_to(entry * (dir * tp).exp(), inc);
@@ -1216,7 +1416,8 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             "barriers": "TP = K_TARGET * sigma_1s * sqrt(120), SL = K_STOP * sigma_1s * sqrt(120)",
             "first_passage": "binomial lattice dt=0.5 s, horizon 120 s",
             "ev": "EV = P(TP) W - P(SL) L + P(neither) E[R|neither] - C",
-            "cost": "C = 2 * taker_fee(live instrument) + (ask-bid)/mid + 2 * paper_slippage",
+            "cost": if maker_entry { "C = maker_fee + taker_fee + paper_slippage (maker entry at the near touch)" }
+                else { "C = 2 * taker_fee(live instrument) + (ask-bid)/mid + 2 * paper_slippage" },
         },
         "inputs": {"bid": bid, "ask": ask, "mid": mid, "obi_10": obi, "spread_bps": spread_bps, "r_60": m60 * 60.0,
             "sigma_1s": sig, "book_age_ms": book_age, "lambda_mom": LAMBDA_MOM, "gamma_obi": GAMMA_OBI,
@@ -1267,6 +1468,15 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             "capital stage {:?}: no new entries (checkpoint workflow / complete)",
             d.cap.stage
         ));
+    } else if !data_ok {
+        reasons.push(
+            "campaign: stale or incomplete market data (book > 5 s or REST ticker stale)".into(),
+        );
+    } else if let Err(why) = {
+        let open = d.positions.len();
+        d.campaign.entry_gate(now, open)
+    } {
+        reasons.push(format!("campaign: {why}"));
     } else {
         let c = cap.clone().unwrap();
         let proposal = TradeProposal {
@@ -1293,14 +1503,60 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             available_margin: (eq - d.used_margin()).max(0.0),
             paper: true,
         };
+        if d.campaign.cfg.bold_play {
+            // Bold play: margin so one TP win (net of cost) reaches the next hourly
+            // milestone, capped by equity above the owner floor; leverage is the
+            // owner setting capped by the instrument max for this side.
+            let next_h =
+                (d.campaign.checkpoints_done(now) + 1).min(qe_engine::campaign::CAMPAIGN_HOURS);
+            let next_req = dec_f64(d.campaign.cfg.checkpoint_required(next_h));
+            if let Some(g) = d.gov.policy.gamble.as_mut() {
+                let side_max = if side == Side::Long {
+                    c.max_leverage_long
+                } else {
+                    c.max_leverage_short
+                };
+                let lev = (g.leverage as f64).min(side_max).max(1.0);
+                let stake = d.campaign.cfg.bold_stake(eq, next_req, lev, tp - cost);
+                g.stake_inr = dec(stake).round_dp(2);
+            }
+        }
         match d.gov.evaluate_proposal(&proposal, &c, &acct, now as u64) {
             Decision::Approved(o) => {
-                decision = "taken";
-                reasons.push(format!(
-                    "approved: qty {} lev {}x notional INR {:.2} risk INR {:.4}",
-                    o.qty, o.leverage, o.notional_account, o.risk_at_stop
-                ));
-                approved = Some(o);
+                // Campaign risk profile: planned loss = stop loss + round-trip fees
+                // (actual order type: maker or taker entry) + slippage/spread, INR.
+                let fxv = fx.unwrap();
+                let entry_fee = if maker_entry {
+                    c.maker_fee
+                } else {
+                    c.taker_fee
+                };
+                let fee_frac = entry_fee + c.taker_fee;
+                let tc = TradeCheck {
+                    planned: PlannedLoss {
+                        stop_loss_inr: dec(o.qty * (o.entry_price - o.stop_loss).abs() * fxv),
+                        fees_inr: dec(o.notional_account * fee_frac),
+                        slippage_inr: dec(o.notional_account * (cost - fee_frac).max(0.0)),
+                    },
+                    notional_inr: dec(o.notional_account),
+                    min_notional_inr: dec(c.min_notional * fxv),
+                    stop_price: o.stop_loss,
+                    liquidation_price: o.liquidation_price,
+                    long: o.side == Side::Long,
+                    // desk orders are built with position_margin_type "isolated"
+                    isolated_margin: true,
+                };
+                match d.campaign.check_trade(now, &tc) {
+                    Ok(()) => {
+                        decision = "taken";
+                        reasons.push(format!(
+                            "approved: qty {} lev {}x notional INR {:.2} risk INR {:.4}; campaign planned loss INR {:.4}",
+                            o.qty, o.leverage, o.notional_account, o.risk_at_stop, tc.planned.total()
+                        ));
+                        approved = Some(o);
+                    }
+                    Err(why) => reasons.push(format!("campaign: {why}")),
+                }
             }
             Decision::Rejected { reasons: r, .. } => {
                 // a bet the account cannot size must not outrank affordable ones
@@ -1338,7 +1594,7 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     d.opportunities.truncate(100);
     let mode = if gamble { "gamble" } else { "standard" };
     let rec = json!({"ts_ms": now, "trace_id": trace, "pair": pair, "side": side, "decision": decision, "mode": mode,
-        "gamble_estimate": gamble_est,
+        "gamble_estimate": gamble_est, "payoff_plan": payoff_plan,
         "reason": reason, "entry": entry, "tp_price": tp_price, "sl_price": sl_price, "ev_net_bps": net * 1e4,
         "approved_order": approved, "instrument": cap, "explanation": explanation});
     d.store.append("decisions", &rec);
@@ -1395,6 +1651,9 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
                             c.max_leverage_short
                         }),
                         governor_approved: true,
+                        entry_limit: maker_entry.then_some(o.entry_price),
+                        fill_timeout_ms: maker_entry
+                            .then_some(d.settings.maker_timeout_ms.max(1) as u64),
                     },
                     risk_at_stop: o.risk_at_stop,
                     risk_fraction: d.gov.policy.risk_fraction,
@@ -1428,6 +1687,11 @@ fn open_paper(
 ) {
     let now = now_ms() as u64;
     let policy = d.gov.policy.clone();
+    let maker = (d.settings.gamble_maker_entry && policy.is_gamble()).then(|| MakerEntry {
+        price: o.entry_price,
+        placed_ms: now as i64,
+        deadline_ms: now as i64 + d.settings.maker_timeout_ms,
+    });
     let mut pos = Position::new(o, &policy);
     let actions = pos.start(now);
     d.positions.push(PaperPos {
@@ -1435,9 +1699,11 @@ fn open_paper(
         margin: TRADE_MARGIN.into(),
         fx,
         taker_fee: c.taker_fee,
+        maker_fee: c.maker_fee,
         mark: mid,
         entry_ref_mid: mid,
         proposal: rec,
+        maker,
     });
     let idx = d.positions.len() - 1;
     run_actions(d, idx, actions);
@@ -1445,6 +1711,18 @@ fn open_paper(
 }
 
 fn fill_rec(d: &mut Desk, idx: usize, buy: bool, f: qe_risk::Fill, ref_mid: f64, reason: &str) {
+    fill_rec_liq(d, idx, buy, f, ref_mid, reason, "taker")
+}
+
+fn fill_rec_liq(
+    d: &mut Desk,
+    idx: usize,
+    buy: bool,
+    f: qe_risk::Fill,
+    ref_mid: f64,
+    reason: &str,
+    liquidity: &str,
+) {
     let p = &d.positions[idx];
     let slip_bps = if buy {
         (f.price - ref_mid) / ref_mid * 1e4
@@ -1453,7 +1731,7 @@ fn fill_rec(d: &mut Desk, idx: usize, buy: bool, f: qe_risk::Fill, ref_mid: f64,
     };
     let rec = json!({"id": format!("{}-{}", p.pos.order.trace_id, d.fills.len()), "position_id": p.pos.order.trace_id,
         "pair": p.pos.order.pair, "side": if buy {"buy"} else {"sell"}, "qty": f.qty, "price": f.price,
-        "ref_mid": ref_mid, "slippage_bps": slip_bps, "fee": f.fee, "fee_inr": f.fee * p.fx, "liquidity": "taker",
+        "ref_mid": ref_mid, "slippage_bps": slip_bps, "fee": f.fee, "fee_inr": f.fee * p.fx, "liquidity": liquidity,
         "reason": reason, "ts_ms": now_ms(), "paper": true});
     d.store.append("fills", &rec);
     d.fills.push_front(rec);
@@ -1498,6 +1776,20 @@ pub fn run_actions(d: &mut Desk, idx: usize, actions: Vec<Action>) {
                 qty,
             } => {
                 let buy = side == Side::Long;
+                if let Some(m) = d.positions[idx].maker.clone() {
+                    d.maker_stats.placed += 1;
+                    d.audit(
+                        "execution",
+                        format!(
+                            "paper maker entry {client_id} resting: {} {qty} @ {} (limit, GTC, cancel after {} ms)",
+                            if buy { "buy" } else { "sell" },
+                            m.price,
+                            m.deadline_ms - m.placed_ms
+                        ),
+                        Value::Null,
+                    );
+                    continue;
+                }
                 let (inc, minq) = d
                     .instruments
                     .get(&format!("{pair}|{TRADE_MARGIN}"))
@@ -1632,6 +1924,7 @@ fn close_trade(d: &mut Desk, idx: usize, pnl: f64, exit_price: f64, reason: &str
         (pp.pos.entry_fees + pp.pos.exit_fees) * pp.fx
     };
     d.cap.on_realised(dec(pnl), dec(fees_inr));
+    d.campaign.on_trade_closed(now, dec(pnl));
     let eq = d.cap.equity_f64();
     d.gov.record_realised(pnl, eq, now as u64);
     for a in std::mem::take(&mut d.gov.audit) {
@@ -1739,6 +2032,10 @@ pub fn hold_edge(d: &Desk, pp: &PaperPos, now: i64) -> f64 {
 pub fn lifecycle_tick(d: &mut Desk) {
     let now = now_ms();
     for idx in 0..d.positions.len() {
+        if d.positions[idx].maker.is_some() {
+            maker_tick(d, idx, now);
+            continue;
+        }
         let pair = d.positions[idx].pos.order.pair.clone();
         let book = d.books.get(&pair).filter(|b| b.is_sane()).cloned();
         let actions = match book {
@@ -1775,10 +2072,127 @@ pub fn lifecycle_tick(d: &mut Desk) {
     crate::learn::resolve(d, now);
 }
 
+/// Quantity that public trades printed strictly through a resting limit after
+/// it was placed (buy limit: prints below it; sell limit: prints above it).
+pub fn maker_through_qty(trades: &VecDeque<timeframe::Trade>, buy: bool, m: &MakerEntry) -> f64 {
+    trades
+        .iter()
+        .filter(|t| t.ts_ms >= m.placed_ms)
+        .filter(|t| {
+            if buy {
+                t.price < m.price
+            } else {
+                t.price > m.price
+            }
+        })
+        .map(|t| t.qty)
+        .sum()
+}
+
+/// Advance a resting paper maker entry: fill it when enough volume printed
+/// through its price; at the deadline fill what printed through (if it meets
+/// the exchange minimum) and cancel the rest. No taker chase.
+fn maker_tick(d: &mut Desk, idx: usize, now: i64) {
+    let Some(m) = d.positions[idx].maker.clone() else {
+        return;
+    };
+    let pp = &d.positions[idx];
+    let pair = pp.pos.order.pair.clone();
+    let buy = pp.pos.order.side == Side::Long;
+    let want = pp.pos.order.qty;
+    let client_id = pp.pos.entry_id();
+    let through = d
+        .trades
+        .get(&pair)
+        .map_or(0.0, |t| maker_through_qty(t, buy, &m));
+    let expired = now >= m.deadline_ms;
+    let (inc, minq) = d
+        .instruments
+        .get(&format!("{pair}|{TRADE_MARGIN}"))
+        .map(|c| capability(&c.1))
+        .map_or((0.0, 0.0), |c| (c.quantity_increment, c.min_quantity));
+    let qty = if through + 1e-12 >= want {
+        want
+    } else if expired {
+        let q = if inc > 0.0 {
+            (through / inc + 1e-9).floor() * inc
+        } else {
+            through
+        };
+        if q >= minq.max(1e-12) {
+            q
+        } else {
+            0.0
+        }
+    } else {
+        return;
+    };
+    d.positions[idx].maker = None;
+    if qty <= 0.0 {
+        d.maker_stats.cancelled += 1;
+        d.audit(
+            "execution",
+            format!("paper maker entry {client_id} unfilled after {} ms: cancelled, no taker chase; re-evaluating", now - m.placed_ms),
+            Value::Null,
+        );
+        let more = d.positions[idx].pos.on_entry_rejected();
+        run_actions(d, idx, more);
+        return;
+    }
+    let partial = qty + 1e-12 < want;
+    if partial {
+        d.maker_stats.partial += 1;
+    } else {
+        d.maker_stats.filled += 1;
+    }
+    let f = qe_risk::Fill {
+        qty,
+        price: m.price,
+        fee: qty * m.price * d.positions[idx].maker_fee,
+    };
+    let ref_mid = d
+        .books
+        .get(&pair)
+        .filter(|b| b.is_sane())
+        .map_or(m.price, |b| {
+            micro::mid(b.best_bid().unwrap(), b.best_ask().unwrap())
+        });
+    fill_rec_liq(
+        d,
+        idx,
+        buy,
+        f,
+        ref_mid,
+        if partial { "entry_partial" } else { "entry" },
+        "maker",
+    );
+    if let Some(fr) = d.fills.front_mut() {
+        fr["latency_ms"] = json!(now - m.placed_ms);
+        fr["partial"] = json!(partial);
+    }
+    d.audit(
+        "execution",
+        format!(
+            "paper maker entry {client_id} filled {qty} @ {} after {} ms",
+            m.price,
+            now - m.placed_ms
+        ),
+        Value::Null,
+    );
+    let mut more = d.positions[idx]
+        .pos
+        .on_fill(qty, m.price, f.fee, now as u64);
+    if partial {
+        more.extend(d.positions[idx].pos.on_entry_done_partial());
+    }
+    run_actions(d, idx, more);
+}
+
 /// Drive the capital plan: stage transitions and the checkpoint workflow
 /// (stop entries, flatten, cancel entry orders, verify flat, query the PAPER
 /// ledger balance, reconcile, prepare the withdrawal for the user).
 pub fn capital_tick(d: &mut Desk, now: i64) {
+    campaign_tick(d, now);
     if let Some(ev) = d.cap.on_clock(now as u64) {
         d.store
             .append("capital", &serde_json::to_value(&ev).unwrap_or_default());
@@ -2107,6 +2521,7 @@ pub fn refresh_gamble_sim(d: &mut Desk, now: i64) {
         "expected_bets": r.expected_bets, "median_final_equity": r.median_final_equity,
         "bets_remaining": input.bets_remaining, "sims": 2_000, "seed": 42,
         "win_p": win_p, "payoff_ratio": input.payoff_ratio, "cost_frac": cost,
+        "barriers": if d.settings.payoff.is_some() { "payoff plan (qe_risk::gamble::payoff)" } else { "sigma barriers" },
         "bets_per_hour": bph, "hours_remaining": hours,
         "source": source, "computed_ms": now}));
 }
@@ -2148,6 +2563,13 @@ pub fn gamble_json(d: &Desk) -> Value {
         "stopped_reason": d.gov.gamble_stopped.clone().or_else(|| d.gov.killed.then(|| "kill switch engaged".to_string())),
         "paper": !crate::live_exec::live_installed(),
         "simulation": sim,
+        "entry": if d.settings.gamble_maker_entry { "maker" } else { "taker" },
+        "maker": {"placed": d.maker_stats.placed, "filled": d.maker_stats.filled,
+            "partial": d.maker_stats.partial, "cancelled": d.maker_stats.cancelled,
+            "fill_rate": if d.maker_stats.placed > 0 {
+                Some((d.maker_stats.filled + d.maker_stats.partial) as f64 / d.maker_stats.placed as f64) } else { None },
+            "timeout_ms": d.settings.maker_timeout_ms,
+            "note": "paper fills only when trades print strictly through the resting price (queue position unknown, assumed last); CoinDCX futures post_only is documented as unsupported, so live limits can still fill as taker"},
         "candidates": board.iter().take(8).collect::<Vec<_>>(),
         "ev_note": "Each bet's estimated expected value after costs is shown per candidate; it is usually negative (round trip ~13-16 bps, no measured edge). Gamble mode bets anyway by the owner's choice; the ranking only picks the least-bad bet.",
     })
@@ -2157,6 +2579,12 @@ pub fn flatten(d: &mut Desk, why: &str) -> usize {
     let now = now_ms() as u64;
     let mut n = 0;
     for idx in 0..d.positions.len() {
+        if d.positions[idx].maker.take().is_some() {
+            d.maker_stats.cancelled += 1;
+            d.positions[idx].pos.on_entry_rejected();
+            n += 1;
+            continue;
+        }
         let a = d.positions[idx].pos.emergency_exit(now);
         n += a.len();
         run_actions(d, idx, a);
@@ -2533,7 +2961,7 @@ pub fn live_json() -> Value {
 }
 
 /// Scheduled reports: 20:00 paper, hourly while trading toward the single INR 50,000
-/// target, final at the 17:00 IST final checkpoint (then the plan completes). Written as
+/// target, final at the 23:00 IST final checkpoint (then the plan completes). Written as
 /// markdown under `<data dir>/reports/`.
 pub fn report_tick(d: &mut Desk, now: i64) {
     use qe_engine::report::ReportKind as K;
@@ -2662,18 +3090,8 @@ mod tests {
         }
     }
 
-    fn desk_with(side: Side) -> Desk {
-        std::env::set_var(
-            "QE_DATA_DIR",
-            std::env::temp_dir()
-                .join("qe-desk-test")
-                .to_string_lossy()
-                .to_string(),
-        );
-        let mut d = Desk::new(Settings::default());
-        d.books.insert("B-X_USDT".into(), book(99.95, 100.05));
-        d.gov.open_positions = 1;
-        let c = InstrumentCapability {
+    fn cap_x() -> InstrumentCapability {
+        InstrumentCapability {
             pair: "B-X_USDT".into(),
             margin_currency: "INR".into(),
             active: true,
@@ -2691,7 +3109,21 @@ mod tests {
             maintenance_margin_rate: None,
             margin_modes: vec![],
             supports_market_order: true,
-        };
+        }
+    }
+
+    fn desk_with(side: Side) -> Desk {
+        std::env::set_var(
+            "QE_DATA_DIR",
+            std::env::temp_dir()
+                .join("qe-desk-test")
+                .to_string_lossy()
+                .to_string(),
+        );
+        let mut d = Desk::new(Settings::default());
+        d.books.insert("B-X_USDT".into(), book(99.95, 100.05));
+        d.gov.open_positions = 1;
+        let c = cap_x();
         open_paper(&mut d, order(side), c, 1.0, 100.0, Value::Null);
         d
     }
@@ -2886,9 +3318,454 @@ mod tests {
         let _ = std::fs::remove_file(d.store.dir.join(GAMBLE_STOP_FILE));
     }
 
+    fn trade(ts_ms: i64, price: f64, qty: f64) -> timeframe::Trade {
+        timeframe::Trade {
+            ts_ms,
+            price,
+            qty,
+            buyer_aggressor: None,
+        }
+    }
+
+    fn maker_desk(side: Side) -> Desk {
+        let mut d = desk_with(Side::Long);
+        d.positions.clear();
+        d.gov.policy = gamble_desk(side).gov.policy;
+        d.settings.gamble_maker_entry = true;
+        d.settings.maker_timeout_ms = 60_000;
+        open_paper(&mut d, order(side), cap_x(), 1.0, 100.0, Value::Null);
+        d
+    }
+
+    #[test]
+    fn maker_entry_rests_until_trades_print_through() {
+        let mut d = maker_desk(Side::Long);
+        let pair = d.positions[0].pos.order.pair.clone();
+        let px = d.positions[0].maker.as_ref().unwrap().price;
+        let qty = d.positions[0].pos.order.qty;
+        assert_eq!(d.positions[0].pos.state, State::EntrySubmitted);
+        assert_eq!(d.maker_stats.placed, 1);
+        // a print AT the price does not fill (queue position unknown)
+        d.trades
+            .entry(pair.clone())
+            .or_default()
+            .push_back(trade(now_ms(), px, qty * 10.0));
+        lifecycle_tick(&mut d);
+        assert!(d.positions[0].maker.is_some());
+        // prints through the price fill at the limit with the maker fee
+        d.trades
+            .entry(pair)
+            .or_default()
+            .push_back(trade(now_ms(), px * 0.999, qty));
+        lifecycle_tick(&mut d);
+        let p = &d.positions[0];
+        assert!(p.maker.is_none());
+        assert_eq!(p.pos.state, State::Protected);
+        assert_eq!(p.pos.avg_entry, px);
+        assert!((p.pos.entry_fees - qty * px * p.maker_fee).abs() < 1e-12);
+        assert_eq!(d.fills[0]["liquidity"], "maker");
+        assert_eq!(d.maker_stats.filled, 1);
+    }
+
+    #[test]
+    fn maker_entry_times_out_and_is_cancelled_without_a_chase() {
+        let mut d = maker_desk(Side::Short);
+        let px = d.positions[0].maker.as_ref().unwrap().price;
+        let pair = d.positions[0].pos.order.pair.clone();
+        // a print below a sell limit is not through it
+        d.trades
+            .entry(pair)
+            .or_default()
+            .push_back(trade(now_ms(), px * 0.99, 1e9));
+        d.positions[0].maker.as_mut().unwrap().deadline_ms = 0;
+        let fills = d.fills.len();
+        lifecycle_tick(&mut d);
+        assert!(d.positions.is_empty(), "rejected entry swept");
+        assert_eq!(d.fills.len(), fills, "no taker fill");
+        assert_eq!(d.maker_stats.cancelled, 1);
+        assert_eq!(gamble_json(&d)["maker"]["fill_rate"], 0.0);
+    }
+
+    #[test]
+    fn flatten_cancels_a_resting_maker_entry() {
+        let mut d = maker_desk(Side::Long);
+        flatten(&mut d, "test");
+        assert!(d.positions.is_empty());
+        assert_eq!(d.maker_stats.cancelled, 1);
+    }
+
+    #[test]
+    fn range_120s_is_the_median_bucket_range() {
+        let mut h = VecDeque::new();
+        // three 120 s buckets with ranges 1%, 2%, 4% of ~100
+        for (k, amp) in [(0i64, 4.0), (1, 2.0), (2, 1.0)] {
+            for i in 0..60i64 {
+                let t = 1_000_000 - k * 120_000 - i * 2_000;
+                let p = 100.0 + if i % 2 == 0 { amp / 2.0 } else { -amp / 2.0 };
+                h.push_front((t, p, 0.0));
+            }
+        }
+        let r = range_120s_frac(&h).unwrap();
+        assert!((r - 0.02).abs() < 1e-9, "{r}");
+        assert_eq!(range_120s_frac(&VecDeque::new()), None);
+    }
+
     #[test]
     fn iso_utc_formats_the_deadline() {
         assert_eq!(iso_utc(1_795_519_800_000), "2026-11-24T11:30:00Z");
         assert_eq!(gamble_json(&Desk::new(Settings::default())), Value::Null);
+    }
+}
+
+fn campaign_path(d: &Desk) -> std::path::PathBuf {
+    d.store.dir.join("campaign_state.json")
+}
+
+/// Restart recovery: resume the persisted campaign (a stop stays a stop). An
+/// unreadable or foreign state blocks entries instead of being reset silently.
+/// The campaign profile: bold play (owner floor) for the campaign gamble
+/// profile, otherwise the protective INR 1 / INR 5 profile.
+pub fn campaign_cfg(s: &Settings) -> CampaignConfig {
+    match (&s.gamble, s.campaign_bold) {
+        (Some(g), true) => CampaignConfig::bold(g.floor_inr),
+        _ => CampaignConfig::default(),
+    }
+}
+
+/// Campaign configuration validation (23-hour schedule): the capital plan must
+/// end at the 23:00 IST campaign deadline. A config still carrying the
+/// SUPERSEDED 22:00 IST deadline (or any other end) is refused at start-up.
+pub fn validate_campaign_schedule(s: &Settings) -> Result<(), String> {
+    use qe_engine::campaign::{CAMPAIGN_DEADLINE_MS, SUPERSEDED_22H_DEADLINE_MS};
+    for (k, v) in [
+        ("stage1_checkpoint_ms", s.stage1_checkpoint_ms),
+        ("stage2_deadline_ms", s.stage2_deadline_ms),
+    ] {
+        if v == SUPERSEDED_22H_DEADLINE_MS {
+            return Err(format!(
+                "configs/risk-limits.toml {k} = {v} is the SUPERSEDED 22:00 IST deadline; \
+                 the 23-hour campaign ends at 23:00 IST ({CAMPAIGN_DEADLINE_MS})"
+            ));
+        }
+        if v != CAMPAIGN_DEADLINE_MS {
+            return Err(format!(
+                "configs/risk-limits.toml {k} = {v} is not the 23:00 IST campaign deadline \
+                 {CAMPAIGN_DEADLINE_MS}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn load_campaign(d: &mut Desk) {
+    let cfg = campaign_cfg(&d.settings);
+    let src = if crate::live_exec::live_installed() {
+        EquitySource::LiveExchange
+    } else {
+        EquitySource::Paper
+    };
+    d.campaign = Campaign::new(cfg.clone(), src);
+    match std::fs::read_to_string(campaign_path(d)) {
+        Ok(txt) => match Campaign::restore(&txt, &cfg) {
+            Ok(c) => d.campaign = c,
+            Err(e) => {
+                d.campaign
+                    .owner_stop(now_ms(), &format!("state not restorable ({e})"));
+                d.campaign_error = Some(e);
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            d.campaign
+                .owner_stop(now_ms(), &format!("state unreadable ({e})"));
+            d.campaign_error = Some(e.to_string());
+        }
+    }
+}
+
+/// Feed the campaign the current equity, run the 23:00 IST deadline workflow,
+/// audit every campaign event and persist the state.
+pub fn campaign_tick(d: &mut Desk, now: i64) {
+    let live = crate::live_exec::live_installed();
+    // Live: the paper ledger is never real capital. Equity is the verified INR
+    // futures-wallet balance from the read-only account loop (every 10 s); a
+    // failed or stale read makes it unknown (null) and the gate refuses entries.
+    let (eq, src) = if live {
+        (live_campaign_equity(d, now), EquitySource::LiveExchange)
+    } else {
+        (Some(d.cap.equity), EquitySource::Paper)
+    };
+    // paper ledger P&L against the paper start (never against E0, which is the
+    // live measurement baseline)
+    let realised = d.cap.equity - dec(d.settings.paper_start_equity_inr);
+    let unreal = dec(d.unrealized());
+    d.campaign.observe(now, eq, src, realised, unreal);
+    if d.campaign.is_stopped() && !d.controls.entries_paused {
+        let _ = d.gov.pause_entries(true, now as u64);
+        d.controls.entries_paused = true;
+    }
+    d.campaign.tick(now);
+    if d.campaign.expired(now) && d.campaign.final_record.is_none() {
+        if d.campaign.deadline_steps.is_empty() {
+            let _ = d.gov.pause_entries(true, now as u64);
+            d.controls.entries_paused = true;
+            d.campaign.record_step(
+                now,
+                DeadlineStep::StopEntries,
+                true,
+                "entries paused, exit-only".into(),
+            );
+            let cancel = if live {
+                "live: owner must cancel resting entry orders (not verified by this build)"
+            } else {
+                "paper: no resting entry orders"
+            };
+            d.campaign
+                .record_step(now, DeadlineStep::CancelEntryOrders, !live, cancel.into());
+            let n = flatten(d, "campaign deadline 23:00 IST");
+            let fl = if live {
+                "live close path NOT verified: owner alerted, flatten via the validated owner procedure"
+                    .to_string()
+            } else {
+                format!("paper: {n} exit action(s)")
+            };
+            d.campaign
+                .record_step(now, DeadlineStep::Flatten, !live, fl);
+            if live {
+                d.incident(
+                    "campaign",
+                    "23:00 IST deadline: live close path not verified; entries stopped, OWNER must flatten and reconcile".into(),
+                );
+            }
+        }
+        if live {
+            d.campaign.record_step(
+                now,
+                DeadlineStep::VerifyFlat,
+                false,
+                "no exchange reconciliation in this build".into(),
+            );
+            d.campaign.finalize(
+                now,
+                false,
+                "live: exchange reconciliation not performed; account NOT verified flat",
+            );
+        } else if d.positions.is_empty() {
+            d.campaign.record_step(
+                now,
+                DeadlineStep::ReconcilePositions,
+                true,
+                "paper ledger: 0 open positions".into(),
+            );
+            d.campaign.record_step(
+                now,
+                DeadlineStep::ReconcileProtectiveOrders,
+                true,
+                "paper: protective orders close with the position".into(),
+            );
+            d.campaign.record_step(
+                now,
+                DeadlineStep::VerifyFlat,
+                true,
+                "paper ledger flat".into(),
+            );
+            let realised = d.cap.equity - dec(d.settings.paper_start_equity_inr);
+            d.campaign.observe(
+                now,
+                Some(d.cap.equity),
+                EquitySource::Paper,
+                realised,
+                Decimal::ZERO,
+            );
+            d.campaign
+                .finalize(now, true, "paper ledger (not an exchange account)");
+            d.campaign.record_step(
+                now,
+                DeadlineStep::RecordFinal,
+                true,
+                "final paper equity recorded".into(),
+            );
+        }
+    }
+    let events = d.campaign.drain_events();
+    if !events.is_empty() {
+        for e in &events {
+            d.store
+                .append("campaign", &serde_json::to_value(e).unwrap_or_default());
+            d.audit("campaign", e.message.clone(), e.data.clone());
+        }
+        persist_campaign(d);
+    }
+}
+
+/// A live balance older than this is not used (the read loop runs every 10 s).
+pub const LIVE_EQUITY_MAX_AGE_MS: i64 = 30_000;
+
+/// Verified live INR equity, or None when the last read failed or is stale.
+pub fn live_campaign_equity(d: &Desk, now: i64) -> Option<Decimal> {
+    if d.live_account_err.is_some() {
+        return None;
+    }
+    d.live_inr_equity
+        .filter(|(t, v)| now - *t <= LIVE_EQUITY_MAX_AGE_MS && v.is_finite())
+        .map(|(_, v)| dec(v))
+}
+
+fn persist_campaign(d: &mut Desk) {
+    let Ok(txt) = serde_json::to_string(&d.campaign) else {
+        return;
+    };
+    let p = campaign_path(d);
+    let tmp = p.with_extension("json.tmp");
+    let r = std::fs::write(&tmp, txt).and_then(|_| std::fs::rename(&tmp, &p));
+    if let Err(e) = r {
+        d.campaign_error = Some(format!("campaign state not persisted: {e}"));
+    }
+}
+
+/// `/api/state.campaign` (docs/DASHBOARD_API.md).
+pub fn campaign_json(d: &Desk, now: i64) -> Value {
+    let open = d
+        .positions
+        .iter()
+        .find(|p| p.pos.filled_qty > 0.0)
+        .map_or(Value::Null, |p| {
+            let s = if p.pos.order.side == Side::Long {
+                1.0
+            } else {
+                -1.0
+            };
+            let u = (p.mark - p.pos.avg_entry) * (p.pos.filled_qty - p.pos.exited_qty) * s * p.fx;
+            json!({"pair": p.pos.order.pair, "side": if s > 0.0 {"long"} else {"short"},
+                   "held_secs": p.pos.age_ms(now as u64).unwrap_or(0) as f64 / 1000.0,
+                   "unrealised_inr": format!("{u:.2}")})
+        });
+    let note = match d.campaign.equity_source {
+        EquitySource::Paper => "PAPER ledger in INR (simulated, not real capital); USDT P&L converted at the CoinDCX USDTINR spot mid",
+        EquitySource::LiveExchange => "LIVE: CoinDCX INR futures wallet (balance + locked), read-only every 10 s; null if the read failed or is older than 30 s; USDT wallets are never converted or added",
+    };
+    let mut j = d.campaign.to_json(now, open, note);
+    j["error"] = json!(d.campaign_error);
+    j
+}
+
+#[cfg(test)]
+mod campaign_tests {
+    use super::*;
+
+    #[test]
+    fn campaign_state_is_exposed_and_paper_labelled() {
+        let d = Desk::new(Settings::default());
+        let j = campaign_json(&d, qe_engine::campaign::CAMPAIGN_START_MS);
+        assert_eq!(j["target_inr"], "50000");
+        assert_eq!(j["floor_inr"], "95");
+        assert_eq!(j["loss_budget_inr"], "5");
+        assert_eq!(j["per_trade_max_loss_inr"], "1");
+        assert_eq!(j["deadline"], "2026-11-24T23:00:00+05:30");
+        assert_eq!(j["first_entry"], "2026-11-24T01:00:00+05:30");
+        assert_eq!(j["start_equity_inr"], "101.45");
+        assert_eq!(j["milestones"].as_array().unwrap().len(), 24);
+        assert_eq!(j["milestones"][23]["required_inr"], "50000");
+        assert_eq!(j["entry_window_open"], false);
+        assert_eq!(j["equity_source"], "paper");
+    }
+
+    #[test]
+    fn campaign_schedule_validation_refuses_the_22_hour_deadline() {
+        use qe_engine::campaign::{CAMPAIGN_DEADLINE_MS, SUPERSEDED_22H_DEADLINE_MS};
+        let mut s = Settings::default();
+        assert_eq!(s.stage2_deadline_ms, CAMPAIGN_DEADLINE_MS);
+        assert!(validate_campaign_schedule(&s).is_ok());
+        s.stage2_deadline_ms = SUPERSEDED_22H_DEADLINE_MS;
+        let e = validate_campaign_schedule(&s).unwrap_err();
+        assert!(e.contains("SUPERSEDED 22:00"), "{e}");
+        s.stage2_deadline_ms = CAMPAIGN_DEADLINE_MS + 1;
+        assert!(validate_campaign_schedule(&s).is_err());
+        // the shipped configs carry the 23:00 IST deadline and unchanged risk limits
+        let rl: toml::Table = include_str!("../../../configs/risk-limits.toml")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            rl["stage2_deadline_ms"].as_integer(),
+            Some(CAMPAIGN_DEADLINE_MS)
+        );
+        assert_eq!(
+            rl["stage1_checkpoint_ms"].as_integer(),
+            Some(CAMPAIGN_DEADLINE_MS)
+        );
+        let c: toml::Table = include_str!("../../../configs/campaign-24nov.toml")
+            .parse()
+            .unwrap();
+        let sch = c["schedule"].as_table().unwrap();
+        assert_eq!(sch["hours"].as_integer(), Some(23));
+        assert_eq!(sch["deadline"].as_str(), Some("2026-11-24T23:00:00+05:30"));
+        assert_eq!(
+            sch["first_entry"].as_str(),
+            Some("2026-11-24T01:00:00+05:30")
+        );
+        assert_eq!(sch["start_equity_inr"].as_str(), Some("101.45"));
+        let r = c["risk"].as_table().unwrap();
+        assert_eq!(r["floor_inr"].as_str(), Some("95"));
+        assert_eq!(r["per_trade_max_loss_inr"].as_str(), Some("1"));
+        assert_eq!(r["campaign_loss_budget_inr"].as_str(), Some("5"));
+        assert_eq!(r["max_hold_ms"].as_integer(), Some(120_000));
+        assert_eq!(r["max_open_positions"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn simulation_horizons_end_at_23_00_ist() {
+        use qe_engine::campaign::{CAMPAIGN_DEADLINE_MS, CAMPAIGN_START_MS, HOUR_MS};
+        let d = Desk::new(Settings::default());
+        let now = CAMPAIGN_START_MS + 2 * HOUR_MS;
+        // the capital plan (target_json / Monte Carlo / gamble odds) uses 23:00
+        let (_, dl) = d.cap.target();
+        assert_eq!(dl as i64, CAMPAIGN_DEADLINE_MS);
+        let req = d.cap.required(now as u64);
+        assert!((req.hours - 21.0).abs() < 1e-9, "{}", req.hours);
+        let hours = (d.settings.stage2_deadline_ms - now) as f64 / 3.6e6;
+        assert!((hours - 21.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn live_equity_must_be_fresh_and_error_free() {
+        let mut d = Desk::new(Settings::default());
+        let now = 1_000_000;
+        assert_eq!(live_campaign_equity(&d, now), None);
+        d.live_inr_equity = Some((now - 5_000, 100.0));
+        assert_eq!(live_campaign_equity(&d, now), Some(dec(100.0)));
+        d.live_inr_equity = Some((now - LIVE_EQUITY_MAX_AGE_MS - 1, 100.0));
+        assert_eq!(live_campaign_equity(&d, now), None, "stale read refused");
+        d.live_inr_equity = Some((now, 100.0));
+        d.live_account_err = Some("401".into());
+        assert_eq!(live_campaign_equity(&d, now), None, "failed read refused");
+    }
+
+    /// Mocked HTTP: the read-only account reads wallets/positions/orders/balances
+    /// from a local server; no credentials or exchange are involved.
+    #[tokio::test]
+    async fn readonly_account_reads_inr_equity_from_mock_http() {
+        use axum::{routing::any, Router};
+        let app = Router::new()
+            .route(
+                "/exchange/v1/derivatives/futures/wallets",
+                any(|| async {
+                    r#"[{"currency_short_name":"INR","balance":"97.5","locked_balance":"2.5"},{"currency_short_name":"USDT","balance":"3"}]"#
+                }),
+            )
+            .fallback(any(|| async { "[]" }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let creds = qe_coindcx::auth::Credentials::new("k-test".into(), "s-test".into()).unwrap();
+        let ro = qe_coindcx::private::readonly::ReadOnlyAccount::new(creds)
+            .with_base_url(&format!("http://{addr}"));
+        let snap = ro.snapshot(&["INR"]).await.unwrap();
+        let eq = qe_coindcx::private::readonly::inr_wallet_equity(&snap.wallets).unwrap();
+        assert_eq!(eq, 100.0);
+        let txt = qe_coindcx::private::readonly::summary(&snap);
+        assert!(
+            txt.contains("INR 100.00") && !txt.contains("s-test"),
+            "{txt}"
+        );
     }
 }

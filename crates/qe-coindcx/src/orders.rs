@@ -6,7 +6,7 @@
 //!   {timestamp, leverage (string), pair, margin_currency_short_name}
 //! * POST /exchange/v1/derivatives/futures/positions/create_tpsl
 //!   {timestamp, id, take_profit:{stop_price, order_type:"take_profit_market"},
-//!    stop_loss:{stop_price, order_type:"stop_market"}}
+//!   stop_loss:{stop_price, order_type:"stop_market"}}
 //!   (docs table: only take_profit_market / stop_market supported; examples differ.)
 //!
 //! These sprint-1 body builders are kept for compatibility; the signed client
@@ -103,9 +103,9 @@ pub fn client_order_id(strategy: &str, pair: &str, seq: u64) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in strategy
         .bytes()
-        .chain([b'|'])
+        .chain(*b"|")
         .chain(pair.bytes())
-        .chain([b'|'])
+        .chain(*b"|")
         .chain(seq.to_le_bytes())
     {
         h ^= b as u64;

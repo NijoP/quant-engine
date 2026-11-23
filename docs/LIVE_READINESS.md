@@ -13,6 +13,8 @@ responses. Until your own runs pass, treat every authenticated path as
 
 ## Build once
 
+> **Canonical midnight procedure: [OWNER_START_0000.md](OWNER_START_0000.md).** Do not build locally for the 00:00 start; download the CI artifact `qe-desk-linux-x86_64`. The build commands below are for developers only.
+
 ```sh
 cargo build --release -p qe-live-check --features live-orders
 alias qlc=./target/release/qe-live-check
@@ -25,7 +27,9 @@ it somewhere else. Credentials come from `COINDCX_API_KEY` / `COINDCX_API_SECRET
 or a `chmod 600` file named by `QE_SECRETS_FILE` (default `./.env`). The tools
 only ever print `configured` or `not configured`.
 
-## Before Stage 1 (finish before 20:00 IST)
+## Before arming (finish before the campaign starts at 00:00 IST, 24 Nov)
+
+Current campaign: [CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md) (INR 101.45 E0 → INR 50,000, first entry 01:00 IST, deadline 23:00 IST 24 Nov 2026; the 22:00 IST 22-hour schedule is superseded).
 
 | # | Command | What it does | Places orders? |
 | --- | --- | --- | --- |
@@ -43,7 +47,7 @@ only ever print `configured` or `not configured`.
 | --- | --- |
 | Credentials, signing self-test, account reconciled | 15 min |
 | Instrument requirements | 6 h |
-| Protective orders verified, 120 s closure tested, risk-governor acceptance | 24 h |
+| Protective orders verified, fill-to-flat within 120 s during validation (immediate close), risk-governor acceptance | 24 h |
 
 Arming snapshots the checks. While the arm record is valid (at most 24 h,
 default 3 h), the gate does not re-expire on account-check age. Expiry, `disarm`
@@ -60,13 +64,24 @@ or `kill` closes it.
    max(min_quantity, min_notional x 1.02 / price), rounded up to the
    quantity increment. After that there are no further prompts, so an open
    position never waits on a keyboard:
-4. it waits for the fill, sends `create_tpsl` (`take_profit_market` and
+4. it waits for the fill and reads the exchange's own position response for
+   the pair. Its `margin_type` must be `isolated`. If it is `crossed`, missing
+   or anything else, the tool sends no TP/SL, runs the emergency flatten,
+   verifies flat and stops (protective orders: FAIL). The reported margin type
+   is logged as its own `margin_type` step in the report and as a
+   `validation_margin_type` audit event. Then it sends `create_tpsl` (`take_profit_market` and
    `stop_market` at +/-1 % of the fill, on the price grid), and requires both
    legs to be accepted **and** listed as untriggered orders;
 5. it sends `cancel_all_open_orders_for_position` and checks that the legs are gone;
 6. it sends `positions/exit`, then `cancel_all_open_orders`, and checks that
    the account is flat. It measures the time from fill to flat, which must be
-   120 s or less.
+   120 s or less. This check (key `closure120s_tested`) is **fill-to-flat
+   within 120 s during validation (immediate close)**: the tool closes the
+   position itself at once.
+
+> **Not proven by `validate`:** the desk's automatic 120 s holding-time
+> enforcement. Desk 120 s holding-time enforcement: unit-tested only, not
+> proven live. `qlc status` and `qlc readiness` print this as a separate note.
 
 Every step is printed, audited to `data/live/audit.jsonl` and written to
 `data/live/reports/validation-<ms>.json`. If anything fails after the entry
@@ -92,12 +107,13 @@ A kill never blocks risk-reducing calls (cancel, exit, cancel-all), so a
 disarmed desk can still close what it holds. The desk can call
 `qe_live_check::arming::kill` itself, for example on a governor halt.
 
-## (Removed) 22:30 IST Stage 1 checkpoint and INR 2,000 withdrawal
+## (Historical) 22:30 IST Stage 1 checkpoint and INR 2,000 withdrawal
 
-> **Removed by the owner on 23 Nov 2026.** The only target is INR 50,000 by
-> 17:00 IST on 24 Nov 2026, measured on actual equity. The desk no longer stops
-> at 22:30 and prepares no withdrawal. Use only the 17:00 final checkpoint. The
-> `stage1` tool below is kept for reference only.
+> **Historical, removed by the owner on 23 Nov 2026.** The later "INR 50,000 by
+> 17:00 IST" deadline is historical too. The current campaign has no
+> intermediate withdrawal and one final checkpoint at **23:00 IST on 24 Nov 2026**
+> ([CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md)). The `stage1` tool below is kept for
+> reference only.
 
 ```sh
 qlc checkpoint --kind stage1 --currency INR --expected <desk realised equity>
@@ -127,14 +143,15 @@ must start from.
 
 6. For Stage 2, re-run steps 2, 5 and 6 above (`readiness`, then `arm`).
 
-## 17:00 IST: final checkpoint
+## 23:00 IST 24 Nov: campaign final checkpoint (was 17:00, then 22:00; both now historical)
 
 ```sh
 qlc checkpoint --kind stage2 --currency INR --expected <desk realised equity>
 ```
 
 This is the same flatten, verify, balance and report sequence. It also sets the
-**kill switch**, so no position is carried past the checkpoint.
+**kill switch**, so no position is carried past the checkpoint. If it prints
+`NOT VERIFIED FLAT`, the account is not flat: close it in the CoinDCX app.
 
 ## Hooks for the desk (`qe_live_check`)
 

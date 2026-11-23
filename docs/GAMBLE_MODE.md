@@ -4,6 +4,18 @@ Gamble mode is an execution profile only the account owner can turn on. It
 places bets without waiting for the forecast to prove a calibrated edge. It is
 **off by default**. No target, schedule or agent can enable it.
 
+> **Owner override (23 Nov 2026):** the owner chose to run gamble mode live for the 24 Nov campaign
+> via `configs/campaign-live.toml` ([OWNER_START_0000.md](OWNER_START_0000.md)). The engineering
+> verdict is NO-GO ([LIVE_GO_NO_GO.md](LIVE_GO_NO_GO.md)). The note below is the engineering recommendation.
+>
+> **Paper / research profile.** Gamble mode relaxes model authority: it skips the
+> calibration and positive-net-EV gates. It is therefore **not** part of the
+> 24 Nov campaign's live execution path ([CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md)),
+> where both gates stay mandatory. Use it for paper simulation and research. Its
+> owner floor is separate from the campaign's INR 95 floor and INR 1 / INR 5
+> loss caps, and does not replace them. The live steps below describe code that
+> exists at this commit. They are not a campaign recommendation.
+
 ## Honest expectation
 
 - Round-trip cost is about 13-16 bps of notional (2 x taker fee + spread + 2 x slippage).
@@ -74,6 +86,58 @@ cost, or when another fresh candidate scores higher. Only the best available bet
 taken. Liquidity and cost enter through the spread and fee in `cost`. The
 `unstable` and `liquidity_withdrawal` regimes fail the data-integrity check.
 
+## Maker entries (sprint 5)
+
+Set `entry = "maker"` (and optionally `maker_timeout_s = 4`, default 4 s, max 30)
+in the gamble config. The default is `entry = "taker"` (market order, as before).
+
+- **Order:** a passive limit order at the near touch (buy at the best bid, sell at
+  the best ask), `order_type = "limit_order"`, `time_in_force = "good_till_cancel"`.
+  CoinDCX documents the futures `post_only` field as "Ignore this (Not supported
+  at the moment)", so **no post-only flag is sent**. If the book moves through the
+  price before the order arrives, the exchange can fill it as **taker**.
+- **Timeout:** if the order is not filled within `maker_timeout_s`, the remainder
+  is cancelled and the position is re-read once, to catch a fill that raced the
+  cancel. A partial fill is protected (SL + TP) at its filled size. There is
+  **no taker chase**. The desk evaluates again on the next scan.
+- **Exits are unchanged:** exchange-side SL/TP when live, and the 120 s time exit
+  as a market (taker) order.
+- **Cost used for ranking and sizing:** `maker_fee + taker_fee + slippage` (the
+  entry rests on the same side the exit leaves from, so no spread is crossed),
+  against `2 x taker_fee + spread + 2 x slippage` for taker entries. Both fees
+  come from live instrument metadata.
+- **Paper simulator:** a resting entry fills only when public trades print
+  **strictly through** its price after it was placed. A print *at* the price does
+  not count, because the queue position is unknown and we assume we are last in
+  the queue. The fill is at the limit price with the maker fee. When the timeout
+  expires, the paper simulator fills what printed through (if that meets the
+  exchange minimum quantity) and cancels the rest. Caveats: (1) real fills may
+  be later or smaller, since queue position and hidden size are not modelled;
+  (2) adverse selection is real, because a maker fill tends to come just as the
+  price moves against the bet; this shows up in realised results, not in the cost.
+- **Dashboard:** `/api/state.gamble.entry` and `/api/state.gamble.maker`
+  (placed, filled, partial, cancelled, fill_rate).
+- Only instruments whose metadata lists `limit_order` can be candidates.
+- With a `[payoff]` section in the gamble config, `payoff.maker_entry` decides the
+  entry order type, so the cost the plan ranks on always matches the order that
+  is sent. If `entry` is also set and disagrees, startup is refused.
+
+### Payoff wiring in the desk
+
+When `[payoff]` is present, each evaluated instrument gets one
+`qe_risk::gamble::payoff::plan` per side. Its inputs are the live maker/taker fee,
+spread, top-5 depth on the exit side, the median 120 s high-low range of the last
+~10 minutes of prices, sigma_120, the exchange max leverage, the maintenance
+margin, and realised gamble bets on that pair and side. Excluded instruments
+(for example cost > `max_cost_share_of_tp` of TP) are skipped with the plan's
+reason. The chosen side uses the plan's TP/SL, cost and `win_p`, and the plan is
+journaled on the decision (`payoff_plan`). The target-odds Monte Carlo then
+takes `win_p`, the gross payoff ratio TP/SL and `cost_frac` from the best plan on
+the board (`/api/state.gamble.simulation`, `barriers` = "payoff plan"). The
+plan's liquidation-safe leverage is not passed to the governor. The governor
+still uses the owner leverage capped at the exchange max, and refuses any stop
+beyond the estimated liquidation price.
+
 ## Target probability
 
 `/api/state.gamble.p_target` and `p_floor` come from `qe_math::gamble::target_odds`
@@ -83,14 +147,18 @@ the leverage cap and the exchange minimum notional:
 - the win rate and payoff ratio come from realised gamble bets once >= 10 exist;
   before that, from the best current candidate's estimate (P(win) conditional on a
   barrier being hit; time exits are not modelled separately);
-- bets remaining = hours to the 17:00 IST 24 Nov deadline x bets per hour (the
+- bets remaining = hours to the deadline x bets per hour. The deadline is
+  `stage2_deadline_ms` from `configs/risk-limits.toml`. When this was written it
+  was 17:00 IST 24 Nov, which is now **historical**: the campaign deadline is
+  23:00 IST (23-hour schedule; the 22:00 IST deadline is superseded). Bets per hour is the
   measured rate once >= 5 bets have closed; otherwise 20/h, which assumes one
-  position and holds of 120 s or less).
+  position and holds of 120 s or less.
 
 ### Stake policies
 
 - `fixed`: margin per bet = `stake_inr`, capped by the floor rule.
-- `target_optimal` (bold play): the largest bet the floor rule, leverage cap and
+- **24 Nov campaign bold play (current, live-capable under owner arming):** `configs/campaign-live.toml` keeps `stake_policy = "fixed"` and sets `campaign_stake = "next_milestone"`. Each bet's margin is sized so one TP win reaches the next hourly milestone, limited to the equity above the required owner floor. This is the profile in [OWNER_START_0000.md](OWNER_START_0000.md). The `target_optimal` restriction below applies only to that older policy.
+- `target_optimal` (bold play, older policy): the largest bet the floor rule, leverage cap and
   exchange limits allow, unless a smaller bet reaches the target with one win.
   In a game with negative expectation this maximises P(reach a fixed target),
   because fewer bets means less exposure to the house edge. Exception: the

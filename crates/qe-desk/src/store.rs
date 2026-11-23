@@ -17,7 +17,7 @@ impl Store {
     pub fn open() -> Self {
         let dir = std::env::var("QE_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/desk"));
+            .unwrap_or_else(|_| crate::desk::repo_root().join("data/desk"));
         let _ = std::fs::create_dir_all(&dir);
         Self {
             dir,

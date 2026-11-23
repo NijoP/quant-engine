@@ -5,11 +5,20 @@ account owner, do it yourself. No developer or agent has run these steps with
 real credentials. Treat every authenticated path as **unverified** until your
 own runs pass.
 
-The plan now has one capital target: **INR 50,000 by 17:00 IST on 24 Nov 2026**,
-measured from the real wallet balance. The 22:30 Stage 1 target and the INR 2,000
-withdrawal checkpoint are removed. The 17:00 final checkpoint stays. The target
-never overrides the risk governor: 1% per trade, session loss limits, one
-position, mandatory SL and TP, and a 120 s lifetime.
+The current campaign is **INR 101.45 (E0) → INR 50,000, 24 Nov 2026 00:00 → 23:00 IST**
+(23 h; first entry permitted 01:00 IST; the 22-hour / 22:00 IST schedule is superseded),
+reported from the real wallet balance when live ([CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md)).
+The hourly schedule is a mathematical requirement, not a forecast. It never
+overrides the risk governor or the campaign risk profile: INR 95 floor, INR 1 max
+planned loss per trade, INR 5 max campaign loss, one position, mandatory SL and TP,
+and a 120 s lifetime. There are no intermediate withdrawals.
+
+> Historical: the 22:30 Stage 1 target, the INR 2,000 withdrawal checkpoint and
+> the later "INR 50,000 by **17:00** IST" deadline and the "INR 50,000 by
+> **22:00** IST" 22-hour schedule are superseded by the 23:00 IST campaign deadline.
+
+Live execution stays **disabled by default**. No agent arms it, reads keys or
+places orders as part of the campaign work.
 
 ## 1. Keys
 
@@ -26,6 +35,8 @@ The tools never print, log or send keys to the dashboard or to agents. They
 only report `configured` or `not configured`.
 
 ## 2. Build with the order path compiled in
+
+> **Canonical midnight procedure: [OWNER_START_0000.md](OWNER_START_0000.md).** Do not build locally for the 00:00 start; download the CI artifact `qe-desk-linux-x86_64`. The build commands below are for developers only.
 
 ```sh
 cargo build --release -p qe-live-check --features live-orders
@@ -134,6 +145,9 @@ qlc clear-kill               # typed CLEAR KILL SWITCH; you stay disarmed
 ```
 
 A kill never blocks risk-reducing calls (cancel, exit, cancel-all), so an open
-position can always be flattened. At 17:00 IST on 24 Nov run
+position can always be flattened. At **23:00 IST on 24 Nov** (campaign deadline;
+the desk turns exit-only) run
 `qlc checkpoint --kind stage2 --currency INR --expected <desk equity>` to stop
-entries, flatten, cancel and reconcile. Never carry a position past it.
+entries, flatten, cancel and reconcile. Never carry a position past it. Report
+the account as flat only if that reconciliation says so. On `NOT VERIFIED FLAT`,
+close it yourself in the CoinDCX app.

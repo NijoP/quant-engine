@@ -49,6 +49,7 @@ pub enum LedgerState {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Reconciliation {
     Found(FuturesOrderRecord),

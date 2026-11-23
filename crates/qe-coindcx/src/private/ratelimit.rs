@@ -111,6 +111,7 @@ impl RateLimiter {
 mod tests {
     use super::*;
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn global_per_second_budget() {
         let mut l = RateLimiter::default();
         let t0 = Instant::now();

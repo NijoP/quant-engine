@@ -9,6 +9,7 @@ fn de_f64_str<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> 
     enum V {
         S(String),
         F(f64),
+        #[allow(dead_code)]
         N(Option<()>),
     }
     Ok(match V::deserialize(d)? {

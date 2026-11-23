@@ -34,8 +34,31 @@ Leverage never changes the quantity.
 ## No escalation
 A loss halves the effective risk fraction and a win restores it. The ceiling is never exceeded.
 
-## Capital stages
-`CapitalManager`: Stage 1 Growth -> at the checkpoint (22:00 IST) `AwaitingCheckpoint`
+## 24 Nov campaign risk profile (current)
+Applies to the INR 100 → INR 50,000 campaign ([CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md),
+example `configs/campaign-24nov.toml`), on top of the governor rules above. No limit is loosened
+to make the schedule reachable.
+
+| Rule | Value |
+|---|---|
+| Campaign floor (permanent stop) | INR 95 |
+| Max planned loss per trade | INR 1, including fees, slippage and the stop-loss loss |
+| Max cumulative campaign loss | INR 5 from INR 100 |
+| Open positions / max hold | 1 / 120 s |
+| Margin | isolated where supported |
+| Size-up after a loss, martingale, averaging down | never |
+| Raise size to meet an exchange minimum | never (rejected) |
+| Stop beyond estimated liquidation | never (rejected) |
+| Behind schedule | reporting only: no change to leverage, size, thresholds or entries |
+
+The floor or loss-budget stop is permanent: no new entries, kill switch preserved, audited, owner
+review required for any new campaign.
+
+## Capital stages (historical)
+> Historical. The stage plan below (checkpoint and withdrawal) is superseded by the 24 Nov
+> campaign, which has no intermediate withdrawal.
+
+`CapitalManager`: Stage 1 Growth -> at the checkpoint (23:00 IST; 22:00 superseded) `AwaitingCheckpoint`
 (stop entries, flatten) -> `confirm_withdrawal(amount, user_confirmed=true, confirmed_balance)`
 -> Stage 2 Protective -> Complete at the final target. An unconfirmed withdrawal is
 never recorded.

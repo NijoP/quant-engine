@@ -9,6 +9,9 @@ import {
   type Position,
   type ScannerRow,
 } from "./api";
+import { CampaignPanel } from "./campaign";
+import { OpsHealthStrip } from "./ops";
+import { mockCampaign } from "./fixtures/campaign";
 import { mockGamble } from "./fixtures/gamble";
 import { GambleBanner, GamblePanel } from "./gamble";
 import { AgentsPanel, ControlsPanel, DecisionsPanel, GlobalStatus, InstrumentPanel, ReadinessPanel, TargetPanel, UniverseTable } from "./panels";
@@ -118,6 +121,8 @@ export default function App() {
   const offline = error !== null;
   // Dev-only `?mock=gamble` fixture wins so the panel renders without a desk.
   const gamble = mockGamble() ?? state?.gamble ?? null;
+  // Dev-only `?mock=campaign` fixture; production renders only the desk's own campaign state.
+  const campaign = (import.meta.env.DEV ? mockCampaign() : undefined) ?? state?.campaign ?? null;
 
   return (
     <div className="desk">
@@ -127,6 +132,8 @@ export default function App() {
         </div>
       )}
       <Header state={state} serverNow={serverNow} />
+      <OpsHealthStrip state={state} serverNow={serverNow} offline={offline} />
+      {(state || campaign) && <CampaignPanel campaign={campaign} serverNow={serverNow} />}
       <GambleBanner gamble={gamble} />
       {(state || gamble) && <GamblePanel gamble={gamble} serverNow={serverNow} />}
       {state ? (

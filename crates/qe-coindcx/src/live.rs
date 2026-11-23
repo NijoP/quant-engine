@@ -139,7 +139,7 @@ pub enum OwnerSession {
     /// Supervised minimum-size protective-order validation: may open risk once
     /// credentials, signing, flat account and instrument checks pass.
     Validation,
-    /// 22:30 / 17:00 checkpoint: risk-reducing calls only.
+    /// Campaign checkpoint (23:00 IST; earlier 22:30 / 22:00 superseded): risk-reducing calls only.
     Checkpoint,
 }
 

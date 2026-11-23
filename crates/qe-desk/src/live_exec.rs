@@ -15,6 +15,7 @@
 //!
 //! An entry with an unknown outcome is reconciled against the exchange before
 //! anything else; it is never blindly resubmitted.
+use qe_coindcx::private::types::{OrderType, TimeInForce};
 use qe_coindcx::private::{
     FuturesPosition, FuturesWallet, LedgerState, NewOrder, PrivateClient, PrivateError, Side,
     TpslResult,
@@ -140,6 +141,16 @@ pub struct LiveOrderRequest {
     /// Exchange max for this instrument / tier from live metadata.
     pub exchange_max_leverage: Option<u32>,
     pub governor_approved: bool,
+    /// Gamble maker entry: a passive limit (GTC) at this price instead of a
+    /// market order. No `post_only` flag is sent: CoinDCX documents it as "not
+    /// supported at the moment" for futures, so the order can still fill as
+    /// taker if the book moved through the price before it arrived.
+    #[serde(default)]
+    pub entry_limit: Option<f64>,
+    /// Override the fill timeout (ms) for this entry; the unfilled remainder
+    /// is then cancelled and never chased with a market order.
+    #[serde(default)]
+    pub fill_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -306,7 +317,15 @@ impl<V: Venue> LiveExecutor<V> {
         }
         r.leverage = Some(lev);
         let side = if req.long { Side::Buy } else { Side::Sell };
-        let order = NewOrder::market(side, &req.pair, req.qty, lev, &req.margin);
+        let mut order = NewOrder::market(side, &req.pair, req.qty, lev, &req.margin);
+        if let Some(px) = req.entry_limit.filter(|p| p.is_finite() && *p > 0.0) {
+            order.order_type = OrderType::LimitOrder;
+            order.price = Some(format!("{px}"));
+            order.time_in_force = Some(TimeInForce::GoodTillCancel);
+        }
+        let fill_timeout = req
+            .fill_timeout_ms
+            .map_or(self.cfg.fill_timeout, Duration::from_millis);
         let submitted = Instant::now();
         let order_id = match self.venue.create_order(coid, order).await {
             Ok(id) => id,
@@ -328,7 +347,7 @@ impl<V: Venue> LiveExecutor<V> {
 
         // Confirm the fill from exchange position state.
         let target = if req.long { req.qty } else { -req.qty };
-        let fill_deadline = submitted + self.cfg.fill_timeout;
+        let fill_deadline = submitted + fill_timeout;
         let mut pos: Option<FuturesPosition> = None;
         loop {
             match self.venue.position(&req.pair, &req.margin).await {
@@ -355,7 +374,16 @@ impl<V: Venue> LiveExecutor<V> {
                 r.incidents
                     .push(format!("cancel of unfilled remainder failed: {e:?}"));
             }
+            // A fill can land between the last read and the cancel: re-read once.
+            match self.venue.position(&req.pair, &req.margin).await {
+                Ok(Some(p)) if p.is_open() => pos = Some(p),
+                Ok(_) => {}
+                Err(e) => r
+                    .events
+                    .push(format!("post-cancel position read failed: {e:?}")),
+            }
         }
+        let filled = pos.as_ref().map_or(0.0, |p| signed_qty(p).abs());
         let Some(p) = pos.filter(|_| filled > 0.0) else {
             r.state = LiveState::NoFill;
             r.events
@@ -665,6 +693,7 @@ mod tests {
         reads: u32,
         open: bool,
         calls: Vec<String>,
+        last_order: Option<NewOrder>,
     }
 
     #[derive(Clone, Default)]
@@ -687,9 +716,10 @@ mod tests {
             self.log(&format!("lev:{lev}"));
             Ok(())
         }
-        async fn create_order(&self, coid: &str, _: NewOrder) -> Result<String, PrivateError> {
+        async fn create_order(&self, coid: &str, o: NewOrder) -> Result<String, PrivateError> {
             self.log(&format!("order:{coid}"));
             let mut s = self.0.lock().unwrap();
+            s.last_order = Some(o);
             s.open = s.fill_qty > 0.0;
             if s.entry_unknown {
                 return Err(PrivateError::OutcomeUnknown {
@@ -802,7 +832,47 @@ mod tests {
             governor_leverage: 20,
             exchange_max_leverage: Some(10),
             governor_approved: true,
+            entry_limit: None,
+            fill_timeout_ms: None,
         }
+    }
+
+    #[tokio::test]
+    async fn maker_entry_is_a_passive_gtc_limit_and_unfilled_is_cancelled() {
+        let m = mock(|s| s.fill_qty = 0.0);
+        let mut q = req();
+        q.entry_limit = Some(99.95);
+        q.fill_timeout_ms = Some(40);
+        let r = LiveExecutor::new(m.clone(), cfg()).execute(&q).await;
+        assert_eq!(r.state, LiveState::NoFill, "{r:?}");
+        let o = m.0.lock().unwrap().last_order.clone().unwrap();
+        assert_eq!(o.order_type, OrderType::LimitOrder);
+        assert_eq!(o.price.as_deref(), Some("99.95"));
+        assert_eq!(o.time_in_force, Some(TimeInForce::GoodTillCancel));
+        assert!(o.validate().is_ok());
+        let body = serde_json::to_value(&o).unwrap();
+        assert_eq!(body["order_type"], "limit_order");
+        assert!(
+            body.get("post_only").is_none(),
+            "venue: post_only unsupported"
+        );
+        let c = m.calls();
+        assert!(c.contains(&"cancel:ex-1".to_string()), "{c:?}");
+        assert!(
+            !c.iter().any(|x| x == "tpsl" || x == "exit"),
+            "no chase: {c:?}"
+        );
+        assert_eq!(c.iter().filter(|x| x.starts_with("order:")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn maker_entry_filled_is_protected_like_a_market_entry() {
+        let m = mock(|s| s.close_after_reads = Some(4));
+        let mut q = req();
+        q.entry_limit = Some(99.95);
+        let r = LiveExecutor::new(m.clone(), cfg()).execute(&q).await;
+        assert_eq!(r.state, LiveState::Closed, "{r:?}");
+        assert_eq!(m.calls(), ["lev:10", "order:qe-t1", "tpsl", "cancel_all"]);
     }
 
     #[test]

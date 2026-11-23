@@ -18,3 +18,14 @@ execution_mode = "paper"  # "live" also needs QE_EXECUTION_MODE=live and the qe-
 paper_start_equity_inr = 100.0
 paper_slippage_bps = 2.0
 data_dir = "data/desk-gamble"
+
+# Payoff per bet (qe_risk::gamble::payoff): cost-aware ranking and
+# volatility-scaled TP/SL. SL is always set; leverage is
+# min(owner, instrument max) lowered until liquidation lies beyond the SL.
+[payoff]
+max_cost_share_of_tp = 0.25  # skip instruments whose round-trip cost > 25% of TP
+tp_range_share = 0.5         # TP = 50% of the measured 120 s high-low range
+sl_to_tp = 0.5               # SL = 50% of TP distance
+maker_entry = true           # price entry as post-only maker
+liq_buffer_frac = 0.001      # keep liquidation >= 10 bps beyond SL + cost
+prior_weight = 20.0          # pseudo-samples for model vs measured TP-first hits

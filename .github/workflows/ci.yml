@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: [main, "fm/**"]
+    branches: [main, "fm/**", "campaign/**"]
   pull_request:
 permissions:
   contents: read
@@ -20,6 +20,9 @@ jobs:
       - run: cargo clippy -p qe-engine -p qe-desk -p qe-risk --all-targets --no-deps -- -D warnings
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+      # Spec: the whole workspace, all targets and features (incl. the compiled-in
+      # `live` order path), warnings denied.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
   dashboard:
     runs-on: ubuntu-latest
     defaults:
@@ -33,10 +36,12 @@ jobs:
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - run: npm ci
+      - run: npm run lint
+      - run: npm test
       - run: npm run build
   desk-artifact:
     # Release qe-desk + dashboard/dist for paper runs on machines that should not compile.
-    if: startsWith(github.ref, 'refs/heads/fm/')
+    if: startsWith(github.ref, 'refs/heads/fm/') || startsWith(github.ref, 'refs/heads/campaign/') || startsWith(github.head_ref, 'campaign/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +52,8 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
-      - run: cargo build --release -p qe-desk
+      - run: cargo build --release -p qe-desk --features live
+      - run: cargo build --release -p qe-live-check --features live-orders
       - run: npm ci && npm run build
         working-directory: dashboard
       - uses: actions/upload-artifact@v4
@@ -55,6 +61,7 @@ jobs:
           name: qe-desk-linux-x86_64
           path: |
             target/release/qe-desk
+            target/release/qe-live-check
             dashboard/dist
           retention-days: 3
   secrets:
@@ -66,3 +73,25 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # Worker branches: release binaries for local paper runs and research evaluation, so
+  # workers on a memory-constrained machine never compile locally. Built from a copy at
+  # /tmp/qe/src so the binaries' compile-time paths (configs/, dashboard/dist,
+  # crates/qe-research/*.json) resolve once that path is linked to a local checkout.
+  binaries:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/fm/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          mkdir -p /tmp/qe
+          cp -a "$GITHUB_WORKSPACE" /tmp/qe/src
+          cd /tmp/qe/src
+          cargo build --release -p qe-desk -p qe-research --bins
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qe-binaries
+          path: |
+            /tmp/qe/src/target/release/qe-desk
+            /tmp/qe/src/target/release/qe-research
+          retention-days: 3
