@@ -252,6 +252,15 @@ export interface Campaign {
   stop_reason: string | null;
   exit_only: boolean;
   equity_history: { t: string; equity_inr: string }[];
+  /** Launch-time campaign (configs/campaign-protect.toml): T0/E0 set at activation. */
+  launch?: {
+    enabled: boolean;
+    activated: boolean;
+    t0: string | null;
+    e0_inr: string | null;
+    e0_source: "live_exchange" | "paper" | null;
+    checkpoints: number | null;
+  };
 }
 
 export interface Gamble {

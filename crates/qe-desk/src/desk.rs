@@ -132,6 +132,11 @@ pub struct Settings {
     pub gamble_maker_entry: bool,
     /// Campaign bold-play stake toward the next hourly milestone (gamble profile).
     pub campaign_bold: bool,
+    /// Launch-time protective campaign (configs/campaign-protect.toml):
+    /// T0/E0 at activation, 23:30 IST deadline, strategy gates unchanged.
+    pub campaign_protect: bool,
+    /// Maker (passive limit) entries for the protective campaign profile.
+    pub protect_maker_entry: bool,
     /// Cancel an unfilled maker entry after this long; never chased with a taker.
     pub maker_timeout_ms: i64,
     /// Payoff per bet (`[payoff]` in the gamble config, qe_risk::gamble::payoff):
@@ -157,6 +162,8 @@ impl Default for Settings {
             gamble: None,
             gamble_maker_entry: false,
             campaign_bold: false,
+            campaign_protect: false,
+            protect_maker_entry: false,
             maker_timeout_ms: 4_000,
             payoff: None,
         }
@@ -443,6 +450,8 @@ pub struct Desk {
     /// Live only: (read at ms, verified INR futures-wallet equity) from the
     /// read-only account loop; stale after LIVE_EQUITY_MAX_AGE_MS.
     pub live_inr_equity: Option<(i64, f64)>,
+    /// Last read-only exposure snapshot: (read start ms, open positions, open orders).
+    pub live_exposure: Option<(i64, usize, usize)>,
     pub live_account_err: Option<String>,
 }
 
@@ -708,6 +717,7 @@ impl Desk {
             campaign: Campaign::new(camp_cfg, EquitySource::Paper),
             campaign_error: None,
             live_inr_equity: None,
+            live_exposure: None,
             live_account_err: None,
         };
         load_campaign(&mut desk);
@@ -1187,7 +1197,8 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     let fee = cap.as_ref().map(|c| c.taker_fee);
     let slip = d.settings.paper_slippage_bps / 1e4;
     let fee_used = fee.unwrap_or(f64::NAN);
-    let maker_entry = d.settings.gamble_maker_entry && d.gov.policy.is_gamble();
+    let maker_entry = (d.settings.gamble_maker_entry && d.gov.policy.is_gamble())
+        || (d.settings.campaign_protect && d.settings.protect_maker_entry);
     let cost = if maker_entry {
         // Maker entry rests at the near touch and the taker exit leaves from
         // the same side: maker fee + taker fee + exit slippage, no spread.
@@ -1508,7 +1519,7 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             // milestone, capped by equity above the owner floor; leverage is the
             // owner setting capped by the instrument max for this side.
             let next_h =
-                (d.campaign.checkpoints_done(now) + 1).min(qe_engine::campaign::CAMPAIGN_HOURS);
+                (d.campaign.checkpoints_done(now) + 1).min(d.campaign.cfg.checkpoint_count());
             let next_req = dec_f64(d.campaign.cfg.checkpoint_required(next_h));
             if let Some(g) = d.gov.policy.gamble.as_mut() {
                 let side_max = if side == Side::Long {
@@ -3426,6 +3437,9 @@ fn campaign_path(d: &Desk) -> std::path::PathBuf {
 /// The campaign profile: bold play (owner floor) for the campaign gamble
 /// profile, otherwise the protective INR 1 / INR 5 profile.
 pub fn campaign_cfg(s: &Settings) -> CampaignConfig {
+    if s.campaign_protect {
+        return Campaign::awaiting_launch(EquitySource::Paper).cfg;
+    }
     match (&s.gamble, s.campaign_bold) {
         (Some(g), true) => CampaignConfig::bold(g.floor_inr),
         _ => CampaignConfig::default(),
@@ -3436,7 +3450,22 @@ pub fn campaign_cfg(s: &Settings) -> CampaignConfig {
 /// end at the 23:00 IST campaign deadline. A config still carrying the
 /// SUPERSEDED 22:00 IST deadline (or any other end) is refused at start-up.
 pub fn validate_campaign_schedule(s: &Settings) -> Result<(), String> {
-    use qe_engine::campaign::{CAMPAIGN_DEADLINE_MS, SUPERSEDED_22H_DEADLINE_MS};
+    use qe_engine::campaign::{
+        CAMPAIGN_DEADLINE_MS, LAUNCH_DEADLINE_MS, SUPERSEDED_22H_DEADLINE_MS,
+    };
+    if s.campaign_protect {
+        for (k, v) in [
+            ("stage1_checkpoint_ms", s.stage1_checkpoint_ms),
+            ("stage2_deadline_ms", s.stage2_deadline_ms),
+        ] {
+            if v != LAUNCH_DEADLINE_MS {
+                return Err(format!(
+                    "campaign-protect: {k} = {v} is not the 23:30 IST deadline {LAUNCH_DEADLINE_MS}"
+                ));
+            }
+        }
+        return Ok(());
+    }
     for (k, v) in [
         ("stage1_checkpoint_ms", s.stage1_checkpoint_ms),
         ("stage2_deadline_ms", s.stage2_deadline_ms),
@@ -3464,9 +3493,22 @@ pub fn load_campaign(d: &mut Desk) {
     } else {
         EquitySource::Paper
     };
-    d.campaign = Campaign::new(cfg.clone(), src);
+    d.campaign = if cfg.launch {
+        Campaign::awaiting_launch(src)
+    } else {
+        Campaign::new(cfg.clone(), src)
+    };
     match std::fs::read_to_string(campaign_path(d)) {
         Ok(txt) => match Campaign::restore(&txt, &cfg) {
+            // E0 read from the paper ledger never becomes a live baseline
+            Ok(c)
+                if src == EquitySource::LiveExchange
+                    && c.activated_source == Some(EquitySource::Paper) =>
+            {
+                let e = "persisted campaign was activated on PAPER equity; a live run needs a fresh campaign state (owner review)".to_string();
+                d.campaign.owner_stop(now_ms(), &e);
+                d.campaign_error = Some(e);
+            }
             Ok(c) => d.campaign = c,
             Err(e) => {
                 d.campaign
@@ -3497,15 +3539,61 @@ pub fn campaign_tick(d: &mut Desk, now: i64) {
     };
     // paper ledger P&L against the paper start (never against E0, which is the
     // live measurement baseline)
+    // Launch-time campaign: T0 = now, E0 = this fresh verified read.
+    if d.campaign.awaiting_activation && !d.campaign.is_stopped() {
+        if let Err(why) = d.campaign.activate(now, eq, src) {
+            if d.campaign.last_gate.as_deref() != Some(why.as_str()) {
+                d.audit(
+                    "campaign",
+                    format!("activation pending: {why}"),
+                    Value::Null,
+                );
+                d.campaign.last_gate = Some(why);
+            }
+        }
+    }
+    if live {
+        if let Some(why) = crate::live_exec::protection_stop() {
+            d.campaign
+                .owner_stop(now, &format!("live protection/verification failure: {why}"));
+        }
+        // Reconciliation: with no live trade in flight, the exchange must show
+        // no position and no open order. Anything else is a permanent stop.
+        if let Some((started, np, no)) = d.live_exposure {
+            if (np > 0 || no > 0)
+                && crate::live_exec::idle_since(started)
+                && !d.campaign.is_stopped()
+            {
+                let why = format!(
+                    "account reconciliation failed: {np} open position(s), {no} open order(s) on the exchange with no live trade in flight"
+                );
+                d.incident("campaign", why.clone());
+                d.campaign.owner_stop(now, &why);
+            }
+        }
+    }
     let realised = d.cap.equity - dec(d.settings.paper_start_equity_inr);
     let unreal = dec(d.unrealized());
-    d.campaign.observe(now, eq, src, realised, unreal);
+    if d.campaign.awaiting_activation {
+        d.campaign.equity = eq;
+    } else {
+        d.campaign.observe(now, eq, src, realised, unreal);
+    }
     if d.campaign.is_stopped() && !d.controls.entries_paused {
         let _ = d.gov.pause_entries(true, now as u64);
         d.controls.entries_paused = true;
     }
     d.campaign.tick(now);
-    if d.campaign.expired(now) && d.campaign.final_record.is_none() {
+    if live && (d.campaign.exit_only || d.campaign.is_stopped()) {
+        crate::live_exec::close_entries();
+    }
+    if live && d.campaign.cfg.launch && d.campaign.expired(now) && d.campaign.final_record.is_none()
+    {
+        live_deadline_workflow(d, now);
+    } else if d.campaign.expired(now)
+        && d.campaign.final_record.is_none()
+        && !d.campaign.awaiting_activation
+    {
         if d.campaign.deadline_steps.is_empty() {
             let _ = d.gov.pause_entries(true, now as u64);
             d.controls.entries_paused = true;
@@ -3522,7 +3610,8 @@ pub fn campaign_tick(d: &mut Desk, now: i64) {
             };
             d.campaign
                 .record_step(now, DeadlineStep::CancelEntryOrders, !live, cancel.into());
-            let n = flatten(d, "campaign deadline 23:00 IST");
+            let why = format!("campaign deadline {}", d.campaign.cfg.deadline_label());
+            let n = flatten(d, &why);
             let fl = if live {
                 "live close path NOT verified: owner alerted, flatten via the validated owner procedure"
                     .to_string()
@@ -3598,6 +3687,90 @@ pub fn campaign_tick(d: &mut Desk, now: i64) {
     }
 }
 
+/// Live deadline workflow (launch-time campaign, 23:30 IST): entries closed,
+/// the executor's in-flight trade (at most one, at most 120 s) finishes through
+/// its own protected exit, then a read-only exchange snapshot that STARTED after
+/// the executor went idle must show zero positions and zero open orders before
+/// the account is reported flat. Each step is recorded once.
+fn live_deadline_workflow(d: &mut Desk, now: i64) {
+    let has = |d: &Desk, s: DeadlineStep| d.campaign.deadline_steps.iter().any(|r| r.step == s);
+    if !has(d, DeadlineStep::StopEntries) {
+        let _ = d.gov.pause_entries(true, now as u64);
+        d.controls.entries_paused = true;
+        crate::live_exec::close_entries();
+        d.campaign.record_step(
+            now,
+            DeadlineStep::StopEntries,
+            true,
+            "entries paused; live task refuses new jobs (exit-only, persisted)".into(),
+        );
+        d.campaign.record_step(now, DeadlineStep::CancelEntryOrders, true,
+            "live executor: an unfilled entry remainder is cancelled at its fill timeout; no resting entry orders are kept".into());
+    }
+    if crate::live_exec::live_busy() {
+        return; // the open trade closes by TP/SL or the 120 s time exit
+    }
+    if !has(d, DeadlineStep::Flatten) {
+        d.campaign.record_step(
+            now,
+            DeadlineStep::Flatten,
+            true,
+            "live executor idle: the last live trade closed through its own exit path".into(),
+        );
+    }
+    match d.live_exposure {
+        Some((started, np, no))
+            if crate::live_exec::idle_since(started) && started >= d.campaign.cfg.deadline_ms =>
+        {
+            let flat = np == 0 && no == 0;
+            let detail =
+                format!("CoinDCX read-only snapshot: {np} open position(s), {no} open order(s)");
+            d.campaign.record_step(
+                now,
+                DeadlineStep::ReconcilePositions,
+                np == 0,
+                detail.clone(),
+            );
+            d.campaign.record_step(
+                now,
+                DeadlineStep::ReconcileProtectiveOrders,
+                no == 0,
+                detail.clone(),
+            );
+            d.campaign
+                .record_step(now, DeadlineStep::VerifyFlat, flat, detail.clone());
+            if !flat {
+                d.incident("campaign", format!("deadline: account NOT flat ({detail}): OWNER must run `qe-live-check checkpoint --kind adhoc`"));
+            }
+            d.campaign.finalize(now, flat, &detail);
+            d.campaign.record_step(
+                now,
+                DeadlineStep::RecordFinal,
+                true,
+                "final live wallet equity recorded from the read-only account loop".into(),
+            );
+        }
+        _ if now - d.campaign.cfg.deadline_ms > 10 * 60_000 => {
+            d.campaign.record_step(
+                now,
+                DeadlineStep::VerifyFlat,
+                false,
+                "no fresh exchange snapshot within 10 min of the deadline".into(),
+            );
+            d.incident(
+                "campaign",
+                "deadline: account flat state NOT verified; OWNER must reconcile".into(),
+            );
+            d.campaign.finalize(
+                now,
+                false,
+                "live: no fresh exchange snapshot after the deadline",
+            );
+        }
+        _ => {}
+    }
+}
+
 /// A live balance older than this is not used (the read loop runs every 10 s).
 pub const LIVE_EQUITY_MAX_AGE_MS: i64 = 30_000;
 
@@ -3652,6 +3825,66 @@ pub fn campaign_json(d: &Desk, now: i64) -> Value {
 #[cfg(test)]
 mod campaign_tests {
     use super::*;
+
+    fn protect_settings() -> Settings {
+        use qe_engine::campaign::LAUNCH_DEADLINE_MS;
+        let mut s = Settings {
+            campaign_protect: true,
+            protect_maker_entry: true,
+            paper_start_equity_inr: 201.45,
+            stage1_checkpoint_ms: LAUNCH_DEADLINE_MS,
+            stage2_deadline_ms: LAUNCH_DEADLINE_MS,
+            ..Settings::default()
+        };
+        s.protective.policy_max_leverage = 5.0;
+        s.growth = s.protective.clone();
+        s
+    }
+
+    fn temp_store(d: &mut Desk, tag: &str) {
+        let p =
+            std::env::temp_dir().join(format!("qe-desk-{tag}-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&p).unwrap();
+        d.store.dir = p;
+    }
+
+    #[test]
+    fn campaign_protect_activates_on_first_tick_and_restores() {
+        use qe_engine::campaign::{HOUR_MS, LAUNCH_DEADLINE_MS};
+        let s = protect_settings();
+        assert!(validate_campaign_schedule(&s).is_ok());
+        let mut bad = s.clone();
+        bad.stage2_deadline_ms = qe_engine::campaign::CAMPAIGN_DEADLINE_MS;
+        assert!(validate_campaign_schedule(&bad).is_err());
+        let mut d = Desk::new(s.clone());
+        temp_store(&mut d, "protect");
+        d.campaign = Campaign::awaiting_launch(EquitySource::Paper);
+        let t0 = LAUNCH_DEADLINE_MS - 5 * HOUR_MS - 123;
+        assert_eq!(campaign_json(&d, t0)["status"], "awaiting_activation");
+        campaign_tick(&mut d, t0);
+        assert!(!d.campaign.awaiting_activation);
+        assert_eq!(d.campaign.cfg.start_ms, t0);
+        assert_eq!(
+            d.campaign.cfg.start_equity.round_dp(2).to_string(),
+            "201.45"
+        );
+        assert_eq!(d.campaign.activated_source, Some(EquitySource::Paper));
+        let j = campaign_json(&d, t0 + 1);
+        assert_eq!(j["launch"]["activated"], true);
+        assert_eq!(j["deadline"], "2026-11-24T23:30:00+05:30");
+        assert_eq!(j["milestones"].as_array().unwrap().len(), 7); // 5 h + partial + T0
+                                                                  // restart: the persisted activation is resumed, not re-activated
+        let mut d2 = Desk::new(s);
+        d2.store.dir = d.store.dir.clone();
+        load_campaign(&mut d2);
+        assert_eq!(d2.campaign.cfg.start_ms, t0);
+        assert!(d2.campaign_error.is_none(), "{:?}", d2.campaign_error);
+        // 23:30: exit-only, paper workflow finalises flat
+        campaign_tick(&mut d2, LAUNCH_DEADLINE_MS);
+        assert!(d2.campaign.exit_only);
+        assert!(d2.campaign.entry_gate(LAUNCH_DEADLINE_MS + 1, 0).is_err());
+        assert!(d2.campaign.final_record.is_some());
+    }
 
     #[test]
     fn campaign_state_is_exposed_and_paper_labelled() {

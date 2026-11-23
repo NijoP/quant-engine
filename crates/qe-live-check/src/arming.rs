@@ -12,7 +12,7 @@
 //!   typed confirmation). A kill never blocks risk-REDUCING calls.
 use crate::confirm::Confirm;
 use crate::state::{fresh_checks, CheckRecord, StateDir};
-use qe_coindcx::live::{CheckStatus, LiveGate, OPERATOR_CONFIRM_PHRASE};
+use qe_coindcx::live::{CheckItem, CheckStatus, LiveGate, OPERATOR_CONFIRM_PHRASE};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_ARM_HOURS: i64 = 24;
@@ -26,6 +26,21 @@ pub struct ArmRecord {
     pub expires_at_ms: i64,
     pub checks: Vec<CheckRecord>,
     pub confirmation: String,
+    /// First-genuine-trade protection mode: [`FIRST_TRADE_DEFERRED`] were
+    /// NotRun at arming and are verified by the first live strategy trade
+    /// (no separate test order). Owner-typed like every arm.
+    #[serde(default)]
+    pub first_trade_verifies_protection: bool,
+}
+
+/// Readiness items a first-trade arm may leave NotRun (never Fail).
+pub const FIRST_TRADE_DEFERRED: [CheckItem; 2] = [
+    CheckItem::ProtectiveOrdersVerified,
+    CheckItem::Closure120sTested,
+];
+
+fn deferred(item: CheckItem) -> bool {
+    FIRST_TRADE_DEFERRED.contains(&item)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -85,6 +100,20 @@ pub fn arm<C: Confirm>(
     hours: i64,
     now_ms: i64,
 ) -> Result<ArmRecord, ArmError> {
+    arm_with(dir, confirm, hours, now_ms, false)
+}
+
+/// [`arm`], optionally in first-genuine-trade protection mode: every other
+/// item must pass recently; [`FIRST_TRADE_DEFERRED`] may be NotRun (a Fail
+/// still refuses). The desk then verifies protection on the first live
+/// strategy trade and stops permanently if it cannot.
+pub fn arm_with<C: Confirm>(
+    dir: &StateDir,
+    confirm: &mut C,
+    hours: i64,
+    now_ms: i64,
+    first_trade: bool,
+) -> Result<ArmRecord, ArmError> {
     if let Some(k) = killed(dir) {
         return Err(ArmError::Killed(k.reason));
     }
@@ -95,6 +124,9 @@ pub fn arm<C: Confirm>(
     let failing: Vec<String> = checks
         .iter()
         .filter(|c| !c.status.is_pass())
+        .filter(|c| {
+            !(first_trade && deferred(c.item) && matches!(c.status, CheckStatus::NotRun(_)))
+        })
         .map(|c| format!("{:?}: {:?}", c.item, c.status))
         .collect();
     if !failing.is_empty() {
@@ -105,13 +137,21 @@ pub fn arm<C: Confirm>(
         );
         return Err(ArmError::ChecksNotPassed(failing));
     }
-    if !confirm.confirm(
-        &format!(
+    let prompt = if first_trade {
+        format!(
+            "ARM LIVE TRADING for {hours} h on your REAL CoinDCX account in FIRST-TRADE PROTECTION mode. Protective orders and the 120 s close have NOT been verified with a test order: the FIRST genuine strategy trade is financially exposed from its fill until its TP/SL are verified on the exchange; if verification fails the desk emergency-closes it and stops permanently. Kill any time with `qe-live-check kill`."
+        )
+    } else {
+        format!(
             "ARM LIVE TRADING for {hours} h on your REAL CoinDCX account. The desk may then place real orders within the risk governor's limits. Kill any time with `qe-live-check kill`."
-        ),
-        OPERATOR_CONFIRM_PHRASE,
-    ) {
-        let _ = dir.audit(now_ms, "arm_refused", serde_json::json!({"failing": ["not confirmed"]}));
+        )
+    };
+    if !confirm.confirm(&prompt, OPERATOR_CONFIRM_PHRASE) {
+        let _ = dir.audit(
+            now_ms,
+            "arm_refused",
+            serde_json::json!({"failing": ["not confirmed"]}),
+        );
         return Err(ArmError::NotConfirmed);
     }
     let rec = ArmRecord {
@@ -119,15 +159,23 @@ pub fn arm<C: Confirm>(
         expires_at_ms: now_ms + hours * 3_600_000,
         checks,
         confirmation: "typed on terminal".into(),
+        first_trade_verifies_protection: first_trade,
     };
     dir.write_json(ARM_FILE, &rec).map_err(io)?;
     dir.audit(
         now_ms,
         "armed",
-        serde_json::json!({"expires_at_ms": rec.expires_at_ms}),
+        serde_json::json!({"expires_at_ms": rec.expires_at_ms,
+            "first_trade_verifies_protection": first_trade}),
     )
     .map_err(io)?;
     Ok(rec)
+}
+
+/// True while a valid arm record is in first-genuine-trade protection mode.
+pub fn first_trade_mode(dir: &StateDir) -> bool {
+    dir.read_json::<ArmRecord>(ARM_FILE)
+        .is_some_and(|r| r.first_trade_verifies_protection)
 }
 
 /// Owner-initiated disarm (no kill flag).
@@ -175,7 +223,14 @@ pub fn arm_status(dir: &StateDir, now_ms: i64) -> ArmStatus {
         (Some(k), _) => Some(format!("kill switch: {}", k.reason)),
         (None, None) => Some("not armed".into()),
         (None, Some(r)) if now_ms >= r.expires_at_ms => Some("arm record expired".into()),
-        (None, Some(r)) if !r.checks.iter().all(|c| c.status.is_pass()) => {
+        (None, Some(r))
+            if !r.checks.iter().all(|c| {
+                c.status.is_pass()
+                    || (r.first_trade_verifies_protection
+                        && deferred(c.item)
+                        && matches!(c.status, CheckStatus::NotRun(_)))
+            }) =>
+        {
             Some("arm record has non-passing checks".into())
         }
         (None, Some(r)) if r.armed_at_ms > now_ms => Some("arm record from the future".into()),
@@ -202,8 +257,27 @@ pub fn gate_from(mut gate: LiveGate, dir: &StateDir, now_ms: i64) -> LiveGate {
     let st = arm_status(dir, now_ms);
     if st.armed {
         if let Some(rec) = dir.read_json::<ArmRecord>(ARM_FILE) {
+            let ft = rec.first_trade_verifies_protection;
             for c in rec.checks {
                 gate.readiness.set(c.item, c.status);
+            }
+            if ft {
+                // Deferred items: the first live trade's recorded result once it
+                // exists (a Fail closes the gate), otherwise deferred-pass.
+                let now_checks = dir.checks();
+                for item in FIRST_TRADE_DEFERRED {
+                    let st = now_checks
+                        .iter()
+                        .find(|c| c.item == item && !matches!(c.status, CheckStatus::NotRun(_)))
+                        .map(|c| c.status.clone())
+                        .unwrap_or_else(|| {
+                            CheckStatus::Pass(
+                                "deferred: verified by the first live trade (first-trade protection mode)"
+                                    .into(),
+                            )
+                        });
+                    gate.readiness.set(item, st);
+                }
             }
             gate.armed = true;
         }
@@ -328,5 +402,63 @@ mod tests {
         clear_kill(&d, &mut Scripted::new(&[true]), T + 4000).unwrap();
         // Clearing the kill does not re-arm.
         assert!(!arm_status(&d, T + 5000).armed);
+    }
+
+    #[test]
+    fn first_trade_arm_defers_only_protection_and_closure() {
+        let d = temp_dir("first-trade");
+        for i in CheckItem::ALL {
+            if !deferred(i) {
+                record_check(&d, i, CheckStatus::Pass("ok".into()), T).unwrap();
+            }
+        }
+        // the normal arm still refuses: protection / closure not run
+        assert!(matches!(
+            arm(&d, &mut Scripted::new(&[true]), 2, T),
+            Err(ArmError::ChecksNotPassed(v)) if v.len() == 2
+        ));
+        // first-trade arm: still owner-typed
+        assert_eq!(
+            arm_with(&d, &mut Scripted::new(&[false]), 2, T, true),
+            Err(ArmError::NotConfirmed)
+        );
+        let rec = arm_with(&d, &mut Scripted::new(&[true]), 2, T, true).unwrap();
+        assert!(rec.first_trade_verifies_protection);
+        assert!(first_trade_mode(&d));
+        assert!(arm_status(&d, T + 1000).armed);
+        let g = gate_from(live_env(), &d, T + 1000);
+        assert!(g.armed && g.readiness.all_pass(), "{:?}", g.readiness);
+        // the first trade's FAILED verification closes the gate
+        record_check(
+            &d,
+            CheckItem::ProtectiveOrdersVerified,
+            CheckStatus::Fail("source: first live trade t1 - not listed".into()),
+            T + 2000,
+        )
+        .unwrap();
+        let g = gate_from(live_env(), &d, T + 3000);
+        assert!(!g.readiness.all_pass());
+        if LiveGate::COMPILED {
+            assert!(g.check_for(Purpose::OpenRisk).is_err());
+        }
+        // and a Fail can never be deferred at arming
+        disarm(&d, T + 4000, "test").unwrap();
+        assert!(matches!(
+            arm_with(&d, &mut Scripted::new(&[true]), 2, T + 4000, true),
+            Err(ArmError::ChecksNotPassed(_))
+        ));
+        // any other failing item refuses the first-trade arm too
+        let d = temp_dir("first-trade-2");
+        record_check(
+            &d,
+            CheckItem::CredentialsConfigured,
+            CheckStatus::Pass("ok".into()),
+            T,
+        )
+        .unwrap();
+        assert!(matches!(
+            arm_with(&d, &mut Scripted::new(&[true]), 2, T, true),
+            Err(ArmError::ChecksNotPassed(_))
+        ));
     }
 }

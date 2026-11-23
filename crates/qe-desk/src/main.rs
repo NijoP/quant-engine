@@ -93,9 +93,11 @@ fn load_settings() -> anyhow::Result<Settings> {
             .map_err(|e| anyhow::anyhow!(e))?;
             Some(t)
         }
-        Some(GAMBLE_PROFILE) => None,
+        Some(GAMBLE_PROFILE) | Some(CAMPAIGN_PROTECT_PROFILE) => None,
         Some(other) => {
-            anyhow::bail!("unknown profile {other:?} (use standard, experiment or gamble)")
+            anyhow::bail!(
+                "unknown profile {other:?} (use standard, experiment, gamble or campaign-protect)"
+            )
         }
     };
     let gamble = if profile.as_deref() == Some(GAMBLE_PROFILE) {
@@ -267,8 +269,128 @@ fn load_settings() -> anyhow::Result<Settings> {
             }
         }
     }
+    if profile.as_deref() == Some(CAMPAIGN_PROTECT_PROFILE) {
+        apply_campaign_protect(&mut st, &load_campaign_protect()?)?;
+    }
     desk::validate_campaign_schedule(&st).map_err(|e| anyhow::anyhow!(e))?;
     Ok(st)
+}
+
+/// `--profile campaign-protect`: the launch-time protective campaign.
+pub const CAMPAIGN_PROTECT_PROFILE: &str = "campaign-protect";
+
+fn load_campaign_protect() -> anyhow::Result<toml::Table> {
+    let path = std::env::var("QE_CAMPAIGN_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| repo_root().join("configs/campaign-protect.toml"));
+    std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("campaign-protect: {}: {e}", path.display()))?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("campaign-protect: {}: {e}", path.display()))
+}
+
+/// Apply configs/campaign-protect.toml. Refuses anything looser than the
+/// protective limits; the per-trade / cumulative / floor limits themselves are
+/// derived from E0 at activation (qe_engine::campaign::CampaignConfig::protect_launch).
+pub fn apply_campaign_protect(st: &mut Settings, t: &toml::Table) -> anyhow::Result<()> {
+    let bail = |m: String| anyhow::anyhow!("campaign-protect profile refused: {m}");
+    let lev = t
+        .get("leverage_cap")
+        .and_then(|v| v.as_integer())
+        .ok_or_else(|| bail("leverage_cap (integer 1..=5) is required".into()))?;
+    if !(1..=5).contains(&lev) {
+        return Err(bail(format!("leverage_cap {lev} outside 1..=5")));
+    }
+    for (k, want) in [
+        ("require_calibration_for_live", true),
+        ("require_positive_net_ev_for_live", true),
+        ("isolated_margin", true),
+        ("allow_raise_to_min_notional", false),
+        ("allow_size_up_after_loss", false),
+        ("behind_schedule_changes_risk", false),
+    ] {
+        match t.get(k).and_then(|v| v.as_bool()) {
+            Some(v) if v == want => {}
+            other => return Err(bail(format!("{k} must be {want} (got {other:?})"))),
+        }
+    }
+    if t.get("max_open_positions").and_then(|v| v.as_integer()) != Some(1) {
+        return Err(bail("max_open_positions must be 1".into()));
+    }
+    if t.get("max_hold_ms").and_then(|v| v.as_integer()) != Some(120_000) {
+        return Err(bail("max_hold_ms must be 120000".into()));
+    }
+    let deadline = t.get("deadline_ms").and_then(|v| v.as_integer());
+    if deadline != Some(qe_engine::campaign::LAUNCH_DEADLINE_MS) {
+        return Err(bail(format!(
+            "deadline_ms {deadline:?} must be {} (2026-11-24 23:30 IST)",
+            qe_engine::campaign::LAUNCH_DEADLINE_MS
+        )));
+    }
+    st.protect_maker_entry = match t.get("entry").and_then(|v| v.as_str()).unwrap_or("maker") {
+        "maker" => true,
+        "taker" => false,
+        o => return Err(bail(format!("entry {o:?} (use \"maker\" or \"taker\")"))),
+    };
+    if let Some(v) = t
+        .get("maker_timeout_s")
+        .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))
+    {
+        if !(v > 0.0 && v <= 30.0) {
+            return Err(bail(format!("maker_timeout_s {v} must be in (0, 30]")));
+        }
+        st.maker_timeout_ms = (v * 1000.0) as i64;
+    }
+    let env_live = std::env::var(qe_coindcx::live::ENV_EXECUTION_MODE)
+        .ok()
+        .is_some_and(|m| {
+            qe_coindcx::live::ExecutionMode::parse(&m) == qe_coindcx::live::ExecutionMode::Live
+        });
+    match (
+        t.get("execution_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("paper"),
+        env_live,
+    ) {
+        ("paper", false) | ("live", true) => {}
+        (m, e) => {
+            return Err(bail(format!(
+                "config execution_mode {m:?} but desk started {} (both must agree)",
+                if e { "live" } else { "paper" }
+            )))
+        }
+    }
+    if let Some(v) = t.get("paper_start_equity_inr").and_then(|v| v.as_float()) {
+        st.paper_start_equity_inr = v;
+    }
+    if let Some(v) = t.get("paper_slippage_bps").and_then(|v| v.as_float()) {
+        st.paper_slippage_bps = v.max(0.0);
+    }
+    // Both capital stages use the protective policy (normal strategy gates:
+    // calibration authority + positive net EV) with the leverage cap; the
+    // instrument max still applies inside the governor.
+    let mut pol = st.protective.clone();
+    pol.policy_max_leverage = pol.policy_max_leverage.min(lev as f64);
+    st.protective = pol.clone();
+    st.growth = pol;
+    st.stage1_checkpoint_ms = qe_engine::campaign::LAUNCH_DEADLINE_MS;
+    st.stage2_deadline_ms = qe_engine::campaign::LAUNCH_DEADLINE_MS;
+    st.campaign_protect = true;
+    st.profile = CAMPAIGN_PROTECT_PROFILE.into();
+    if std::env::var_os("QE_DATA_DIR").is_none() {
+        let dd = t
+            .get("data_dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("data/desk-campaign-protect");
+        // paper and live never share a campaign state (E0 must be a live read)
+        let dd = if env_live {
+            format!("{dd}-live")
+        } else {
+            dd.to_string()
+        };
+        std::env::set_var("QE_DATA_DIR", repo_root().join(&dd));
+    }
+    Ok(())
 }
 
 /// TOML value as text: strings, integers and floats are all accepted.
@@ -1690,15 +1812,22 @@ async fn account_loop(s: S) {
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     loop {
         tick.tick().await;
+        let started = now_ms();
         let r = ro.snapshot(&["INR"]).await;
         let now = now_ms();
         let mut d = s.write().await;
         let res = r.map_err(|e| e.to_string()).and_then(|snap| {
+            let open = snap
+                .positions
+                .iter()
+                .filter(|p| p.is_open() || p.has_pending_orders())
+                .count();
             qe_coindcx::private::readonly::inr_wallet_equity(&snap.wallets)
-                .map(|e| (e, snap.positions.len(), snap.open_orders.len()))
+                .map(|e| (e, open, snap.open_orders.len()))
         });
         match res {
             Ok((e, np, no)) => {
+                d.live_exposure = Some((started, np, no));
                 if d.live_account_err.take().is_some() {
                     d.audit(
                         "account",
@@ -1714,6 +1843,7 @@ async fn account_loop(s: S) {
                 );
             }
             Err(e) => {
+                d.live_exposure = None;
                 if d.live_account_err.is_none() {
                     d.incident(
                         "account",

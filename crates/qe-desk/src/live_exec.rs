@@ -15,7 +15,15 @@
 //!
 //! An entry with an unknown outcome is reconciled against the exchange before
 //! anything else; it is never blindly resubmitted.
-use qe_coindcx::private::types::{OrderType, TimeInForce};
+//!
+//! Post-fill verification (every live trade, owner directive 24 Nov 2026): the
+//! exchange position read that confirmed the fill must report a positive
+//! quantity, a fill price, the leverage that was set and `margin_type ==
+//! isolated`; after `create_tpsl` both protective legs must be LISTED as open
+//! (`untriggered`) on the exchange for the pair. Any failure: no further risk,
+//! emergency exit, verify flat, incident, and a PERMANENT stop
+//! ([`protection_stop`]: the desk stops the campaign and sets the kill switch).
+use qe_coindcx::private::types::{FuturesOrderRecord, OrderType, TimeInForce};
 use qe_coindcx::private::{
     FuturesPosition, FuturesWallet, LedgerState, NewOrder, PrivateClient, PrivateError, Side,
     TpslResult,
@@ -71,6 +79,11 @@ pub trait Venue: Send + Sync {
         position_id: &str,
     ) -> impl Future<Output = Result<(), PrivateError>> + Send;
     fn wallets(&self) -> impl Future<Output = Result<Vec<FuturesWallet>, PrivateError>> + Send;
+    /// Live (open / partially filled / untriggered) orders in this margin currency.
+    fn open_orders(
+        &self,
+        margin: &str,
+    ) -> impl Future<Output = Result<Vec<FuturesOrderRecord>, PrivateError>> + Send;
 }
 
 impl Venue for PrivateClient {
@@ -123,6 +136,62 @@ impl Venue for PrivateClient {
     async fn wallets(&self) -> Result<Vec<FuturesWallet>, PrivateError> {
         PrivateClient::wallets(self).await
     }
+    async fn open_orders(&self, margin: &str) -> Result<Vec<FuturesOrderRecord>, PrivateError> {
+        let mut all = Vec::new();
+        for side in [Side::Buy, Side::Sell] {
+            all.extend(
+                self.list_orders(
+                    side,
+                    qe_live_check::api::LIVE_ORDER_STATUSES,
+                    1,
+                    100,
+                    &[margin],
+                )
+                .await?,
+            );
+        }
+        Ok(all)
+    }
+}
+
+/// Exchange-reported checks on the position that confirmed the fill. Returns
+/// the failures (empty = verified).
+pub fn verify_position(p: &FuturesPosition, req_qty: f64, lev: u32) -> Vec<String> {
+    let mut bad = vec![];
+    let q = signed_qty(p).abs();
+    if !(q > 0.0 && q <= req_qty + 1e-12) {
+        bad.push(format!("quantity {q} outside (0, {req_qty}]"));
+    }
+    if !p.avg_price.is_some_and(|x| x.is_finite() && x > 0.0) {
+        bad.push(format!("fill price not reported ({:?})", p.avg_price));
+    }
+    match p.leverage {
+        Some(l) if (l - lev as f64).abs() < 1e-9 => {}
+        other => bad.push(format!("leverage {other:?} != set {lev}x")),
+    }
+    if !p
+        .margin_type
+        .as_deref()
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case("isolated"))
+    {
+        bad.push(format!(
+            "margin_type {:?}, expected \"isolated\"",
+            p.margin_type
+        ));
+    }
+    bad
+}
+
+/// Untriggered (resting protective) orders listed for `pair`.
+pub fn listed_protective(os: &[FuturesOrderRecord], pair: &str) -> usize {
+    os.iter()
+        .filter(|o| o.pair.as_deref() == Some(pair))
+        .filter(|o| {
+            o.status
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("untriggered"))
+        })
+        .count()
 }
 
 /// A governor-approved proposal, already sized by the risk engine.
@@ -188,6 +257,11 @@ pub struct LiveTradeReport {
     pub flat_verified: bool,
     /// Real futures wallet balance after the trade (never paper equity).
     pub wallet_balance_after: Option<f64>,
+    /// Exchange-reported margin type of the position (post-fill read).
+    pub margin_type: Option<String>,
+    /// Position verified (qty, fill price, leverage, isolated) AND both TP and
+    /// SL listed open on the exchange.
+    pub protection_verified: bool,
     pub incidents: Vec<String>,
     pub events: Vec<String>,
 }
@@ -271,6 +345,8 @@ impl<V: Venue> LiveExecutor<V> {
             held_ms: None,
             flat_verified: false,
             wallet_balance_after: None,
+            margin_type: None,
+            protection_verified: false,
             incidents: vec![],
             events: vec![],
         }
@@ -399,23 +475,69 @@ impl<V: Venue> LiveExecutor<V> {
             r.events.push(format!("partial fill {filled}/{}", req.qty));
         }
         let pid = p.id.clone().unwrap_or_default();
+        r.margin_type = p.margin_type.clone();
 
-        // Exchange-side protection: both legs or emergency exit.
-        let protected = match self
-            .venue
-            .create_tpsl(&pid, req.take_profit, req.stop_loss)
-            .await
-        {
-            Ok(t) if t.fully_protected() => true,
-            Ok(t) => {
-                r.incidents.push(format!("protection incomplete: {t:?}"));
-                false
-            }
-            Err(e) => {
-                r.incidents.push(format!("protection failed: {e:?}"));
-                false
-            }
+        // Verify the exchange position before adding anything to it.
+        let bad = verify_position(&p, req.qty, lev);
+        let verified = if bad.is_empty() {
+            r.events.push(format!(
+                "position verified: qty {filled} avg {:?} leverage {lev}x margin_type {:?}",
+                p.avg_price, p.margin_type
+            ));
+            true
+        } else {
+            r.incidents
+                .push(format!("position verification failed: {}", bad.join("; ")));
+            false
         };
+        // Exchange-side protection: both legs accepted AND listed, or emergency exit.
+        let accepted = verified
+            && match self
+                .venue
+                .create_tpsl(&pid, req.take_profit, req.stop_loss)
+                .await
+            {
+                Ok(t) if t.fully_protected() => true,
+                Ok(t) => {
+                    r.incidents.push(format!("protection incomplete: {t:?}"));
+                    false
+                }
+                Err(e) => {
+                    r.incidents.push(format!("protection failed: {e:?}"));
+                    false
+                }
+            };
+        // An accepted API response is not proof: the legs must be listed open.
+        let protected = accepted
+            && match self.venue.open_orders(&req.margin).await {
+                Ok(os) => {
+                    let n = listed_protective(&os, &req.pair);
+                    if n >= 2 {
+                        r.events
+                            .push(format!("TP and SL listed open on the exchange ({n})"));
+                        true
+                    } else {
+                        r.incidents.push(format!(
+                            "protection not listed: {n} untriggered order(s) for {}",
+                            req.pair
+                        ));
+                        false
+                    }
+                }
+                Err(e) => {
+                    r.incidents
+                        .push(format!("protection listing read failed: {e:?}"));
+                    false
+                }
+            };
+        r.protection_verified = protected;
+        if !protected {
+            set_protection_stop(format!(
+                "trade {}: {}",
+                req.trade_id,
+                r.incidents.last().cloned().unwrap_or_default()
+            ));
+        }
         let deadline = filled_at + self.cfg.lifetime;
         let reason = if !protected {
             ExitReason::ProtectionFailed
@@ -435,6 +557,21 @@ impl<V: Venue> LiveExecutor<V> {
         }
         r.held_ms = Some(filled_at.elapsed().as_millis() as u64);
         r.flat_verified = self.verify_flat(req, r).await;
+        let held = filled_at.elapsed();
+        if held > self.cfg.lifetime + Duration::from_millis(CLOSE_GRACE_MS) {
+            set_protection_stop(format!(
+                "trade {}: position open {} ms, beyond the {} ms limit",
+                req.trade_id,
+                held.as_millis(),
+                self.cfg.lifetime.as_millis()
+            ));
+        }
+        if !r.flat_verified {
+            set_protection_stop(format!(
+                "trade {}: account not verified flat after exit",
+                req.trade_id
+            ));
+        }
         r.state = match (reason, r.flat_verified) {
             (_, false) => LiveState::ReconciliationRequired,
             (ExitReason::ProtectionFailed, true) => LiveState::EmergencyClosed,
@@ -528,6 +665,66 @@ impl<V: Venue> LiveExecutor<V> {
 
 // ------------------------------------------------------------ desk wiring
 
+/// First-genuine-trade protection mode (`qe-live-check arm
+/// --first-trade-verifies-protection`): the first live trade's verified
+/// protection and its closure are recorded as the readiness results that the
+/// owner could not obtain without a separate test order. Audited.
+pub fn record_first_trade(state: &qe_live_check::state::StateDir, r: &LiveTradeReport, now: i64) {
+    use qe_coindcx::live::{CheckItem, CheckStatus};
+    if r.state == LiveState::Refused {
+        return;
+    }
+    let _ = state.audit(
+        now,
+        "live_trade",
+        serde_json::to_value(r).unwrap_or_default(),
+    );
+    if r.filled_qty <= 0.0 || !qe_live_check::arming::first_trade_mode(state) {
+        return;
+    }
+    // Only the FIRST filled trade is the source; later trades never overwrite it.
+    let from_first = state.checks().iter().any(|c| {
+        c.item == CheckItem::ProtectiveOrdersVerified
+            && matches!(&c.status, CheckStatus::Pass(d) | CheckStatus::Fail(d) if d.starts_with(FIRST_TRADE_SOURCE))
+    });
+    if from_first {
+        return;
+    }
+    let prot = if r.protection_verified {
+        CheckStatus::Pass(format!(
+            "{FIRST_TRADE_SOURCE} {} - position isolated ({:?}), qty {} and leverage {:?} verified, TP+SL listed open on the exchange",
+            r.trade_id, r.margin_type, r.filled_qty, r.leverage
+        ))
+    } else {
+        CheckStatus::Fail(format!(
+            "{FIRST_TRADE_SOURCE} {} - {}",
+            r.trade_id,
+            r.incidents.join("; ")
+        ))
+    };
+    let _ =
+        qe_live_check::state::record_check(state, CheckItem::ProtectiveOrdersVerified, prot, now);
+    let held = r.held_ms.unwrap_or(u64::MAX);
+    let closed_in_time = r.flat_verified && held <= LIFETIME_MS + CLOSE_GRACE_MS;
+    let close = if closed_in_time {
+        CheckStatus::Pass(format!(
+            "{FIRST_TRADE_SOURCE} {} - closed ({:?}) {held} ms after the fill, flat verified",
+            r.trade_id, r.exit_reason
+        ))
+    } else {
+        CheckStatus::Fail(format!(
+            "{FIRST_TRADE_SOURCE} {} - held {held} ms, flat verified {}",
+            r.trade_id, r.flat_verified
+        ))
+    };
+    let _ = qe_live_check::state::record_check(state, CheckItem::Closure120sTested, close, now);
+}
+
+/// Detail prefix of readiness results recorded from the first live trade.
+pub const FIRST_TRADE_SOURCE: &str = "source: first live trade";
+/// Exit + flat verification allowance after the 120 s lifetime.
+pub const CLOSE_GRACE_MS: u64 = 15_000;
+
 /// One governor-approved order handed from the (sync) desk loop to the live task.
 #[derive(Debug, Clone)]
 pub struct LiveJob {
@@ -559,6 +756,52 @@ pub fn submit(job: LiveJob) -> bool {
 }
 
 static STALE_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Permanent stop raised by the executor (protection / verification /
+/// reconciliation failure). Never cleared automatically.
+static PROTECTION_STOP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// True while a live trade is in flight (submit .. verified flat).
+static LIVE_BUSY: AtomicBool = AtomicBool::new(false);
+/// Wall-clock ms of the last trade start / end (for reconciliation reads).
+static LAST_START_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static LAST_END_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// Set at the campaign deadline: the live task refuses every new job.
+static ENTRIES_CLOSED: AtomicBool = AtomicBool::new(false);
+
+fn set_protection_stop(why: String) {
+    if let Ok(mut g) = PROTECTION_STOP.lock() {
+        if g.is_none() {
+            *g = Some(why);
+        }
+    }
+}
+
+/// The executor's permanent-stop reason, if any.
+pub fn protection_stop() -> Option<String> {
+    PROTECTION_STOP.lock().ok().and_then(|g| g.clone())
+}
+
+/// Close the live task to new entries (campaign deadline / exit-only).
+pub fn close_entries() {
+    ENTRIES_CLOSED.store(true, Ordering::SeqCst);
+}
+
+pub fn entries_closed() -> bool {
+    ENTRIES_CLOSED.load(Ordering::SeqCst)
+}
+
+/// No live trade in flight and none started or ended at/after `since_ms`:
+/// an exchange read that STARTED at `since_ms` then reflects the executor's
+/// settled state (used for reconciliation and the deadline flat check).
+pub fn idle_since(since_ms: i64) -> bool {
+    !LIVE_BUSY.load(Ordering::SeqCst)
+        && LAST_START_MS.load(Ordering::SeqCst) < since_ms
+        && LAST_END_MS.load(Ordering::SeqCst) < since_ms
+}
+
+pub fn live_busy() -> bool {
+    LIVE_BUSY.load(Ordering::SeqCst)
+}
 
 /// Set when a live gamble bet would breach, or a live trade ended at/below,
 /// the owner floor; the desk then stops gamble mode permanently.
@@ -626,7 +869,9 @@ pub fn install_if_armed(state: qe_live_check::state::StateDir) -> Result<(), Str
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LiveJob>();
     LIVE_TX.set(tx).map_err(|_| "live task already installed")?;
     let (ex_gate, kill) = (exec.clone(), exec.kill_switch());
+    let gate_state = state.clone();
     tokio::spawn(async move {
+        let state = gate_state;
         loop {
             let now = crate::desk::now_ms();
             if qe_live_check::arming::killed(&state).is_some() {
@@ -648,6 +893,12 @@ pub fn install_if_armed(state: qe_live_check::state::StateDir) -> Result<(), Str
                 STALE_DROPPED.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            if entries_closed() || protection_stop().is_some() {
+                STALE_DROPPED.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            LIVE_BUSY.store(true, Ordering::SeqCst);
+            LAST_START_MS.store(crate::desk::now_ms(), Ordering::SeqCst);
             let bal = exec.balance(&job.req.margin).await;
             let r = match risk_fits_real_equity(&job, bal) {
                 Ok(()) => exec.execute(&job.req).await,
@@ -657,6 +908,19 @@ pub fn install_if_armed(state: qe_live_check::state::StateDir) -> Result<(), Str
                     r
                 }
             };
+            let end = crate::desk::now_ms();
+            record_first_trade(&state, &r, end);
+            if let Some(why) = protection_stop() {
+                // permanent: kill switch (owner-only clear) + incident record
+                let _ = qe_live_check::arming::kill(
+                    &state,
+                    &format!("desk protection stop: {why}"),
+                    end,
+                );
+                let _ = state.write_json(&format!("incident-{}.json", r.trade_id), &r);
+            }
+            LAST_END_MS.store(end, Ordering::SeqCst);
+            LIVE_BUSY.store(false, Ordering::SeqCst);
             if let (Some(f), Some(b)) = (job.gamble_floor, r.wallet_balance_after) {
                 if b <= f {
                     GAMBLE_FLOOR_HIT.store(true, Ordering::SeqCst);
@@ -694,6 +958,12 @@ mod tests {
         open: bool,
         calls: Vec<String>,
         last_order: Option<NewOrder>,
+        /// Leverage last set (reported back on the position).
+        lev: u32,
+        /// Margin type the exchange reports (default "isolated").
+        margin_type: Option<String>,
+        /// Untriggered protective orders listed after create_tpsl.
+        listed: usize,
     }
 
     #[derive(Clone, Default)]
@@ -714,6 +984,7 @@ mod tests {
         }
         async fn update_leverage(&self, _: &str, _: &str, lev: u32) -> Result<(), PrivateError> {
             self.log(&format!("lev:{lev}"));
+            self.0.lock().unwrap().lev = lev;
             Ok(())
         }
         async fn create_order(&self, coid: &str, o: NewOrder) -> Result<String, PrivateError> {
@@ -761,6 +1032,8 @@ mod tests {
                 pair: Some(pair.into()),
                 active_pos: Some(s.fill_qty),
                 avg_price: Some(100.0),
+                leverage: Some(s.lev as f64),
+                margin_type: s.margin_type.clone(),
                 ..Default::default()
             }))
         }
@@ -795,6 +1068,18 @@ mod tests {
             ]))
             .unwrap())
         }
+        async fn open_orders(&self, _: &str) -> Result<Vec<FuturesOrderRecord>, PrivateError> {
+            self.log("listed");
+            let n = self.0.lock().unwrap().listed;
+            Ok((0..n)
+                .map(|i| FuturesOrderRecord {
+                    id: Some(format!("p{i}")),
+                    pair: Some("B-BTC_USDT".into()),
+                    status: Some("untriggered".into()),
+                    ..Default::default()
+                })
+                .collect())
+        }
     }
 
     fn mock(f: impl FnOnce(&mut MockState)) -> Mock {
@@ -805,6 +1090,8 @@ mod tests {
             s.fill_qty = 2.0;
             s.tpsl_ok = true;
             s.reconcile_finds = true;
+            s.margin_type = Some("isolated".into());
+            s.listed = 2;
             f(&mut s);
         }
         m
@@ -872,7 +1159,10 @@ mod tests {
         q.entry_limit = Some(99.95);
         let r = LiveExecutor::new(m.clone(), cfg()).execute(&q).await;
         assert_eq!(r.state, LiveState::Closed, "{r:?}");
-        assert_eq!(m.calls(), ["lev:10", "order:qe-t1", "tpsl", "cancel_all"]);
+        assert_eq!(
+            m.calls(),
+            ["lev:10", "order:qe-t1", "tpsl", "listed", "cancel_all"]
+        );
     }
 
     #[test]
@@ -930,7 +1220,10 @@ mod tests {
         assert_eq!(r.leverage, Some(10), "min(governor, exchange max)");
         assert!(r.flat_verified);
         assert_eq!(r.wallet_balance_after, Some(12.5));
-        assert_eq!(m.calls(), ["lev:10", "order:qe-t1", "tpsl", "cancel_all"]);
+        assert_eq!(
+            m.calls(),
+            ["lev:10", "order:qe-t1", "tpsl", "listed", "cancel_all"]
+        );
     }
 
     #[tokio::test]
@@ -1054,5 +1347,148 @@ mod tests {
         .with_base_url("http://127.0.0.1:9");
         let r = LiveExecutor::new(c, cfg()).execute(&req()).await;
         assert_eq!(r.state, LiveState::Refused);
+    }
+
+    #[tokio::test]
+    async fn success_records_verified_protection() {
+        let m = mock(|s| s.close_after_reads = Some(4));
+        let r = LiveExecutor::new(m.clone(), cfg()).execute(&req()).await;
+        assert!(r.protection_verified, "{r:?}");
+        assert_eq!(r.margin_type.as_deref(), Some("isolated"));
+        assert!(r.events.iter().any(|e| e.contains("listed open")), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn non_isolated_position_is_emergency_closed_without_tpsl() {
+        let m = mock(|s| s.margin_type = Some("crossed".into()));
+        let r = LiveExecutor::new(m.clone(), cfg()).execute(&req()).await;
+        assert_eq!(r.state, LiveState::EmergencyClosed, "{r:?}");
+        assert!(!r.protection_verified);
+        let c = m.calls();
+        assert!(!c.contains(&"tpsl".to_string()), "{c:?}");
+        assert!(c.contains(&"exit".to_string()), "{c:?}");
+        assert!(r.flat_verified);
+        assert!(protection_stop().is_some(), "permanent stop raised");
+        // missing margin type is not "isolated" either
+        let m = mock(|s| s.margin_type = None);
+        let r = LiveExecutor::new(m, cfg()).execute(&req()).await;
+        assert_eq!(r.state, LiveState::EmergencyClosed, "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn accepted_but_unlisted_protection_is_emergency_closed() {
+        let m = mock(|s| s.listed = 1);
+        let r = LiveExecutor::new(m.clone(), cfg()).execute(&req()).await;
+        assert_eq!(r.state, LiveState::EmergencyClosed, "{r:?}");
+        assert_eq!(r.exit_reason, Some(ExitReason::ProtectionFailed));
+        assert!(
+            r.incidents.iter().any(|i| i.contains("not listed")),
+            "{r:?}"
+        );
+        assert!(m.calls().contains(&"exit".to_string()));
+    }
+
+    #[test]
+    fn position_verification_checks_qty_price_leverage_and_margin() {
+        let p = FuturesPosition {
+            active_pos: Some(-2.0),
+            avg_price: Some(100.0),
+            leverage: Some(5.0),
+            margin_type: Some("ISOLATED".into()),
+            ..Default::default()
+        };
+        assert!(verify_position(&p, 2.0, 5).is_empty());
+        assert_eq!(verify_position(&p, 2.0, 4).len(), 1, "leverage mismatch");
+        assert_eq!(verify_position(&p, 1.0, 5).len(), 1, "over-filled");
+        let none = FuturesPosition {
+            active_pos: Some(1.0),
+            ..Default::default()
+        };
+        assert_eq!(verify_position(&none, 2.0, 5).len(), 3);
+    }
+
+    fn report(verified: bool, held: u64, flat: bool) -> LiveTradeReport {
+        LiveTradeReport {
+            trade_id: "t1".into(),
+            client_order_id: "qe-t1".into(),
+            state: LiveState::Closed,
+            exit_reason: Some(ExitReason::TimeExit),
+            leverage: Some(5),
+            requested_qty: 1.0,
+            filled_qty: 1.0,
+            avg_entry: Some(100.0),
+            fill_confirmed_ms_after_submit: Some(50),
+            held_ms: Some(held),
+            flat_verified: flat,
+            wallet_balance_after: Some(201.0),
+            margin_type: Some("isolated".into()),
+            protection_verified: verified,
+            incidents: vec![],
+            events: vec![],
+        }
+    }
+
+    fn first_trade_dir(tag: &str) -> qe_live_check::state::StateDir {
+        use qe_coindcx::live::{CheckItem, CheckStatus};
+        let p = std::env::temp_dir().join(format!(
+            "qe-desk-ft-{tag}-{}-{}",
+            std::process::id(),
+            crate::desk::now_ms()
+        ));
+        let d = qe_live_check::state::StateDir::new(p);
+        let now = crate::desk::now_ms();
+        for i in CheckItem::ALL {
+            if !qe_live_check::arming::FIRST_TRADE_DEFERRED.contains(&i) {
+                qe_live_check::state::record_check(&d, i, CheckStatus::Pass("ok".into()), now)
+                    .unwrap();
+            }
+        }
+        struct Yes;
+        impl qe_live_check::confirm::Confirm for Yes {
+            fn confirm(&mut self, _: &str, _: &str) -> bool {
+                true
+            }
+        }
+        qe_live_check::arming::arm_with(&d, &mut Yes, 2, now, true).unwrap();
+        d
+    }
+
+    #[test]
+    fn first_trade_records_protection_and_closure_once() {
+        use qe_coindcx::live::CheckItem;
+        let d = first_trade_dir("ok");
+        let now = crate::desk::now_ms();
+        record_first_trade(&d, &report(true, 120_400, true), now);
+        let get = |i: CheckItem| d.checks().into_iter().find(|c| c.item == i).unwrap();
+        let p = get(CheckItem::ProtectiveOrdersVerified);
+        assert!(p.status.is_pass(), "{p:?}");
+        assert!(format!("{:?}", p.status).contains(FIRST_TRADE_SOURCE));
+        assert!(get(CheckItem::Closure120sTested).status.is_pass());
+        // a later trade never overwrites the first trade's record
+        record_first_trade(&d, &report(false, 500_000, false), now + 1);
+        assert!(get(CheckItem::ProtectiveOrdersVerified).status.is_pass());
+        let ev: Vec<String> = d
+            .audit_lines()
+            .iter()
+            .filter_map(|l| l["event"].as_str().map(String::from))
+            .collect();
+        assert!(
+            ev.iter().filter(|e| *e == "live_trade").count() == 2,
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn first_trade_failure_is_recorded_as_fail() {
+        use qe_coindcx::live::CheckItem;
+        let d = first_trade_dir("fail");
+        let now = crate::desk::now_ms();
+        record_first_trade(&d, &report(false, 200_000, true), now);
+        let get = |i: CheckItem| d.checks().into_iter().find(|c| c.item == i).unwrap();
+        assert!(!get(CheckItem::ProtectiveOrdersVerified).status.is_pass());
+        assert!(!get(CheckItem::Closure120sTested).status.is_pass());
+        // the gate closes on the recorded failure
+        let g = qe_live_check::arming::gate_for_desk(&d, true, now + 1);
+        assert!(!g.readiness.all_pass());
     }
 }

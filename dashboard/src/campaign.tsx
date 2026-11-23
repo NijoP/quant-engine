@@ -41,6 +41,21 @@ export function CampaignPanel({ campaign, serverNow }: { campaign: Campaign | nu
       </section>
     );
   const c = campaign;
+  if (c.launch?.enabled && !c.launch.activated)
+    return (
+      <section className="panel campaign">
+        <h2>
+          Launch-time campaign · awaiting activation · <EquitySourceBadge c={c} />
+          {c.exit_only && <span className="badge exit-only">EXIT-ONLY — no new entries</span>}
+        </h2>
+        <div className="kv cols">
+          <span>T0 / E0</span><b>not set: the first fresh verified wallet read activates the campaign</b>
+          <span>deadline</span><b>{istDateTime(Date.parse(c.deadline))}</b>
+          <span>remaining time</span><b>{duration(c.remaining_secs)}</b>
+          <span>current time</span><b>{istDateTime(serverNow)}</b>
+        </div>
+      </section>
+    );
   const startMs = Date.parse(c.start);
   const deadlineMs = Date.parse(c.deadline);
   const equity = n(c.equity_inr);
@@ -65,7 +80,7 @@ export function CampaignPanel({ campaign, serverNow }: { campaign: Campaign | nu
         </div>
       )}
       <div className="kv cols">
-        <span>campaign start</span><b>{istDateTime(startMs)}</b>
+        <span>campaign start{c.launch?.enabled ? " (T0, activation)" : ""}</span><b>{istDateTime(startMs)}</b>
         <span>first entry permitted</span>
         <b>
           {istDateTime(firstEntryMs)} <span className="muted">({windowOpen ? "entry window open: evaluation permitted, never forced" : "entry window closed: no new campaign entries"})</span>
@@ -83,7 +98,7 @@ export function CampaignPanel({ campaign, serverNow }: { campaign: Campaign | nu
         <span>hourly milestone</span>
         <b>
           h{c.prev_milestone.hour} {inr(c.prev_milestone.required_inr)} → h{c.next_milestone.hour} {inr(c.next_milestone.required_inr)} at{" "}
-          {istHourMinute(Date.parse(c.next_milestone.at))} · {c.checkpoints_done}/{CAMPAIGN_HOURS} checkpoints passed
+          {istHourMinute(Date.parse(c.next_milestone.at))} · {c.checkpoints_done}/{c.launch?.enabled ? c.milestones.length - 1 : CAMPAIGN_HOURS} checkpoints passed
         </b>
         <span>required now</span><b>{inr(c.required_now_inr)}</b>
         <span>actual vs required</span>
