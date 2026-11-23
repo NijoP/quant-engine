@@ -26,7 +26,9 @@
 //! for h in 1, 2, 5, 10, 15, 30, 60, 90, 120 (RT) or 60, 120 (1m).
 //! The status rule is documented in [`calibration`]; results in docs/CALIBRATION.md.
 pub mod calibration;
+pub mod challenger;
 pub mod eval;
 pub mod history;
 pub mod record;
+pub mod registry;
 pub mod report;
