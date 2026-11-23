@@ -72,6 +72,8 @@ pub struct DecisionCtx<'a> {
     pub calibrated: bool,
     pub order: &'a qe_risk::ApprovedOrder,
     pub model_version: &'a str,
+    /// Gamble-mode bet (mode=gamble in the snapshot).
+    pub gamble: bool,
 }
 
 pub fn snapshot(c: &DecisionCtx) -> DecisionSnapshot {
@@ -146,18 +148,28 @@ pub fn snapshot(c: &DecisionCtx) -> DecisionSnapshot {
             "risk budget INR {:.4}, risk at stop INR {:.4}, fraction {:.4}",
             o.risk_budget, o.risk_at_stop, o.risk_fraction_used
         ),
-        strategy_version: "desk.bracket.v1".into(),
+        strategy_version: if c.gamble {
+            "desk.gamble.v1".into()
+        } else {
+            "desk.bracket.v1".into()
+        },
         model_version: c.model_version.into(),
         risk: RiskDecision {
             approved: true,
             codes: vec!["governor_approved".into()],
             risk_budget: dec(o.risk_budget.max(o.risk_at_stop)),
         },
-        reasoning_codes: vec![if c.calibrated {
-            "calibrated".into()
-        } else {
-            "uncalibrated_prior".into()
-        }],
+        reasoning_codes: {
+            let mut v = vec![if c.calibrated {
+                "calibrated".to_string()
+            } else {
+                "uncalibrated_prior".to_string()
+            }];
+            if c.gamble {
+                v.push("mode=gamble".into());
+            }
+            v
+        },
     }
 }
 

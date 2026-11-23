@@ -1,0 +1,20 @@
+# GAMBLE MODE - owner-armed only, OFF by default (docs/GAMBLE_MODE.md).
+# Started with `qe-desk --profile gamble`. The desk refuses to start unless
+# enabled = true, owner_ack is copied exactly, and stake_inr, leverage and
+# floor_inr are all set: gamble mode has NO trading defaults.
+#
+# Gamble mode skips the calibration and net-EV > 0 gates: the forecast has no
+# measured edge and each bet's expected value after ~13-16 bps of round-trip
+# cost is usually negative. Kept: one position, SL + TP, 120 s time exit, kill
+# switch, data-integrity and instrument checks, no size increase after a loss.
+# The floor is a permanent stop; restart with --gamble-rearm to re-arm.
+enabled = false
+# owner_ack = "I ACCEPT: gamble mode has no proven edge and can lose my stake down to the floor"
+# stake_inr = "10"        # margin per bet (fixed policy), INR
+# leverage = 10           # whole number; capped at the exchange max per side/tier
+# floor_inr = "50"        # equity at which gamble mode stops for good
+stake_policy = "fixed"    # or "target_optimal" (bold play, paper only)
+execution_mode = "paper"  # "live" also needs QE_EXECUTION_MODE=live and the qe-live-check arm
+paper_start_equity_inr = 100.0
+paper_slippage_bps = 2.0
+data_dir = "data/desk-gamble"

@@ -93,7 +93,15 @@ fn load_settings() -> anyhow::Result<Settings> {
             .map_err(|e| anyhow::anyhow!(e))?;
             Some(t)
         }
-        Some(other) => anyhow::bail!("unknown profile {other:?} (use standard or experiment)"),
+        Some(GAMBLE_PROFILE) => None,
+        Some(other) => {
+            anyhow::bail!("unknown profile {other:?} (use standard, experiment or gamble)")
+        }
+    };
+    let gamble = if profile.as_deref() == Some(GAMBLE_PROFILE) {
+        Some(load_gamble(limits.as_ref())?)
+    } else {
+        None
     };
     if let Some(t) = limits {
         let f = |k: &str| t.get(k).and_then(|v| v.as_float());
@@ -184,7 +192,113 @@ fn load_settings() -> anyhow::Result<Settings> {
             }
         }
     }
+    if let Some((t, params)) = gamble {
+        st.profile = GAMBLE_PROFILE.into();
+        if let Some(v) = t.get("paper_start_equity_inr").and_then(|v| v.as_float()) {
+            st.paper_start_equity_inr = v;
+        }
+        if let Some(v) = t.get("paper_slippage_bps").and_then(|v| v.as_float()) {
+            st.paper_slippage_bps = v.max(0.0);
+        }
+        // re-validate against the (possibly overridden) starting equity
+        let raw = raw_gamble(&t);
+        let p2 = qe_risk::gamble::validate(&raw, st.paper_start_equity_inr)
+            .map_err(|e| anyhow::anyhow!("gamble profile refused: {e}"))?;
+        debug_assert_eq!(p2.leverage, params.leverage);
+        st.gamble = Some(p2);
+        if std::env::var_os("QE_DATA_DIR").is_none() {
+            let dd = t
+                .get("data_dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("data/desk-gamble");
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(dd);
+            std::env::set_var("QE_DATA_DIR", p);
+        }
+        let dir = std::path::PathBuf::from(std::env::var("QE_DATA_DIR").unwrap_or_default());
+        let marker = dir.join(GAMBLE_STOP_FILE);
+        if marker.exists() {
+            if std::env::args().any(|a| a == "--gamble-rearm") {
+                std::fs::remove_file(&marker)?;
+                eprintln!(
+                    "[gamble] owner re-armed: floor-stop marker {} removed",
+                    marker.display()
+                );
+            } else {
+                anyhow::bail!(
+                    "gamble mode stopped at the floor earlier ({}); the owner re-arms with --gamble-rearm",
+                    marker.display()
+                );
+            }
+        }
+    }
     Ok(st)
+}
+
+/// TOML value as text: strings, integers and floats are all accepted.
+fn tv(t: &toml::Table, k: &str) -> Option<String> {
+    t.get(k).map(|v| match v {
+        toml::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    })
+}
+
+fn raw_gamble(t: &toml::Table) -> qe_risk::gamble::RawGamble {
+    qe_risk::gamble::RawGamble {
+        enabled: t.get("enabled").and_then(|v| v.as_bool()),
+        owner_ack: tv(t, "owner_ack"),
+        stake_inr: tv(t, "stake_inr"),
+        leverage: tv(t, "leverage"),
+        floor_inr: tv(t, "floor_inr"),
+        stake_policy: tv(t, "stake_policy"),
+    }
+}
+
+/// Gamble profile: configs/gamble.toml (or QE_GAMBLE_CONFIG). Refuses unless the
+/// owner enabled and acknowledged it and set stake, leverage and floor. Live is
+/// allowed only when the config says live AND the desk is started live (the
+/// existing owner arm is still required); any mismatch refuses startup.
+fn load_gamble(
+    limits: Option<&toml::Table>,
+) -> anyhow::Result<(toml::Table, qe_risk::gamble::GambleParams)> {
+    let path = std::env::var("QE_GAMBLE_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/gamble.toml")
+        });
+    let t: toml::Table = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("gamble profile: {}: {e}", path.display()))?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("gamble profile: {}: {e}", path.display()))?;
+    let start = t
+        .get("paper_start_equity_inr")
+        .and_then(|v| v.as_float())
+        .or_else(|| limits.and_then(|l| l.get("paper_start_equity_inr")?.as_float()))
+        .unwrap_or(100.0);
+    let params = qe_risk::gamble::validate(&raw_gamble(&t), start)
+        .map_err(|e| anyhow::anyhow!("gamble profile refused: {e}"))?;
+    let cfg_mode = t
+        .get("execution_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("paper");
+    let env_mode = std::env::var(qe_coindcx::live::ENV_EXECUTION_MODE).ok();
+    let env_live = env_mode.as_deref().is_some_and(|m| {
+        qe_coindcx::live::ExecutionMode::parse(m) == qe_coindcx::live::ExecutionMode::Live
+    });
+    match (cfg_mode, env_live) {
+        ("paper", false) => {}
+        ("live", true) => {
+            if params.stake_policy == qe_risk::gamble::StakePolicy::TargetOptimal {
+                anyhow::bail!("gamble profile refused: target_optimal sizes from desk equity and is paper-only in this release");
+            }
+        }
+        (m, e) => anyhow::bail!(
+            "gamble profile refused: config execution_mode {m:?} but desk started {} (both must agree)",
+            if e { "live" } else { "paper" }
+        ),
+    }
+    Ok((t, params))
 }
 
 // ---------------------------------------------------------------- loops
@@ -719,6 +833,7 @@ async fn monitor_loop(c: PublicClient, s: S) {
         let mut d = s.write().await;
         let now = now_ms();
         refresh_sim(&mut d, now);
+        refresh_gamble_sim(&mut d, now);
         d.load_calibration(); // pick up a regenerated registry without restart
         let st = d.calibration_json();
         let calib_msg = format!(
@@ -972,6 +1087,7 @@ fn state_json(d: &Desk) -> Value {
         "account": account_json(d), "target": target_json(d, now),
         "agents": d.agents.values().collect::<Vec<_>>(), "controls": controls_json(d),
         "calibration": d.calibration_json(), "readiness": readiness(d),
+        "gamble": gamble_json(d),
         "audit": d.audit,
     })
 }
@@ -1407,6 +1523,12 @@ async fn main() -> anyhow::Result<()> {
     };
     if settings.is_experiment() {
         eprintln!("*** {EXPERIMENT_BANNER} *** (paper only; configs/experiment-max-leverage.toml)");
+    }
+    if let Some(g) = &settings.gamble {
+        eprintln!(
+            "*** {GAMBLE_BANNER} *** stake INR {} leverage {}x floor INR {} policy {:?}",
+            g.stake_inr, g.leverage, g.floor_inr, g.stake_policy
+        );
     }
     // Live only when the owner armed it (qe-live-check arm) and mode is live;
     // otherwise, and on any failure, the desk stays on paper.

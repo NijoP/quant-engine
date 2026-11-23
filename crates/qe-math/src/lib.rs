@@ -8,6 +8,7 @@ pub mod barrier;
 pub mod dist;
 pub mod explain;
 pub mod features;
+pub mod gamble;
 pub mod learn;
 pub mod timeframe;
 
