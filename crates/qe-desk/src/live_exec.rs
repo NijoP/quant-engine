@@ -1069,7 +1069,7 @@ mod tests {
             .unwrap())
         }
         async fn open_orders(&self, _: &str) -> Result<Vec<FuturesOrderRecord>, PrivateError> {
-            self.log("orders");
+            self.log("listed");
             let n = self.0.lock().unwrap().listed;
             Ok((0..n)
                 .map(|i| FuturesOrderRecord {
@@ -1161,7 +1161,7 @@ mod tests {
         assert_eq!(r.state, LiveState::Closed, "{r:?}");
         assert_eq!(
             m.calls(),
-            ["lev:10", "order:qe-t1", "tpsl", "orders", "cancel_all"]
+            ["lev:10", "order:qe-t1", "tpsl", "listed", "cancel_all"]
         );
     }
 
@@ -1222,7 +1222,7 @@ mod tests {
         assert_eq!(r.wallet_balance_after, Some(12.5));
         assert_eq!(
             m.calls(),
-            ["lev:10", "order:qe-t1", "tpsl", "orders", "cancel_all"]
+            ["lev:10", "order:qe-t1", "tpsl", "listed", "cancel_all"]
         );
     }
 
