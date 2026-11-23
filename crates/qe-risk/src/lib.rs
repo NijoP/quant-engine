@@ -433,6 +433,9 @@ impl RiskGovernor {
         if inst.exit_only {
             r.push("instrument is exit-only".into());
         }
+        if !(inst.max_leverage_long >= 1.0 && inst.max_leverage_short >= 1.0) {
+            r.push("exchange max leverage unknown (null in metadata): ineligible".into());
+        }
         if !inst.supports_market_order {
             r.push("market order not supported".into());
         }

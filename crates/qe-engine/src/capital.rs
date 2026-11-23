@@ -1,10 +1,12 @@
-//! Two-stage capital plan and checkpoint workflow. Money is `Decimal`.
+//! Single-target capital plan and checkpoint workflow. Money is `Decimal`.
 //!
-//! Stage 0 (paper) until 20:00 IST 23 Nov 2026 -> Stage 1 growth (INR 100 -> 3,000 by
-//! 22:30 IST) -> Checkpoint 1 (stop entries, flatten, cancel entry orders, verify flat,
-//! query balance, reconcile, prepare the INR 2,000 withdrawal, wait for the user) ->
-//! Stage 2 protective from the verified retained balance (expected INR 1,000) ->
-//! INR 50,000 by 17:00 IST 24 Nov -> final checkpoint -> complete.
+//! Stage 0 (paper) until 20:00 IST 23 Nov 2026 -> one trading stage from the actual
+//! equity to the single target of INR 50,000 by 17:00 IST 24 Nov 2026 -> final
+//! checkpoint (stop entries, flatten, cancel entry orders, verify flat, query balance,
+//! reconcile, final reports) -> complete. The former 22:30 IST Stage 1 target
+//! (INR 3,000) and its INR 2,000 withdrawal checkpoint were removed by the owner on
+//! 23 Nov 2026; the `Stage1Growth` stage now carries the single target and ends in the
+//! final checkpoint. `withdrawal_inr` defaults to 0 and no withdrawal is prepared.
 //!
 //! The controller never executes a transfer or withdrawal: it only records one the
 //! user confirmed, together with the balance the user (or a balance query) verified.
@@ -17,10 +19,12 @@ use serde::{Deserialize, Serialize};
 
 /// 2026-11-23 20:00 IST.
 pub const STAGE0_END_MS: u64 = 1_795_444_200_000;
-/// 2026-11-23 22:30 IST.
-pub const STAGE1_CHECKPOINT_MS: u64 = 1_795_453_200_000;
-/// 2026-11-24 17:00 IST.
+/// 2026-11-24 17:00 IST: the single target deadline and final checkpoint.
 pub const STAGE2_DEADLINE_MS: u64 = 1_795_519_800_000;
+/// The trading stage ends at the final deadline (no 22:30 IST checkpoint any more).
+pub const STAGE1_CHECKPOINT_MS: u64 = STAGE2_DEADLINE_MS;
+/// The single capital target (INR).
+pub const TARGET_INR: Decimal = dec!(50000);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CapitalPlan {
@@ -39,10 +43,10 @@ impl Default for CapitalPlan {
         Self {
             stage0_end_ms: STAGE0_END_MS,
             stage1_start_inr: dec!(100),
-            stage1_target_inr: dec!(3000),
+            stage1_target_inr: TARGET_INR,
             stage1_checkpoint_ms: STAGE1_CHECKPOINT_MS,
-            withdrawal_inr: dec!(2000),
-            stage2_expected_start_inr: dec!(1000),
+            withdrawal_inr: Decimal::ZERO,
+            stage2_expected_start_inr: Decimal::ZERO,
             stage2_target_inr: dec!(50000),
             stage2_deadline_ms: STAGE2_DEADLINE_MS,
         }
@@ -335,25 +339,25 @@ impl CapitalController {
         let before = self.history.len();
         match self.stage {
             Stage::Stage0Paper if now_ms >= self.plan.stage1_checkpoint_ms => {
-                self.begin_checkpoint(CheckpointKind::Stage1, now_ms, "22:30 IST checkpoint")
+                self.begin_checkpoint(CheckpointKind::Final, now_ms, "17:00 IST final checkpoint")
             }
             Stage::Stage0Paper if now_ms >= self.plan.stage0_end_ms => self.transition(
                 Stage::Stage1Growth,
                 now_ms,
                 if self.paper {
-                    "20:00 IST: Stage 1 growth (PAPER rehearsal: live not armed)"
+                    "20:00 IST: trading toward INR 50,000 by 17:00 IST 24 Nov (PAPER: live not armed)"
                 } else {
-                    "20:00 IST: Stage 1 growth"
+                    "20:00 IST: trading toward INR 50,000 by 17:00 IST 24 Nov"
                 },
             ),
             Stage::Stage1Growth if now_ms >= self.plan.stage1_checkpoint_ms => {
-                self.begin_checkpoint(CheckpointKind::Stage1, now_ms, "22:30 IST checkpoint")
+                self.begin_checkpoint(CheckpointKind::Final, now_ms, "17:00 IST final checkpoint")
             }
             Stage::Stage1Growth if self.equity >= self.plan.stage1_target_inr => self
                 .begin_checkpoint(
-                    CheckpointKind::Stage1,
+                    CheckpointKind::Final,
                     now_ms,
-                    "Stage 1 target reached early: checkpoint",
+                    "INR 50,000 target reached on actual equity: final checkpoint",
                 ),
             Stage::Stage2Protective if now_ms >= self.plan.stage2_deadline_ms => {
                 self.begin_checkpoint(CheckpointKind::Final, now_ms, "17:00 IST final checkpoint")
@@ -567,50 +571,41 @@ mod tests {
 
     #[test]
     fn plan_times_are_ist() {
-        assert_eq!(STAGE1_CHECKPOINT_MS - STAGE0_END_MS, 9_000_000); // 2.5 h
-        assert_eq!(STAGE2_DEADLINE_MS - STAGE1_CHECKPOINT_MS, 66_600_000); // 18.5 h
-                                                                           // 2026-11-23 14:30:00 UTC == 20:00 IST
+        assert_eq!(STAGE2_DEADLINE_MS - STAGE0_END_MS, 75_600_000); // 21 h
+        assert_eq!(STAGE1_CHECKPOINT_MS, STAGE2_DEADLINE_MS); // no 22:30 checkpoint
+                                                              // 2026-11-23 14:30:00 UTC == 20:00 IST
         assert_eq!(STAGE0_END_MS / 1000 % 86_400, 14 * 3600 + 30 * 60);
+        let p = CapitalPlan::default();
+        assert_eq!(p.stage1_target_inr, dec!(50000));
+        assert_eq!(p.withdrawal_inr, Decimal::ZERO);
     }
 
     #[test]
-    fn stage_flow_and_withdrawal_needs_user() {
+    fn single_target_reached_goes_to_final_checkpoint_without_withdrawal() {
         let mut c = ctl();
         assert_eq!(c.stage, Stage::Stage0Paper);
         assert_eq!(c.risk_mode(), Some(RiskMode::Growth));
         assert!(c.on_clock(STAGE0_END_MS).is_some());
         assert_eq!(c.stage, Stage::Stage1Growth);
+        assert_eq!(c.target(), (dec!(50000), STAGE2_DEADLINE_MS));
+        // the old INR 3,000 / 22:30 target no longer ends the stage
         c.on_realised(dec!(2900), dec!(1));
-        assert_eq!(c.equity, dec!(3000));
-        c.on_clock(STAGE0_END_MS + 1);
-        assert_eq!(c.stage, Stage::Checkpoint1);
+        assert!(c.on_clock(STAGE0_END_MS + 9_000_000).is_none());
+        assert_eq!(c.stage, Stage::Stage1Growth);
+        c.on_realised(dec!(47000), dec!(1));
+        assert_eq!(c.equity, dec!(50000));
+        c.on_clock(STAGE0_END_MS + 9_000_001);
+        assert_eq!(c.stage, Stage::FinalCheckpoint);
         assert!(!c.entries_allowed());
-        assert!(c
-            .record_balance(&mut PaperLedgerBalance(dec!(3000)), 1)
-            .is_err());
-        assert!(c
-            .confirm_withdrawal(dec!(2000), true, dec!(1000), 2)
-            .is_err());
         flat(&mut c);
-        c.record_balance(&mut PaperLedgerBalance(dec!(3000)), 3)
+        c.record_balance(&mut PaperLedgerBalance(dec!(50000)), 3)
             .unwrap();
         let cp = c.checkpoint.clone().unwrap();
+        assert_eq!(cp.kind, CheckpointKind::Final);
         assert!(cp.reconciliation.unwrap().ok);
-        let w = cp.withdrawal.unwrap();
-        assert_eq!(w.amount_inr, dec!(2000));
-        assert_eq!(w.expected_retained_inr, dec!(1000));
-        assert!(c
-            .confirm_withdrawal(dec!(2000), false, dec!(1000), 4)
-            .is_err());
-        assert!(c.withdrawals.is_empty());
-        let eq = c
-            .confirm_withdrawal(dec!(2000), true, dec!(987.65), 5)
-            .unwrap();
-        assert_eq!(eq, dec!(987.65));
-        assert_eq!(c.stage, Stage::Stage2Protective);
-        assert_eq!(c.stage_start_equity, dec!(987.65));
-        assert_eq!(c.risk_mode(), Some(RiskMode::Protective));
-        assert_eq!(c.target().0, dec!(50000));
+        assert!(cp.withdrawal.is_none());
+        c.complete_final(4).unwrap();
+        assert_eq!(c.stage, Stage::Complete);
     }
 
     #[test]
@@ -619,17 +614,11 @@ mod tests {
         c.on_clock(STAGE0_END_MS);
         c.on_realised(dec!(-3), dec!(0.1));
         assert_eq!(c.risk_mode(), Some(RiskMode::Growth));
-        c.on_clock(STAGE1_CHECKPOINT_MS);
-        assert_eq!(c.stage, Stage::Checkpoint1);
-        flat(&mut c);
-        c.record_balance(&mut PaperLedgerBalance(dec!(97)), 1)
-            .unwrap();
-        let w = c.checkpoint.clone().unwrap().withdrawal.unwrap();
-        assert!(!w.target_met);
-        assert_eq!(w.amount_inr, Decimal::ZERO);
-        c.confirm_withdrawal(Decimal::ZERO, true, dec!(97), 2)
-            .unwrap();
-        assert_eq!(c.risk_mode(), Some(RiskMode::Protective));
+        assert!(c.on_clock(STAGE2_DEADLINE_MS - 1).is_none());
+        assert_eq!(c.risk_mode(), Some(RiskMode::Growth));
+        c.on_clock(STAGE2_DEADLINE_MS);
+        assert_eq!(c.stage, Stage::FinalCheckpoint);
+        assert_eq!(c.risk_mode(), None);
     }
 
     #[test]
@@ -649,12 +638,7 @@ mod tests {
     #[test]
     fn final_checkpoint_at_deadline() {
         let mut c = ctl();
-        c.on_clock(STAGE1_CHECKPOINT_MS);
-        flat(&mut c);
-        c.record_balance(&mut PaperLedgerBalance(dec!(100)), 1)
-            .unwrap();
-        c.confirm_withdrawal(Decimal::ZERO, true, dec!(100), 2)
-            .unwrap();
+        c.on_clock(STAGE0_END_MS);
         assert!(c.on_clock(STAGE2_DEADLINE_MS - 1).is_none());
         c.on_clock(STAGE2_DEADLINE_MS);
         assert_eq!(c.stage, Stage::FinalCheckpoint);

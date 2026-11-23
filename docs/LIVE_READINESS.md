@@ -92,7 +92,12 @@ A kill never blocks risk-reducing calls (cancel, exit, cancel-all), so a
 disarmed desk can still close what it holds. The desk can call
 `qe_live_check::arming::kill` itself, for example on a governor halt.
 
-## 22:30 IST: Stage 1 checkpoint and INR 2,000 withdrawal
+## (Removed) 22:30 IST Stage 1 checkpoint and INR 2,000 withdrawal
+
+> **Removed by the owner on 23 Nov 2026.** The only target is INR 50,000 by
+> 17:00 IST on 24 Nov 2026, measured on actual equity. The desk no longer stops
+> at 22:30 and prepares no withdrawal. Use only the 17:00 final checkpoint. The
+> `stage1` tool below is kept for reference only.
 
 ```sh
 qlc checkpoint --kind stage1 --currency INR --expected <desk realised equity>
