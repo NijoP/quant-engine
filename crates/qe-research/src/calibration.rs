@@ -13,8 +13,8 @@
 //! * `calibrating`  — OOS observations exist but at least one gate fails.
 //! * `calibrated`   — n_oos >= [`MIN_OOS`], >= 3 OOS folds, ECE of the
 //!   published (recalibrated) mapping <= [`MAX_ECE`], Brier skill of that
-//!   mapping against the training-fold climatology >= [`MIN_SKILL`], and skill
-//!   > 0 in at least 2/3 of the OOS folds (walk-forward stability). A model that
+//!   mapping against the training-fold climatology >= [`MIN_SKILL`], and
+//!   positive skill in at least 2/3 of the OOS folds (walk-forward stability). A model that
 //!   is merely as good as the base rate is *not* calibrated for authority.
 //!
 //! Only `calibrated` grants forecast authority ([`CalibrationReport::grants_authority`]).
@@ -51,8 +51,8 @@ impl BinMap {
             return None;
         }
         let base = pts.iter().filter(|x| x.y).count() as f64 / pts.len() as f64;
-        let mut sy = vec![0.0; BINS];
-        let mut n = vec![0usize; BINS];
+        let mut sy = [0.0; BINS];
+        let mut n = [0usize; BINS];
         for x in pts {
             let b = bin(x.p);
             n[b] += 1;
@@ -65,7 +65,7 @@ impl BinMap {
             .collect();
         Some(BinMap {
             p_cal,
-            n,
+            n: n.to_vec(),
             base_rate: base,
         })
     }
@@ -135,9 +135,9 @@ pub struct WalkForward {
 }
 
 fn reliability(p: &[f64], y: &[bool]) -> Vec<ReliabilityBin> {
-    let mut sp = vec![0.0; BINS];
-    let mut sy = vec![0.0; BINS];
-    let mut n = vec![0usize; BINS];
+    let mut sp = [0.0; BINS];
+    let mut sy = [0.0; BINS];
+    let mut n = [0usize; BINS];
     for (&pi, &yi) in p.iter().zip(y) {
         let b = bin(pi);
         sp[b] += pi;
@@ -299,10 +299,10 @@ impl CalibrationEntry {
                 if w.oos_folds < 3 {
                     reasons.push(format!("oos folds {} < 3", w.oos_folds));
                 }
-                if !(w.ece_recal <= MAX_ECE) {
+                if w.ece_recal.is_nan() || w.ece_recal > MAX_ECE {
                     reasons.push(format!("ECE(recal) {:.4} > {MAX_ECE}", w.ece_recal));
                 }
-                if !(w.brier_skill_recal >= MIN_SKILL) {
+                if w.brier_skill_recal.is_nan() || w.brier_skill_recal < MIN_SKILL {
                     reasons.push(format!(
                         "Brier skill vs climatology {:.5} < {MIN_SKILL} (little or no information beyond base rate)",
                         w.brier_skill_recal

@@ -10,6 +10,13 @@ pub const MODEL_DESK: &str = "desk.fp.v1";
 pub const MODEL_MOM: &str = "mom.fp.v1";
 pub const MODEL_MOM_1M: &str = "mom.fp.v1.1m";
 
+/// Last path component only: the committed report must not leak local paths.
+fn base(p: &Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 fn median(mut v: Vec<f64>) -> Option<f64> {
     if v.is_empty() {
         return None;
@@ -33,7 +40,7 @@ pub fn build(
     let mut evaluation = json!({
         "params": DESK_PARAMS,
         "folds": folds,
-        "recording": {"dir": rec_dir, "rt_polls": rec.rt_polls, "t_first_ms": rec.t_first, "t_last_ms": rec.t_last,
+        "recording": {"dir": base(rec_dir), "rt_polls": rec.rt_polls, "t_first_ms": rec.t_first, "t_last_ms": rec.t_last,
             "minutes": (rec.t_last - rec.t_first) as f64 / 60_000.0, "pairs": rec.rt.len(),
             "book_pairs": rec.books.len(), "book_snapshots": rec.books.values().map(|b| b.len()).sum::<usize>(),
             "fees_from_metadata": rec.fees},
@@ -68,7 +75,7 @@ pub fn build(
         }
         entries.extend(eval::entries(MODEL_MOM_1M, "candles1m", &all, folds));
         evaluation[MODEL_MOM_1M] = json!({"data": eval::describe(&all, 60.0), "trading": eval::trading(&all),
-            "history_dir": h, "cost_note": "cost uses the median spread measured in the recording; pairs without a recorded book have no net metrics"});
+            "history_dir": base(h), "cost_note": "cost uses the median spread measured in the recording; pairs without a recorded book have no net metrics"});
     }
     Ok(CalibrationReport {
         generated_ms: qe_coindcx::auth::request_timestamp_ms(),
