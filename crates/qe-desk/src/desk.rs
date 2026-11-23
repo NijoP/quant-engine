@@ -116,6 +116,9 @@ pub struct Settings {
     pub gamble_maker_entry: bool,
     /// Cancel an unfilled maker entry after this long; never chased with a taker.
     pub maker_timeout_ms: i64,
+    /// Payoff per bet (`[payoff]` in the gamble config, qe_risk::gamble::payoff):
+    /// cost-aware exclusion and volatility-scaled TP/SL. None = legacy sigma barriers.
+    pub payoff: Option<qe_risk::gamble::payoff::PayoffCfg>,
 }
 
 impl Default for Settings {
@@ -136,6 +139,7 @@ impl Default for Settings {
             gamble: None,
             gamble_maker_entry: false,
             maker_timeout_ms: 4_000,
+            payoff: None,
         }
     }
 }
@@ -841,6 +845,34 @@ pub fn ret_over(h: &VecDeque<(i64, f64, f64)>, w_ms: i64) -> Option<f64> {
 
 /// Per-second volatility from 1-step log returns of the 1 s RT samples:
 /// sigma_1s = RV_step / sqrt(mean dt).
+/// Median high-low range / mean price over consecutive 120 s buckets of the
+/// price history (newest first; buckets with fewer than 20 prints are skipped).
+pub fn range_120s_frac(h: &VecDeque<(i64, f64, f64)>) -> Option<f64> {
+    let end = h.back()?.0;
+    let mut v = vec![];
+    for k in 0..5i64 {
+        let (lo_t, hi_t) = (end - (k + 1) * 120_000, end - k * 120_000);
+        let p: Vec<f64> = h
+            .iter()
+            .filter(|x| x.0 > lo_t && x.0 <= hi_t && x.1 > 0.0)
+            .map(|x| x.1)
+            .collect();
+        if p.len() < 20 {
+            continue;
+        }
+        let (lo, hi) = p
+            .iter()
+            .fold((f64::INFINITY, 0.0f64), |a, x| (a.0.min(*x), a.1.max(*x)));
+        let mean = p.iter().sum::<f64>() / p.len() as f64;
+        v.push((hi - lo) / mean);
+    }
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f64::total_cmp);
+    Some(v[v.len() / 2])
+}
+
 pub fn sigma_per_s(h: &VecDeque<(i64, f64, f64)>) -> Option<f64> {
     if h.len() < 30 {
         return None;
@@ -1059,6 +1091,7 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     };
     let book_age = now - b.ts;
     let (bid, ask) = (b.best_bid().unwrap(), b.best_ask().unwrap());
+    let (bid_lv, ask_lv) = (b.bids.clone(), b.asks.clone());
     let mid = micro::mid(bid, ask);
     let obi = micro::obi(&b.bids, &b.asks, 10).unwrap_or(0.0);
     let spread_bps = micro::spread_bps(bid, ask);
@@ -1169,6 +1202,7 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     let gamble = d.gov.policy.is_gamble();
     let mut gamble_skip: Option<String> = None;
     let mut gamble_est: Option<qe_risk::gamble::BetEstimate> = None;
+    let mut payoff_plan: Option<qe_risk::gamble::payoff::PayoffPlan> = None;
     let mut best = if sides[0].3 >= sides[1].3 { 0 } else { 1 };
     if gamble {
         // Rank by the best available estimate of P(win) and payoff after costs.
@@ -1199,11 +1233,98 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             })
             .collect();
         best = if ests[0].score >= ests[1].score { 0 } else { 1 };
-        let me = ests[best].clone();
+        let mut me = ests[best].clone();
+        if let Some(pc) = d.settings.payoff {
+            // Payoff per bet: volatility-scaled TP/SL, maker/taker cost with
+            // spread and depth impact, exclusion when cost eats the TP.
+            let fx_v = d.fx_usdtinr().unwrap_or(f64::NAN);
+            let range = d.hist.get(pair).and_then(range_120s_frac).unwrap_or(0.0);
+            let owner_lev = d.gov.policy.gamble.as_ref().map_or(1, |g| g.leverage);
+            let room = d.equity() - d.gov.policy.gamble.as_ref().map_or(0.0, |g| g.floor());
+            let notional = (room.max(0.0) * owner_lev as f64).max(1.0);
+            let quotes: Vec<_> = [true, false]
+                .iter()
+                .map(|&long| {
+                    let lv = |x: f64| {
+                        if x.is_finite() && x >= 1.0 {
+                            x as u32
+                        } else {
+                            0
+                        }
+                    };
+                    let (lvls, mlev) = if long {
+                        (&bid_lv, cap.as_ref().map_or(0, |c| lv(c.max_leverage_long)))
+                    } else {
+                        (
+                            &ask_lv,
+                            cap.as_ref().map_or(0, |c| lv(c.max_leverage_short)),
+                        )
+                    };
+                    let depth = lvls.iter().take(5).map(|(p, q)| p * q).sum::<f64>() * fx_v;
+                    qe_risk::gamble::payoff::InstrumentQuote {
+                        pair: pair.to_string(),
+                        long,
+                        maker_fee: cap.as_ref().map_or(f64::NAN, |c| c.maker_fee),
+                        taker_fee: fee_used,
+                        spread_frac: (ask - bid) / mid,
+                        depth_inr: if depth.is_finite() { depth } else { 0.0 },
+                        max_leverage: mlev,
+                        maint_margin_frac: cap
+                            .as_ref()
+                            .and_then(|c| c.maintenance_margin_rate)
+                            .unwrap_or(0.0),
+                        range_120s_frac: range,
+                        sigma_120s_frac: s120,
+                        measured: d
+                            .gamble_trades
+                            .get(&(pair.to_string(), long))
+                            .map(|h| (h.n, h.hits)),
+                    }
+                })
+                .collect();
+            let plans: Vec<_> = quotes
+                .iter()
+                .map(|q| qe_risk::gamble::payoff::plan(q, &pc, owner_lev, notional))
+                .collect();
+            let pick = match (&plans[0], &plans[1]) {
+                (Ok(a), Ok(b)) if (a.ev_per_margin - b.ev_per_margin).abs() > 1e-15 => {
+                    if a.ev_per_margin > b.ev_per_margin {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                (Ok(_), Ok(_)) => best,
+                (Ok(_), Err(_)) => 0,
+                (Err(_), Ok(_)) => 1,
+                (Err(e), Err(_)) => {
+                    gamble_skip = Some(format!("gamble: skipped, {e}"));
+                    best
+                }
+            };
+            best = pick;
+            if let Ok(pl) = &plans[pick] {
+                me = qe_risk::gamble::BetEstimate::new(
+                    pair,
+                    pl.long,
+                    now,
+                    pl.win_p,
+                    pl.win_p,
+                    0.0,
+                    0.0,
+                    pl.tp_frac,
+                    pl.sl_frac,
+                    pl.cost_frac,
+                );
+                payoff_plan = Some(pl.clone());
+            }
+        }
         d.gamble_board
             .retain(|_, b| now - b.ts_ms <= GAMBLE_BOARD_MS && b.pair != pair);
         let board: Vec<_> = d.gamble_board.values().cloned().collect();
-        gamble_skip = qe_risk::gamble::skip_reason(&me, &board);
+        if gamble_skip.is_none() {
+            gamble_skip = qe_risk::gamble::skip_reason(&me, &board);
+        }
         // Only instruments the account can actually trade compete for the bet;
         // an ineligible one (e.g. null exchange leverage) must not block others.
         let tradable = cap.as_ref().is_some_and(|c| {
@@ -1216,13 +1337,17 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             || meta
                 .as_ref()
                 .is_some_and(|m| m.order_types.iter().any(|o| o == "limit_order")));
-        if tradable {
+        if tradable && (d.settings.payoff.is_none() || payoff_plan.is_some()) {
             d.gamble_board
                 .insert((pair.to_string(), me.long), me.clone());
         }
         gamble_est = Some(me);
     }
     let (side, fp, _gross, mut net) = sides[best];
+    // With [payoff], the bet uses the plan's barriers and cost.
+    let (tp, sl, cost) = payoff_plan
+        .as_ref()
+        .map_or((tp, sl, cost), |p| (p.tp_frac, p.sl_frac, p.cost_frac));
     if let Some(e) = &gamble_est {
         net = e.ev_frac;
     }
@@ -1385,7 +1510,7 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     d.opportunities.truncate(100);
     let mode = if gamble { "gamble" } else { "standard" };
     let rec = json!({"ts_ms": now, "trace_id": trace, "pair": pair, "side": side, "decision": decision, "mode": mode,
-        "gamble_estimate": gamble_est,
+        "gamble_estimate": gamble_est, "payoff_plan": payoff_plan,
         "reason": reason, "entry": entry, "tp_price": tp_price, "sl_price": sl_price, "ev_net_bps": net * 1e4,
         "approved_order": approved, "instrument": cap, "explanation": explanation});
     d.store.append("decisions", &rec);
@@ -2310,6 +2435,7 @@ pub fn refresh_gamble_sim(d: &mut Desk, now: i64) {
         "expected_bets": r.expected_bets, "median_final_equity": r.median_final_equity,
         "bets_remaining": input.bets_remaining, "sims": 2_000, "seed": 42,
         "win_p": win_p, "payoff_ratio": input.payoff_ratio, "cost_frac": cost,
+        "barriers": if d.settings.payoff.is_some() { "payoff plan (qe_risk::gamble::payoff)" } else { "sigma barriers" },
         "bets_per_hour": bph, "hours_remaining": hours,
         "source": source, "computed_ms": now}));
 }
@@ -3180,6 +3306,22 @@ mod tests {
         flatten(&mut d, "test");
         assert!(d.positions.is_empty());
         assert_eq!(d.maker_stats.cancelled, 1);
+    }
+
+    #[test]
+    fn range_120s_is_the_median_bucket_range() {
+        let mut h = VecDeque::new();
+        // three 120 s buckets with ranges 1%, 2%, 4% of ~100
+        for (k, amp) in [(0i64, 4.0), (1, 2.0), (2, 1.0)] {
+            for i in 0..60i64 {
+                let t = 1_000_000 - k * 120_000 - i * 2_000;
+                let p = 100.0 + if i % 2 == 0 { amp / 2.0 } else { -amp / 2.0 };
+                h.push_front((t, p, 0.0));
+            }
+        }
+        let r = range_120s_frac(&h).unwrap();
+        assert!((r - 0.02).abs() < 1e-9, "{r}");
+        assert_eq!(range_120s_frac(&VecDeque::new()), None);
     }
 
     #[test]

@@ -212,6 +212,20 @@ fn load_settings() -> anyhow::Result<Settings> {
             "maker" => st.gamble_maker_entry = true,
             o => anyhow::bail!("gamble profile refused: entry {o:?} (use \"maker\" or \"taker\")"),
         }
+        if let Some(pv) = t.get("payoff") {
+            let pc: qe_risk::gamble::payoff::PayoffCfg = pv
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("gamble profile refused: [payoff]: {e}"))?;
+            pc.validate()
+                .map_err(|e| anyhow::anyhow!("gamble profile refused: {e}"))?;
+            // The cost the plan ranks on must be the order type actually sent.
+            if t.get("entry").is_some() && st.gamble_maker_entry != pc.maker_entry {
+                anyhow::bail!("gamble profile refused: entry and payoff.maker_entry disagree");
+            }
+            st.gamble_maker_entry = pc.maker_entry;
+            st.payoff = Some(pc);
+        }
         if let Some(v) = t
             .get("maker_timeout_s")
             .and_then(|v| v.as_float().or(v.as_integer().map(|i| i as f64)))

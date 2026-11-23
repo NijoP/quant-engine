@@ -106,6 +106,25 @@ in the gamble config. The default is `entry = "taker"` (market order, as before)
 - **Dashboard:** `/api/state.gamble.entry` and `/api/state.gamble.maker`
   (placed, filled, partial, cancelled, fill_rate).
 - Only instruments whose metadata lists `limit_order` can be candidates.
+- With a `[payoff]` section in the gamble config, `payoff.maker_entry` decides the
+  entry order type, so the cost the plan ranks on always matches the order that
+  is sent. If `entry` is also set and disagrees, startup is refused.
+
+### Payoff wiring in the desk
+
+When `[payoff]` is present, each evaluated instrument gets one
+`qe_risk::gamble::payoff::plan` per side. Its inputs are the live maker/taker fee,
+spread, top-5 depth on the exit side, the median 120 s high-low range of the last
+~10 minutes of prices, sigma_120, the exchange max leverage, the maintenance
+margin, and realised gamble bets on that pair and side. Excluded instruments
+(for example cost > `max_cost_share_of_tp` of TP) are skipped with the plan's
+reason. The chosen side uses the plan's TP/SL, cost and `win_p`, and the plan is
+journaled on the decision (`payoff_plan`). The target-odds Monte Carlo then
+takes `win_p`, the gross payoff ratio TP/SL and `cost_frac` from the best plan on
+the board (`/api/state.gamble.simulation`, `barriers` = "payoff plan"). The
+plan's liquidation-safe leverage is not passed to the governor. The governor
+still uses the owner leverage capped at the exchange max, and refuses any stop
+beyond the estimated liquidation price.
 
 ## Target probability
 
