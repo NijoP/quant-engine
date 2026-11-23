@@ -151,7 +151,9 @@ impl CampaignConfig {
 }
 
 fn r2(x: Decimal) -> Decimal {
-    x.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
+    let mut y = x.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
+    y.rescale(2); // always two decimals in strings ("1.00")
+    y
 }
 
 fn r0(x: Decimal) -> Decimal {
