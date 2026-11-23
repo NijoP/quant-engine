@@ -6,4 +6,5 @@ dist/
 audit/
 .env.*
 !.env.example
-data/
+# local data: desk audit store (data/desk) and qe-research market-data store (public data; never committed)
+/data/
