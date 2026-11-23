@@ -8,6 +8,7 @@
 //! lifecycle timer (250 ms), instrument metadata (1 s, one instrument per tick),
 //! multi-timeframe candles (per candidate, every 2 min) and the system monitor (10 s).
 mod desk;
+mod learn;
 mod store;
 
 use axum::{
@@ -108,6 +109,19 @@ fn load_settings() -> anyhow::Result<Settings> {
         }
         if let Some(v) = f("stage2_target_inr") {
             st.stage2_target_inr = v;
+        }
+        if let Some(v) = f("withdrawal_inr") {
+            st.withdrawal_inr = v;
+        }
+        let ms = |k: &str| t.get(k).and_then(|v| v.as_integer());
+        if let Some(v) = ms("stage0_end_ms") {
+            st.stage0_end_ms = v;
+        }
+        if let Some(v) = ms("stage1_checkpoint_ms") {
+            st.stage1_checkpoint_ms = v;
+        }
+        if let Some(v) = ms("stage2_deadline_ms") {
+            st.stage2_deadline_ms = v;
         }
         if let Some(v) = f("paper_slippage_bps") {
             st.paper_slippage_bps = v;
@@ -666,7 +680,7 @@ async fn monitor_loop(c: PublicClient, s: S) {
             st["verdict"].as_str().unwrap_or("")
         );
         d.agent_ok("strategy_critic", t0, calib_msg);
-        let eq = d.cap.equity;
+        let eq = d.cap.equity_f64();
         let stage = format!("{:?}", d.cap.stage);
         d.agent_ok(
             "capital_manager",
@@ -955,7 +969,7 @@ fn eligibility(d: &Desk, pair: &str, m: &str) -> (Option<bool>, String) {
     let cost = 2.0 * c.taker_fee + 2.0 * d.settings.paper_slippage_bps / 1e4;
     let min_notional = c.min_notional.max(c.min_quantity * last);
     let risk_at_min = min_notional * (stop + cost) * fx;
-    let budget = d.cap.equity * d.gov.effective_risk_fraction();
+    let budget = d.cap.equity_f64() * d.gov.effective_risk_fraction();
     if risk_at_min > budget {
         (
             Some(false),
@@ -1054,6 +1068,36 @@ async fn h_capital(a: AxState<App>) -> Json<Value> {
     acct["target"] = target_json(&d, now_ms());
     acct["equity_curve"] = json!(d.equity_curve);
     Json(acct)
+}
+/// Markdown report generated from the current state: paper | stage1 | stage2 | final.
+async fn h_report(a: AxState<App>, Path(kind): Path<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(k) = qe_engine::report::ReportKind::parse(&kind) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            "unknown report kind (paper|stage1|stage2|final)",
+        )
+            .into_response();
+    };
+    let d = a.s.read().await;
+    let md = build_report(&d, k, now_ms());
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/markdown; charset=utf-8",
+        )],
+        md,
+    )
+        .into_response()
+}
+async fn h_plan(a: AxState<App>) -> Json<Value> {
+    let d = a.s.read().await;
+    let now = now_ms();
+    Json(
+        json!({"target": target_json(&d, now), "simulation": simulate_target(&d, now),
+        "coverage": coverage_json(&d), "execution": execution_json(&d), "learning": learning_json(&d),
+        "risk_events": d.risk_events, "reports_written": d.reports_done, "live": live_json()}),
+    )
 }
 async fn h_agents(a: AxState<App>) -> Json<Value> {
     Json(json!(a.s.read().await.agents.values().collect::<Vec<_>>()))
@@ -1284,14 +1328,17 @@ async fn c_withdrawal(a: AxState<App>, b: Bytes) -> Json<Value> {
         );
     };
     let confirmed = v["user_confirmed"].as_bool().unwrap_or(false);
-    match d
-        .cap
-        .confirm_withdrawal(amount, confirmed, bal, now_ms() as u64)
-    {
+    match d.cap.confirm_withdrawal(
+        crate::desk::dec(amount),
+        confirmed,
+        crate::desk::dec(bal),
+        now_ms() as u64,
+    ) {
         Ok(eq) => {
             let (paused, killed) = (d.gov.entries_paused, d.gov.killed);
             let pol = d.settings.protective.clone();
             let t2 = d.settings.stage2_target_inr;
+            let eq = crate::desk::dec_f64(eq);
             d.gov = qe_risk::RiskGovernor::new(pol, eq, t2);
             d.gov.entries_paused = paused;
             d.gov.killed = killed;
@@ -1402,6 +1449,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/positions", get(h_positions))
         .route("/api/capital", get(h_capital))
         .route("/api/agents", get(h_agents))
+        .route("/api/plan", get(h_plan))
+        .route("/api/report/:kind", get(h_report))
         .route("/api/risk", get(h_risk))
         .route("/api/control/scanner", post(c_scanner))
         .route("/api/control/paper", post(c_paper))
