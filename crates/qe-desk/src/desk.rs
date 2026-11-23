@@ -260,7 +260,6 @@ pub struct Desk {
     pub books: HashMap<String, Book>,
     pub ew_spread: HashMap<String, (f64, u32)>,
     pub instruments: HashMap<String, (i64, FuturesInstrument)>,
-    pub meta_cursor: usize,
     /// instrument key -> (failed at, error); retried after 10 min, never guessed
     pub meta_fail: HashMap<String, (i64, String)>,
     pub mtf: HashMap<String, (i64, Value)>,
@@ -288,6 +287,29 @@ pub struct Desk {
     pub checkpoint_handled: bool,
     pub seq: u64,
     pub feed: String,
+    /// latest WS currentPrices per pair: (exchange ts, last, vol24h, mark, funding, change%)
+    pub ws_prices: HashMap<String, WsPrice>,
+    pub ws_cp_ms: Option<i64>,
+    /// local receive time of the last Live WS book per pair
+    pub ws_book_ms: HashMap<String, i64>,
+    /// WS trades per pair, last 300 s (event time), aggressor from the feed
+    pub trades: HashMap<String, VecDeque<timeframe::Trade>>,
+    pub ws_health: Value,
+}
+
+pub type WsPrice = (i64, f64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+
+impl Desk {
+    /// True when the WS currentPrices stream delivered within 3 s.
+    pub fn ws_prices_fresh(&self) -> bool {
+        self.ws_cp_ms.is_some_and(|t| now_ms() - t <= 3_000)
+    }
+    /// True when a Live WS book for `pair` arrived within `max_ms`.
+    pub fn ws_book_fresh(&self, pair: &str, max_ms: i64) -> bool {
+        self.ws_book_ms
+            .get(pair)
+            .is_some_and(|t| now_ms() - t <= max_ms)
+    }
 }
 
 pub const AGENTS: [(&str, &str, &str); 10] = [
@@ -386,7 +408,6 @@ impl Desk {
             books: HashMap::new(),
             ew_spread: HashMap::new(),
             instruments: HashMap::new(),
-            meta_cursor: 0,
             meta_fail: HashMap::new(),
             mtf: HashMap::new(),
             ctx: HashMap::new(),
@@ -418,7 +439,12 @@ impl Desk {
             sim: None,
             checkpoint_handled: false,
             seq: 0,
-            feed: "rest-poll".into(),
+            feed: "starting".into(),
+            ws_prices: HashMap::new(),
+            ws_cp_ms: None,
+            ws_book_ms: HashMap::new(),
+            trades: HashMap::new(),
+            ws_health: Value::Null,
         }
     }
 
@@ -802,6 +828,21 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
     e.0 = 0.9 * e.0 + 0.1 * spread_bps;
     e.1 += 1;
     let data_ok = book_age < 5_000 && d.rt_fresh();
+    let tflow: Vec<Value> = d
+        .trades
+        .get(pair)
+        .map(|t| {
+            let v: Vec<timeframe::Trade> = t.iter().copied().collect();
+            [10_000i64, 30_000, 60_000]
+                .iter()
+                .map(|w| {
+                    let ws = timeframe::window_stats(&v, now, *w);
+                    json!({"window_s": w / 1000, "trades": ws.trades, "volume": ws.volume,
+                        "tfi": features::trade_flow_imbalance(&ws)})
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let row = d
         .scanner
         .iter()
@@ -897,6 +938,8 @@ pub fn evaluate(d: &mut Desk, pair: &str) {
             "p_neither": f.p_neither, "e_t_target": f.e_t_target, "e_t_stop": f.e_t_stop,
             "e_ret_neither": f.e_ret_neither, "ev_gross": g, "ev_net": n})).collect::<Vec<_>>(),
         "regime": reg, "data_ok": data_ok, "calibrated": calibrated,
+        "trade_flow_ws": tflow,
+        "book_source": if d.ws_book_fresh(pair, 5_000) { "ws (sequence-checked Live book)" } else { "rest depth 20" },
     });
 
     // ---------------- strategy + risk governor

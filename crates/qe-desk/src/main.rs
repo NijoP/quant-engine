@@ -21,6 +21,7 @@ use axum::{
     Json, Router,
 };
 use desk::*;
+use qe_coindcx::ws::{self, Channel, Depth, WsEvent};
 use qe_coindcx::PublicClient;
 use qe_math::{features, timeframe::ContextTf};
 use serde_json::{json, Value};
@@ -35,6 +36,7 @@ type S = Arc<RwLock<Desk>>;
 struct App {
     s: S,
     c: PublicClient,
+    w: ws::WsHandle,
 }
 
 // ---------------------------------------------------------------- config
@@ -182,6 +184,52 @@ async fn rt_loop(c: PublicClient, s: S) {
             continue;
         }
         let t0 = now_ms();
+        {
+            let mut d = s.write().await;
+            if d.ws_prices_fresh() {
+                // Primary: WS currentPrices state, sampled at a regular local 1 Hz so
+                // volatility and calibration see evenly spaced observations.
+                let now = now_ms();
+                let snap: Vec<(String, WsPrice)> =
+                    d.ws_prices.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                for (pair, (_, last, vol, mp, fr, pc)) in snap {
+                    if !d.fut_usdt.contains(&pair) && !d.fut_inr.contains(&pair) {
+                        continue;
+                    }
+                    let h = d.hist.entry(pair.clone()).or_default();
+                    if h.back().is_none_or(|x| x.0 < now) {
+                        h.push_back((now, last, vol.unwrap_or(0.0)));
+                        while h.len() > 600 {
+                            h.pop_front();
+                        }
+                    }
+                    d.rt_meta.insert(pair, (mp, fr, pc, vol));
+                }
+                d.feed = "ws".into();
+                d.last_rt_ms = Some(now);
+                d.rt_polls += 1;
+                let Desk { calib, hist, .. } = &mut *d;
+                calib.resolve(hist, now);
+                scan(&mut d);
+                let n = d.scanner.len();
+                d.agent_ok(
+                    "opportunity_scanner",
+                    t0,
+                    format!("ranked {n} futures from the WS currentPrices stream"),
+                );
+                drop(d);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            if d.feed == "ws" {
+                d.audit(
+                    "feed",
+                    "WS currentPrices stale > 3 s: falling back to REST RT polling".into(),
+                    Value::Null,
+                );
+            }
+            d.feed = "rest-fallback".into();
+        }
         match c.futures_rt().await {
             Ok(rt) => {
                 let mut d = s.write().await;
@@ -263,10 +311,19 @@ async fn book_loop(c: PublicClient, s: S) {
         };
         for p in top {
             let t0 = now_ms();
-            match c.futures_book(&p, 20).await {
-                Ok(b) => {
+            let ws_ok = s.read().await.ws_book_fresh(&p, 2_000);
+            // Live WS book when fresh; REST depth 20 otherwise.
+            let fetched: anyhow::Result<Option<qe_coindcx::types::Book>> = if ws_ok {
+                Ok(None)
+            } else {
+                c.futures_book(&p, 20).await.map(Some)
+            };
+            match fetched {
+                Ok(rest_book) => {
                     let mut d = s.write().await;
-                    d.books.insert(p.clone(), b);
+                    if let Some(b) = rest_book {
+                        d.books.insert(p.clone(), b);
+                    }
                     let before = d.seq;
                     evaluate(&mut d, &p);
                     let out = if d.seq != before {
@@ -296,7 +353,7 @@ async fn book_loop(c: PublicClient, s: S) {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -314,6 +371,9 @@ async fn position_book_loop(c: PublicClient, s: S) {
             v
         };
         for p in pairs {
+            if s.read().await.ws_book_fresh(&p, 1_000) {
+                continue; // live WS book is fresher than a REST poll
+            }
             match c.futures_book(&p, 20).await {
                 Ok(b) => {
                     s.write().await.books.insert(p, b);
@@ -347,7 +407,7 @@ async fn lifecycle_loop(s: S) {
 async fn meta_loop(c: PublicClient, s: S) {
     loop {
         let next: Option<(String, String)> = {
-            let mut d = s.write().await;
+            let d = s.write().await;
             let now = now_ms();
             let stale =
                 |d: &Desk, k: &str| d.instruments.get(k).is_none_or(|x| now - x.0 > 600_000);
@@ -568,6 +628,136 @@ async fn monitor_loop(c: PublicClient, s: S) {
     }
 }
 
+// ---------------------------------------------------------------- websocket (s2-ws)
+
+/// Consume the public stream: currentPrices state, Live books, trades, health events.
+async fn ws_consumer(h: ws::WsHandle, s: S) {
+    let mut rx = h.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                let mut d = s.write().await;
+                match ev {
+                    WsEvent::CurrentPrices(cp) => {
+                        for (p, e) in cp.prices.iter() {
+                            if let Some(l) = e.last_price.filter(|x| *x > 0.0) {
+                                d.ws_prices.insert(
+                                    p.clone(),
+                                    (
+                                        cp.exchange_ts_ms,
+                                        l,
+                                        e.volume_24h,
+                                        e.mark_price,
+                                        e.funding_rate,
+                                        e.change_pct_24h,
+                                    ),
+                                );
+                            }
+                        }
+                        d.ws_cp_ms = Some(now_ms());
+                    }
+                    WsEvent::Book(b) => {
+                        if let Some(v) = b.view {
+                            d.books.insert(
+                                b.instrument.clone(),
+                                qe_coindcx::types::Book {
+                                    ts: v.exchange_ts_ms,
+                                    vs: Some(v.version as i64),
+                                    bids: v.bids.clone(),
+                                    asks: v.asks.clone(),
+                                },
+                            );
+                            d.ws_book_ms.insert(b.instrument, now_ms());
+                        } else {
+                            d.ws_book_ms.remove(&b.instrument);
+                        }
+                    }
+                    WsEvent::Trade(t) => {
+                        let tr = qe_math::timeframe::Trade {
+                            ts_ms: t.exchange_ts_ms,
+                            price: t.price,
+                            qty: t.quantity,
+                            buyer_aggressor: Some(!t.buyer_is_maker),
+                        };
+                        let q = d.trades.entry(t.instrument).or_default();
+                        q.push_back(tr);
+                        while q.front().is_some_and(|x| x.ts_ms < tr.ts_ms - 300_000) {
+                            q.pop_front();
+                        }
+                    }
+                    WsEvent::Stale { channel, silent_ms } => d.audit(
+                        "ws",
+                        format!("channel {channel} stale ({silent_ms} ms): its data is not used"),
+                        Value::Null,
+                    ),
+                    WsEvent::Disconnected {
+                        reason,
+                        retry_in_ms,
+                    } => {
+                        d.ws_book_ms.clear();
+                        d.audit(
+                            "ws",
+                            format!("disconnected ({reason}); retry in {retry_in_ms} ms; REST fallback active"),
+                            Value::Null,
+                        )
+                    }
+                    WsEvent::Connected { session, channels } => d.audit(
+                        "ws",
+                        format!("connected session {session}, {channels} channels joined"),
+                        Value::Null,
+                    ),
+                    _ => {}
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                // treat as a gap: drop WS book freshness so REST refreshes them
+                let mut d = s.write().await;
+                d.ws_book_ms.clear();
+                d.audit(
+                    "ws",
+                    format!("consumer lagged {n} events: books re-validated via REST"),
+                    Value::Null,
+                );
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Keep WS book + trade subscriptions on the current candidates and open positions.
+async fn ws_join_loop(h: ws::WsHandle, s: S) {
+    let mut joined: HashSet<String> = HashSet::new();
+    loop {
+        let (want, health) = {
+            let d = s.read().await;
+            let mut w: HashSet<String> = d
+                .scanner
+                .iter()
+                .take(TOP_N)
+                .filter_map(|r| r["pair"].as_str().map(String::from))
+                .collect();
+            w.extend(d.positions.iter().map(|p| p.pos.order.pair.clone()));
+            (w, serde_json::to_value(h.health()).unwrap_or_default())
+        };
+        for p in want.difference(&joined).cloned().collect::<Vec<_>>() {
+            let a = h.join(Channel::OrderBook(p.clone(), Depth::D20));
+            let b = h.join(Channel::Trades(p.clone()));
+            if a.is_ok() && b.is_ok() {
+                joined.insert(p);
+            }
+        }
+        for p in joined.difference(&want).cloned().collect::<Vec<_>>() {
+            let _ = h.leave(Channel::OrderBook(p.clone(), Depth::D20));
+            let _ = h.leave(Channel::Trades(p.clone()));
+            joined.remove(&p);
+            let mut d = s.write().await;
+            d.ws_book_ms.remove(&p);
+        }
+        s.write().await.ws_health = health;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
 // ---------------------------------------------------------------- views
 
 /// s2-live readiness, surfaced read-only. The desk never loads credentials
@@ -603,7 +793,9 @@ fn health_json(d: &Desk) -> Value {
     json!({"started_ms": d.started_ms, "last_universe_ms": d.last_universe_ms, "last_rt_ms": d.last_rt_ms,
         "last_spot_ticker_ms": d.last_spot_ms, "rt_polls": d.rt_polls, "errors": d.errors,
         "last_error": d.last_error, "stale": d.last_rt_ms.is_none_or(|t| now - t > 5_000),
-        "feed": d.feed, "instruments_cached": d.instruments.len(), "store_dir": d.store.dir.display().to_string(),
+        "feed": d.feed, "ws_prices_fresh": d.ws_prices_fresh(),
+        "ws_live_books": d.ws_book_ms.values().filter(|t| now - **t <= 5_000).count(),
+        "ws": d.ws_health, "instruments_cached": d.instruments.len(), "store_dir": d.store.dir.display().to_string(),
         "store_written": d.store.written, "store_errors": d.store.errors})
 }
 
@@ -838,6 +1030,10 @@ async fn h_instrument(a: AxState<App>, Path(pair): Path<String>, q: Query<InstQ>
         "features": d.scanner.iter().find(|r| r["pair"] == pair.as_str()),
         "forecast": d.forecasts.get(&pair), "book": book, "mtf": d.mtf.get(&pair).map(|x| &x.1),
         "regime": d.regimes.get(&pair),
+        "trade_flow": d.trades.get(&pair).map(|t| {
+            let v: Vec<qe_math::timeframe::Trade> = t.iter().copied().collect();
+            qe_math::timeframe::micro_windows(&v, now_ms())
+        }),
         "decisions": d.decisions.iter().filter(|x| x["pair"] == pair.as_str()).take(20).collect::<Vec<_>>(),
     }))
 }
@@ -848,6 +1044,25 @@ async fn h_candles(
     q: Query<InstQ>,
 ) -> impl IntoResponse {
     let res = q.resolution.clone().unwrap_or_else(|| "1".into());
+    if res == "1S" {
+        let d = a.s.read().await;
+        let v: Vec<qe_math::timeframe::Trade> = d
+            .trades
+            .get(&pair)
+            .map(|t| t.iter().copied().collect())
+            .unwrap_or_default();
+        let agg = qe_math::timeframe::candles_1s(&v, now_ms());
+        let out = json!(agg
+            .candles
+            .iter()
+            .map(
+                |c| json!({"time": c.open_ms, "open": c.open, "high": c.high, "low": c.low,
+                "close": c.close, "volume": c.volume, "complete": c.complete,
+                "buy_volume": c.buy_volume, "sell_volume": c.sell_volume, "trades": c.trades})
+            )
+            .collect::<Vec<_>>());
+        return (axum::http::StatusCode::OK, Json(out));
+    }
     let (api_res, w, n): (&str, i64, i64) = match res.as_str() {
         "1" => ("1", 60_000, 240),
         "5" => ("5", 300_000, 240),
@@ -860,7 +1075,7 @@ async fn h_candles(
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(
-                    json!({"error": "resolution must be 1|5|15|60|1D|2D|3D (1s candles need the trade stream)"}),
+                    json!({"error": "resolution must be 1S|1|5|15|60|1D|2D|3D (1S built from WS trades of subscribed candidates)"}),
                 ),
             )
         }
@@ -1023,6 +1238,19 @@ async fn c_withdrawal(a: AxState<App>, b: Bytes) -> Json<Value> {
     }
 }
 
+async fn c_ws_reconnect(a: AxState<App>) -> Json<Value> {
+    let r = a.w.reconnect();
+    let mut d = a.s.write().await;
+    match r {
+        Ok(()) => ctl(
+            &mut d,
+            true,
+            "WS reconnect requested; REST fallback covers the gap".into(),
+        ),
+        Err(e) => ctl(&mut d, false, format!("WS reconnect failed: {e}")),
+    }
+}
+
 // ---------------------------------------------------------------- ws
 
 async fn h_ws(a: AxState<App>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -1059,6 +1287,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let c = PublicClient::new();
+    let w = ws::spawn(ws::WsConfig {
+        channels: vec![Channel::CurrentPrices],
+        rest_bootstrap: Some(ws::RestBootstrap(c.clone())),
+        ..ws::WsConfig::default()
+    })?;
+    tokio::spawn(ws_consumer(w.clone(), s.clone()));
+    tokio::spawn(ws_join_loop(w.clone(), s.clone()));
     tokio::spawn(universe_loop(c.clone(), s.clone()));
     tokio::spawn(rt_loop(c.clone(), s.clone()));
     tokio::spawn(spot_loop(c.clone(), s.clone()));
@@ -1093,10 +1328,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/control/flatten", post(c_flatten))
         .route("/api/control/kill", post(c_kill))
         .route("/api/control/confirm_withdrawal", post(c_withdrawal))
+        .route("/api/control/ws_reconnect", post(c_ws_reconnect))
         .route("/ws", get(h_ws))
         .fallback_service(tower_http::services::ServeDir::new(dist))
         .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(App { s, c });
+        .with_state(App { s, c, w });
     eprintln!("qe-desk listening on http://{addr} (paper mode; live orders disabled)");
     let l = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(l, app).await?;
