@@ -28,12 +28,14 @@ through gaps, slippage or liquidation.
    ```
 4. **Edit `configs/campaign-live.toml`** yourself:
    - set `enabled = true` and paste `owner_ack` exactly;
-   - set `floor_inr`, `stake_inr` and `leverage` (the desk caps leverage at the exchange maximum);
+   - set `floor_inr` (required, no default), `leverage` (a whole number, capped at the instrument
+     maximum for the side and tier) and `stake_inr` (required by the validator, overridden per bet);
    - set `execution_mode = "live"`.
 
-   Keep `stake_policy = "fixed"`. At main `22fabe5` the desk **refuses to start** live with
-   `target_optimal` (bold play), because it sizes from desk equity, not the real wallet. Bold play
-   is available only if the campaign branch changes that and its CI is green.
+   Bold play is `campaign_stake = "next_milestone"`, already set. Each bet's margin is sized so
+   that one take-profit win, net of cost, lifts equity to the next hourly milestone, capped by the
+   equity above your floor. Keep `stake_policy = "fixed"`: `target_optimal` is still refused live.
+   This profile needs a desk built from `campaign/24nov-50k-hourly-target` (or main after it merges).
 5. **Arm**: `qlc arm --hours 23`, then type the owner phrase.
 6. **Start at 00:00 IST**:
    ```sh

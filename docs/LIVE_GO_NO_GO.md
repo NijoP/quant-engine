@@ -32,10 +32,12 @@ That is the owner's decision, at the owner's own risk, with the owner's own mone
 change this engineering verdict. Every NOT TESTED item above stays unverified until the owner's own
 runs pass, and gamble mode skips the calibration and positive-EV gates (P0-3, P0-4).
 
-Facts that hold at main `22fabe5`:
-- Bold play (`target_optimal`) is refused live; only `fixed` stake runs live.
+Facts on `campaign/24nov-50k-hourly-target`:
+- Bold play is `campaign_stake = "next_milestone"`: the stake is sized so that one TP win reaches the next milestone, capped by the equity above the floor. It is allowed on the live path, owner-armed only, and paper by default.
+- `stake_policy = "target_optimal"` is still refused live.
 - Leverage is an owner number capped at the exchange max.
 - The floor is checked against the real wallet before each order.
+- SL + TP, the 120 s exit, one position and the kill switch are kept.
 
 Steps: [OWNER_START_0000.md](OWNER_START_0000.md). No agent arms live trading.
 

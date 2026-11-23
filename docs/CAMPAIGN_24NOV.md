@@ -168,7 +168,7 @@ On 23 Nov 2026 the owner chose a live gamble profile from 00:00 IST:
 - bold play toward the schedule, at max leverage, with a 120 s hold;
 - an owner-set floor in place of the INR 1 / INR 5 caps.
 
-It is set up in `configs/campaign-live.toml`, shipped off and on paper, with steps in
+It is set up in `configs/campaign-live.toml` (`campaign_stake = "next_milestone"`: each bet is sized so one TP win reaches the next milestone, capped by the equity above the floor), shipped off and on paper, with steps in
 [OWNER_START_0000.md](OWNER_START_0000.md). The engineering verdict stays **NO-GO**
 ([LIVE_GO_NO_GO.md](LIVE_GO_NO_GO.md)). The rules below describe the engineering-recommended
 profile (`configs/campaign-24nov.toml`). Under the owner's gamble profile the schedule *does* inform
