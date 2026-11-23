@@ -1,12 +1,23 @@
-//! 24 November 2026 campaign controller: INR 100 -> INR 50,000 between 00:00 and
-//! 22:00 IST (22 hours, 500x, no intermediate withdrawals, no resets).
+//! 24 November 2026 campaign controller: INR 101.45 -> INR 50,000 between 00:00
+//! and 23:00 IST (23 hours, no intermediate withdrawals, no resets). Campaign
+//! command update of 24 Nov 2026 00:3x IST: this 23-hour schedule supersedes the
+//! earlier 22-hour schedule (INR 100 -> 50,000 by 22:00 IST, `100 * 500^(h/22)`),
+//! which is kept only as a historical record ([`SUPERSEDED_22H_DEADLINE_MS`]).
 //!
 //! # Mathematics
 //!
-//! `target_equity(h) = start * (target / start) ^ (h / 22)` with start = 100,
-//! target = 50,000 and `h` the elapsed hours (fractional, clamped to `[0, 22]`).
-//! The hourly multiplier is `500 ^ (1/22) = 1.3264181...`, i.e. a required
-//! compounded growth of about 32.6418 % per hour.
+//! `target_equity(h) = E0 * (50000 / E0) ^ (h / 23)` with E0 = 101.45 (the last
+//! verified pre-trade INR futures-wallet read, immutable for performance
+//! measurement), target = 50,000 and `h` the elapsed hours since 00:00 IST
+//! (fractional, clamped to `[0, 23]`). The hourly multiplier is
+//! `(50000 / 101.45) ^ (1/23) = 1.3094071...`, i.e. a required compounded growth
+//! of about 30.9407 % per hour.
+//!
+//! # Entry window
+//!
+//! 00:00-01:00 IST is preparation only: no campaign entries before 01:00 IST
+//! ([`CampaignConfig::first_entry_ms`]). From 01:00 the gate *permits* evaluation
+//! (it never requires a trade). At 23:00 IST: no new entries, exit-only.
 //!
 //! This curve is a **mathematical requirement, not a trading forecast**. In the
 //! default protective profile it is a progress benchmark only: the per-trade
@@ -21,10 +32,10 @@
 //!
 //! - The power is evaluated in `f64` (about 15 significant digits; the error at
 //!   INR 50,000 is below 1e-9 INR) and converted to `Decimal`. h = 0 gives exactly
-//!   100 and h = 22 exactly 50,000.
+//!   E0 (101.45) and h = 23 exactly 50,000.
 //! - **Hourly checkpoints** (`required_inr` in the milestone table) are rounded to
-//!   the whole rupee, half away from zero. This reproduces the published 23-row
-//!   schedule exactly (regression-tested below).
+//!   the whole rupee, half away from zero. This reproduces the published 24-row
+//!   schedule (00:00 ... 23:00) exactly (regression-tested below).
 //! - **Continuous values** (required equity now, partial hours, deltas, P&L,
 //!   remaining) are rounded to 2 dp (paise), half away from zero.
 //! - Status compares unrounded actual equity against the 2 dp required value.
@@ -33,12 +44,13 @@
 //!
 //! Floor INR 95; at most INR 1 planned loss per trade *including* estimated fees,
 //! slippage and the stop-loss loss; at most INR 5 cumulative loss from the INR 100
-//! start; one open position; 120 s maximum hold; no martingale, averaging down or
+//! risk reference ([`CampaignConfig::risk_reference_equity`], unchanged by the
+//! 23-hour update: the new E0 baseline is a measurement value, not a risk limit); one open position; 120 s maximum hold; no martingale, averaging down or
 //! size increase after a loss. Reaching the floor or exhausting the loss budget
 //! enters a **permanent** stop that survives restarts (the state is serialisable
 //! and the desk persists it); a new campaign requires explicit owner review.
 //!
-//! At 22:00 IST the campaign enters exit-only mode; the deadline workflow records
+//! At 23:00 IST the campaign enters exit-only mode; the deadline workflow records
 //! each close/cancel/reconcile step and never reports the account flat unless the
 //! reconciliation source confirmed it.
 
@@ -49,10 +61,17 @@ use serde_json::{json, Value};
 
 /// 2026-11-24 00:00 IST (2026-11-23T18:30:00Z).
 pub const CAMPAIGN_START_MS: i64 = 1_795_458_600_000;
-/// 2026-11-24 22:00 IST (2026-11-24T16:30:00Z).
-pub const CAMPAIGN_DEADLINE_MS: i64 = 1_795_537_800_000;
-pub const CAMPAIGN_HOURS: u32 = 22;
+/// 2026-11-24 23:00 IST (2026-11-24T17:30:00Z).
+pub const CAMPAIGN_DEADLINE_MS: i64 = 1_795_541_400_000;
+pub const CAMPAIGN_HOURS: u32 = 23;
 pub const HOUR_MS: i64 = 3_600_000;
+/// 2026-11-24 01:00 IST: the campaign entry window opens (not a forced trade).
+pub const CAMPAIGN_FIRST_ENTRY_MS: i64 = CAMPAIGN_START_MS + HOUR_MS;
+/// SUPERSEDED: the former 22-hour deadline (2026-11-24 22:00 IST). Historical
+/// record only; used to recognise and refuse a persisted 22-hour campaign state.
+pub const SUPERSEDED_22H_DEADLINE_MS: i64 = 1_795_537_800_000;
+/// E0: last verified pre-trade INR futures-wallet equity (campaign baseline).
+pub const CAMPAIGN_BASELINE_INR: Decimal = dec!(101.45);
 /// IST = UTC + 05:30, no daylight saving.
 pub const IST_OFFSET_MS: i64 = 19_800_000;
 
@@ -80,8 +99,14 @@ pub enum CampaignStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CampaignConfig {
     pub start_ms: i64,
+    /// No campaign entries before this instant (01:00 IST).
+    pub first_entry_ms: i64,
     pub deadline_ms: i64,
+    /// E0, the immutable measurement baseline of the target curve (INR 101.45).
+    /// Never reset after a loss; validation costs are recorded separately.
     pub start_equity: Decimal,
+    /// Reference for the cumulative-loss budget (INR 100, unchanged risk limit).
+    pub risk_reference_equity: Decimal,
     pub target: Decimal,
     /// Absolute equity floor (INR 95).
     pub floor: Decimal,
@@ -105,8 +130,10 @@ impl Default for CampaignConfig {
     fn default() -> Self {
         Self {
             start_ms: CAMPAIGN_START_MS,
+            first_entry_ms: CAMPAIGN_FIRST_ENTRY_MS,
             deadline_ms: CAMPAIGN_DEADLINE_MS,
-            start_equity: dec!(100),
+            start_equity: CAMPAIGN_BASELINE_INR,
+            risk_reference_equity: dec!(100),
             target: dec!(50000),
             floor: dec!(95),
             max_loss_per_trade: dec!(1),
@@ -165,7 +192,7 @@ impl CampaignConfig {
         (self.deadline_ms - self.start_ms) as f64 / HOUR_MS as f64
     }
 
-    /// `(target/start)^(1/hours)`: the constant hourly multiplier (1.326418...).
+    /// `(target/start)^(1/hours)`: the constant hourly multiplier (1.3094071...).
     pub fn hourly_multiplier(&self) -> f64 {
         let m = (self.target / self.start_equity)
             .to_f64()
@@ -351,6 +378,14 @@ impl Campaign {
     /// Restore persisted state. A stopped campaign stays stopped; a corrupt or
     /// foreign (different schedule) state is refused rather than reset silently.
     pub fn restore(json: &str, cfg: &CampaignConfig) -> Result<Self, String> {
+        if let Ok(v) = serde_json::from_str::<Value>(json) {
+            if v["cfg"]["deadline_ms"].as_i64() == Some(SUPERSEDED_22H_DEADLINE_MS) {
+                return Err("persisted campaign uses the SUPERSEDED 22-hour schedule \
+                     (deadline 22:00 IST): owner review required; move campaign_state.json \
+                     aside to run the 23-hour schedule"
+                    .into());
+            }
+        }
         let c: Campaign = serde_json::from_str(json).map_err(|e| format!("campaign state: {e}"))?;
         if &c.cfg != cfg {
             return Err(
@@ -386,10 +421,10 @@ impl Campaign {
         self.equity.map(|e| e + self.unrealised.min(Decimal::ZERO))
     }
 
-    /// Loss used against the INR 5 budget, from the starting equity.
+    /// Loss used against the INR 5 budget, from the INR 100 risk reference.
     pub fn loss_used(&self) -> Decimal {
         self.marked_equity().map_or(Decimal::ZERO, |e| {
-            (self.cfg.start_equity - e).max(Decimal::ZERO)
+            (self.cfg.risk_reference_equity - e).max(Decimal::ZERO)
         })
     }
 
@@ -510,7 +545,7 @@ impl Campaign {
     pub fn tick(&mut self, now: i64) {
         if now >= self.cfg.deadline_ms && !self.exit_only {
             self.exit_only = true;
-            let msg = "22:00 IST deadline: exit-only, no new entries".to_string();
+            let msg = "23:00 IST deadline: exit-only, no new entries".to_string();
             self.event(now, "deadline", msg, Value::Null);
         }
     }
@@ -527,8 +562,10 @@ impl Campaign {
             Err(format!("campaign stopped (permanent): {s}"))
         } else if now < self.cfg.start_ms {
             Err("campaign not started (starts 00:00 IST 24 Nov 2026)".into())
+        } else if now < self.cfg.first_entry_ms {
+            Err("campaign entry window opens 01:00 IST: preparation only, no entries".into())
         } else if self.expired(now) {
-            Err("campaign deadline 22:00 IST passed: exit-only".into())
+            Err("campaign deadline 23:00 IST passed: exit-only".into())
         } else if self.completed_at_ms.is_some() {
             Err("campaign target reached: exit-only".into())
         } else if self.exit_only {
@@ -744,7 +781,10 @@ impl Campaign {
             .collect();
         json!({
             "start": iso_ist(c.start_ms),
+            "first_entry": iso_ist(c.first_entry_ms),
             "deadline": iso_ist(c.deadline_ms),
+            "duration_hours": c.duration_hours(),
+            "entry_window_open": now >= c.first_entry_ms && now < c.deadline_ms,
             "start_equity_inr": c.start_equity.to_string(),
             "target_inr": c.target.to_string(),
             "equity_inr": self.equity.map(s),
@@ -812,13 +852,10 @@ pub fn iso_ist(ms: i64) -> String {
 mod tests {
     use super::*;
 
-    const TABLE: [u32; 23] = [
-        100, 133, 176, 233, 310, 411, 545, 722, 958, 1271, 1686, 2236, 2966, 3934, 5218, 6922,
-        9181, 12178, 16153, 21425, 28419, 37696, 50000,
-    ];
-    const INCREASES: [u32; 22] = [
-        33, 43, 57, 77, 101, 134, 177, 236, 313, 415, 550, 730, 968, 1284, 1704, 2259, 2997, 3975,
-        5272, 6994, 9277, 12304,
+    /// The owner's published 23-hour schedule (00:00 ... 23:00 IST), whole rupees.
+    const TABLE: [u32; 24] = [
+        101, 133, 174, 228, 298, 391, 511, 670, 877, 1148, 1503, 1968, 2577, 3375, 4419, 5786,
+        7576, 9920, 12990, 17009, 22271, 29162, 38185, 50000,
     ];
 
     fn cfg() -> CampaignConfig {
@@ -858,64 +895,90 @@ mod tests {
     const Z: Decimal = Decimal::ZERO;
 
     #[test]
-    fn all_23_checkpoints_match_the_table() {
+    fn all_24_checkpoints_match_the_table() {
         let c = cfg();
+        assert_eq!(CAMPAIGN_HOURS, 23);
         for (h, v) in TABLE.iter().enumerate() {
             assert_eq!(
                 c.checkpoint_required(h as u32),
                 Decimal::from(*v),
                 "hour {h}"
             );
-        }
-        for h in 1..=22usize {
             assert_eq!(
-                TABLE[h] - TABLE[h - 1],
-                INCREASES[h - 1],
-                "increase hour {h}"
+                iso_ist(c.checkpoint_ms(h as u32)),
+                format!("2026-11-24T{h:02}:00:00+05:30")
             );
+        }
+        for h in 1..TABLE.len() {
+            assert!(TABLE[h] > TABLE[h - 1], "increasing at hour {h}");
         }
     }
 
     #[test]
-    fn hourly_multiplier_is_32_6418_percent() {
+    fn formula_is_e0_times_ratio_to_h_over_23() {
+        let c = cfg();
+        let e0 = 101.45_f64;
+        for tenths in 0..=230 {
+            let h = tenths as f64 / 10.0;
+            let want = e0 * (50000.0 / e0).powf(h / 23.0);
+            let got = c.target_equity_exact(h).to_f64().unwrap();
+            assert!((got - want).abs() < 1e-6, "h {h}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn hourly_multiplier_is_30_9407_percent() {
         let m = cfg().hourly_multiplier();
-        assert!((m - 1.326418).abs() < 1e-6, "{m}");
-        assert!(((m - 1.0) * 100.0 - 32.6418).abs() < 1e-4);
+        assert!((m - 1.3094071).abs() < 1e-7, "{m}");
+        assert!(((m - 1.0) * 100.0 - 30.9407).abs() < 1e-4);
+        assert_eq!(cfg().duration_hours(), 23.0);
     }
 
     #[test]
     fn endpoints_are_exact() {
         let c = cfg();
-        assert_eq!(c.target_equity_exact(0.0), dec!(100));
-        assert_eq!(c.target_equity_exact(22.0), dec!(50000));
-        assert_eq!(c.required_at(CAMPAIGN_START_MS), dec!(100));
+        assert_eq!(c.start_equity, dec!(101.45));
+        assert_eq!(c.target_equity_exact(0.0), dec!(101.45));
+        assert_eq!(c.target_equity_exact(23.0), dec!(50000));
+        assert_eq!(c.checkpoint_required(23), dec!(50000));
+        assert_eq!(c.required_at(CAMPAIGN_START_MS), dec!(101.45));
         assert_eq!(c.required_at(CAMPAIGN_DEADLINE_MS), dec!(50000));
-        assert_eq!(c.required_at(CAMPAIGN_START_MS - HOUR_MS), dec!(100));
+        assert_eq!(c.required_at(CAMPAIGN_START_MS - HOUR_MS), dec!(101.45));
         assert_eq!(c.required_at(CAMPAIGN_DEADLINE_MS + HOUR_MS), dec!(50000));
-        assert_eq!(c.target_equity_exact(f64::NAN), dec!(100));
+        assert_eq!(c.target_equity_exact(f64::NAN), dec!(101.45));
+        // the old 22:00 instant is no longer the end of the curve
+        let at22 = c.required_at(SUPERSEDED_22H_DEADLINE_MS);
+        assert_eq!(at22, dec!(38185.22));
     }
 
     #[test]
     fn rounding_is_half_away_from_zero() {
         let c = cfg();
-        // hour 1 exact 132.6418... -> 133 (checkpoint) and 132.64 (continuous)
+        // hour 1 exact 132.8394... -> 133 (checkpoint) and 132.84 (continuous)
         assert_eq!(c.checkpoint_required(1), dec!(133));
-        assert_eq!(c.required_at(CAMPAIGN_START_MS + HOUR_MS), dec!(132.64));
+        assert_eq!(c.required_at(CAMPAIGN_START_MS + HOUR_MS), dec!(132.84));
         assert_eq!(r2(dec!(1.005)), dec!(1.01));
         assert_eq!(r0(dec!(232.5)), dec!(233));
-        // hour 7 exact 722.3758 -> 722 (rounds down)
-        assert_eq!(c.checkpoint_required(7), dec!(722));
+        // hour 10 exact 1503.1385 -> 1503 (rounds down)
+        assert_eq!(c.checkpoint_required(10), dec!(1503));
     }
 
     #[test]
     fn partial_hour_targets() {
         let c = cfg();
-        // h = 0.5: 100 * 500^(1/44) = 115.17
-        assert_eq!(c.required_at(CAMPAIGN_START_MS + HOUR_MS / 2), dec!(115.17));
-        let v = c.required_at(CAMPAIGN_START_MS + 21 * HOUR_MS + HOUR_MS / 2);
-        assert!(v > dec!(37696) && v < dec!(50000), "{v}");
+        // h = 0.5: 101.45 * (50000/101.45)^(0.5/23) = 116.0886
+        assert_eq!(c.required_at(CAMPAIGN_START_MS + HOUR_MS / 2), dec!(116.09));
+        // h = 1.25: 101.45 * (50000/101.45)^(1.25/23)
+        let want = 101.45 * (50000.0_f64 / 101.45).powf(1.25 / 23.0);
+        let got = c.required_at(CAMPAIGN_START_MS + HOUR_MS + HOUR_MS / 4);
+        assert!(
+            (got.to_f64().unwrap() - want).abs() <= 0.005,
+            "{got} vs {want}"
+        );
+        let v = c.required_at(CAMPAIGN_START_MS + 22 * HOUR_MS + HOUR_MS / 2);
+        assert!(v > dec!(38185) && v < dec!(50000), "{v}");
         let mut last = Decimal::ZERO;
-        for m in 0..=(22 * 60) {
+        for m in 0..=(23 * 60) {
             let r = c.required_at(CAMPAIGN_START_MS + m * 60_000);
             assert!(r >= last);
             last = r;
@@ -925,7 +988,16 @@ mod tests {
     #[test]
     fn ist_handling() {
         assert_eq!(iso_ist(CAMPAIGN_START_MS), "2026-11-24T00:00:00+05:30");
-        assert_eq!(iso_ist(CAMPAIGN_DEADLINE_MS), "2026-11-24T22:00:00+05:30");
+        assert_eq!(iso_ist(CAMPAIGN_DEADLINE_MS), "2026-11-24T23:00:00+05:30");
+        assert_eq!(
+            iso_ist(CAMPAIGN_FIRST_ENTRY_MS),
+            "2026-11-24T01:00:00+05:30"
+        );
+        assert_eq!(CAMPAIGN_DEADLINE_MS, 1_795_541_400_000);
+        assert_eq!(
+            iso_ist(SUPERSEDED_22H_DEADLINE_MS),
+            "2026-11-24T22:00:00+05:30"
+        );
         assert_eq!(
             iso_ist(cfg().checkpoint_ms(17)),
             "2026-11-24T17:00:00+05:30"
@@ -934,7 +1006,7 @@ mod tests {
             iso_ist(CAMPAIGN_START_MS - 1000),
             "2026-11-23T23:59:59+05:30"
         );
-        assert_eq!(CAMPAIGN_DEADLINE_MS - CAMPAIGN_START_MS, 22 * HOUR_MS);
+        assert_eq!(CAMPAIGN_DEADLINE_MS - CAMPAIGN_START_MS, 23 * HOUR_MS);
         // 2026-11-23T18:30:00Z
         assert_eq!(CAMPAIGN_START_MS / 1000 % 86_400, 18 * 3600 + 1800);
     }
@@ -968,7 +1040,7 @@ mod tests {
         let j = u.to_json(CAMPAIGN_START_MS, Value::Null, "no verified balance");
         assert_eq!(j["equity_source"], "live_exchange");
         assert!(j["equity_inr"].is_null());
-        let e = u.entry_gate(CAMPAIGN_START_MS + 1, 0).unwrap_err();
+        let e = u.entry_gate(CAMPAIGN_FIRST_ENTRY_MS + 1, 0).unwrap_err();
         assert!(e.contains("unknown"));
     }
 
@@ -1064,7 +1136,7 @@ mod tests {
     #[test]
     fn behind_schedule_never_changes_risk_or_forces_trades() {
         let now = CAMPAIGN_START_MS + 10 * HOUR_MS;
-        let mut behind = at("100", now); // required 1,685.79
+        let mut behind = at("100", now); // required 1,503.14
         assert_eq!(behind.status(now), CampaignStatus::Behind);
         let mut ahead = at("100", now);
         ahead.cfg.start_ms = now; // requirement 100 -> on track
@@ -1074,7 +1146,7 @@ mod tests {
         assert!(behind.entry_gate(now, 1).is_err());
         assert!(behind.check_trade(now, &check("1.5", "0", "0")).is_err());
         let rate = behind.required_hourly_rate(now).unwrap();
-        assert!(rate > 0.326, "reported catch-up rate {rate}");
+        assert!(rate > 0.309, "reported catch-up rate {rate}");
         let j = behind.to_json(now, Value::Null, "paper");
         assert_eq!(j["status"], "behind");
         assert_eq!(j["per_trade_max_loss_inr"], "1");
@@ -1084,8 +1156,8 @@ mod tests {
     #[test]
     fn one_position_at_a_time() {
         let mut c = at("100", CAMPAIGN_START_MS);
-        assert!(c.entry_gate(CAMPAIGN_START_MS + 1, 0).is_ok());
-        let e = c.entry_gate(CAMPAIGN_START_MS + 1, 1).unwrap_err();
+        assert!(c.entry_gate(CAMPAIGN_FIRST_ENTRY_MS, 0).is_ok());
+        let e = c.entry_gate(CAMPAIGN_FIRST_ENTRY_MS, 1).unwrap_err();
         assert!(e.contains("open position"));
     }
 
@@ -1137,12 +1209,19 @@ mod tests {
         c.observe(t, Some(dec!(101)), P, dec!(1), Z);
         assert_eq!(c.checkpoint_actual[1], Some(dec!(101)));
         assert_eq!(c.checkpoints_done(t), 1);
-        assert_eq!(c.checkpoints_done(CAMPAIGN_DEADLINE_MS + 1), 22);
+        assert_eq!(c.checkpoints_done(CAMPAIGN_DEADLINE_MS + 1), 23);
         let j = c.to_json(t, Value::Null, "paper");
-        assert_eq!(j["milestones"].as_array().unwrap().len(), 23);
+        assert_eq!(j["milestones"].as_array().unwrap().len(), 24);
+        assert_eq!(j["milestones"][23]["required_inr"], "50000");
+        assert_eq!(j["milestones"][23]["at"], "2026-11-24T23:00:00+05:30");
+        assert_eq!(j["deadline"], "2026-11-24T23:00:00+05:30");
+        assert_eq!(j["first_entry"], "2026-11-24T01:00:00+05:30");
+        assert_eq!(j["duration_hours"], 23.0);
+        assert_eq!(j["start_equity_inr"], "101.45");
+        assert_eq!(j["entry_window_open"], true);
         assert_eq!(j["milestones"][1]["actual_inr"], "101.00");
         assert_eq!(j["prev_milestone"]["hour"], 1);
-        assert_eq!(j["next_milestone"]["required_inr"], "176");
+        assert_eq!(j["next_milestone"]["required_inr"], "174");
         assert_eq!(j["equity_history"].as_array().unwrap().len(), 2);
         assert_eq!(j["drawdown_inr"], "0.00");
     }
@@ -1152,7 +1231,7 @@ mod tests {
         let mut c = at("100", CAMPAIGN_START_MS);
         let _ = c.entry_gate(CAMPAIGN_START_MS - 1, 0);
         let _ = c.entry_gate(CAMPAIGN_START_MS - 1, 0); // repeated block: logged once
-        let _ = c.entry_gate(CAMPAIGN_START_MS + 1, 0);
+        let _ = c.entry_gate(CAMPAIGN_FIRST_ENTRY_MS + 1, 0);
         let _ = c.check_trade(CAMPAIGN_START_MS + 2, &check("2", "0", "0"));
         c.on_trade_closed(CAMPAIGN_START_MS + 3, dec!(0.2));
         let ev = c.drain_events();
@@ -1196,5 +1275,133 @@ mod tests {
         c.observe(CAMPAIGN_START_MS + 5, Some(dec!(50000)), P, dec!(49900), Z);
         assert_eq!(c.status(CAMPAIGN_START_MS + 6), CampaignStatus::Completed);
         assert!(c.entry_gate(CAMPAIGN_START_MS + 6, 0).is_err());
+    }
+    #[test]
+    fn first_entry_gate_opens_at_01_00_ist() {
+        let mut c = at("101.45", CAMPAIGN_START_MS);
+        for t in [
+            CAMPAIGN_START_MS,
+            CAMPAIGN_START_MS + 1,
+            CAMPAIGN_START_MS + 30 * 60_000,
+            CAMPAIGN_FIRST_ENTRY_MS - 1,
+        ] {
+            let e = c.entry_gate(t, 0).unwrap_err();
+            assert!(e.contains("01:00 IST"), "{e}");
+            assert!(!c.exit_only, "preparation hour is not exit-only");
+        }
+        assert!(c.entry_gate(CAMPAIGN_FIRST_ENTRY_MS, 0).is_ok());
+        assert!(c.entry_gate(CAMPAIGN_START_MS + 12 * HOUR_MS, 0).is_ok());
+        assert!(c.entry_gate(CAMPAIGN_DEADLINE_MS - 1, 0).is_ok());
+        let j = c.to_json(CAMPAIGN_FIRST_ENTRY_MS - 1, Value::Null, "paper");
+        assert_eq!(j["entry_window_open"], false);
+    }
+
+    #[test]
+    fn no_entries_at_or_after_23_00_and_exit_only() {
+        let mut c = at("200", CAMPAIGN_START_MS + 2 * HOUR_MS);
+        assert!(c.entry_gate(CAMPAIGN_DEADLINE_MS - 1, 0).is_ok());
+        assert!(!c.exit_only);
+        for t in [
+            CAMPAIGN_DEADLINE_MS,
+            CAMPAIGN_DEADLINE_MS + 1,
+            CAMPAIGN_DEADLINE_MS + HOUR_MS,
+        ] {
+            let e = c.entry_gate(t, 0).unwrap_err();
+            assert!(e.contains("23:00 IST"), "{e}");
+        }
+        assert!(c.exit_only);
+        assert!(c
+            .drain_events()
+            .iter()
+            .any(|e| e.kind == "deadline" && e.message.contains("23:00 IST")));
+        // the old 22:00 instant is NOT the deadline any more
+        let mut d = at("200", CAMPAIGN_START_MS + 2 * HOUR_MS);
+        d.tick(SUPERSEDED_22H_DEADLINE_MS);
+        assert!(!d.exit_only);
+        assert!(d.entry_gate(SUPERSEDED_22H_DEADLINE_MS, 0).is_ok());
+    }
+
+    #[test]
+    fn catch_up_rate_uses_time_to_23_00() {
+        // on the curve at any hour, the catch-up rate is the constant 30.9407 %
+        for h in [0u32, 1, 5, 12, 22] {
+            let now = CAMPAIGN_START_MS + h as i64 * HOUR_MS;
+            let mut c = Campaign::new(cfg(), P);
+            let eq = cfg().target_equity_exact(h as f64);
+            c.observe(now, Some(eq), P, Z, Z);
+            let r = c.required_hourly_rate(now).unwrap();
+            assert!((r - 0.3094071).abs() < 1e-6, "hour {h}: {r}");
+        }
+        // 1 hour left with INR 25,000: must double -> 100 %
+        let mut c = at("25000", CAMPAIGN_DEADLINE_MS - HOUR_MS);
+        let r = c
+            .required_hourly_rate(CAMPAIGN_DEADLINE_MS - HOUR_MS)
+            .unwrap();
+        assert!((r - 1.0).abs() < 1e-9, "{r}");
+        // 30 minutes left with INR 25,000: (2)^(1/0.5) - 1 = 300 %
+        let r = c
+            .required_hourly_rate(CAMPAIGN_DEADLINE_MS - HOUR_MS / 2)
+            .unwrap();
+        assert!((r - 3.0).abs() < 1e-9, "{r}");
+        assert!(c.required_hourly_rate(CAMPAIGN_DEADLINE_MS).is_none());
+        // before the start the full 23 h are used
+        let r = c.required_hourly_rate(CAMPAIGN_START_MS - HOUR_MS).unwrap();
+        let want = (50000.0_f64 / 25000.0).powf(1.0 / 23.0) - 1.0;
+        assert!((r - want).abs() < 1e-12, "{r}");
+        let _ = c.entry_gate(CAMPAIGN_DEADLINE_MS, 0);
+    }
+
+    #[test]
+    fn risk_limits_unchanged_by_23_hour_schedule() {
+        let c = cfg();
+        assert_eq!(c.floor, dec!(95));
+        assert_eq!(c.max_loss_per_trade, dec!(1));
+        assert_eq!(c.max_campaign_loss, dec!(5));
+        assert_eq!(c.risk_reference_equity, dec!(100));
+        assert_eq!(c.max_open_positions, 1);
+        assert_eq!(c.max_hold_secs, 120);
+        assert!(!c.bold_play);
+        let b = CampaignConfig::bold(dec!(60));
+        assert_eq!(b.max_campaign_loss, dec!(40));
+        assert_eq!(b.max_hold_secs, 120);
+        assert_eq!(b.max_open_positions, 1);
+        // the E0 baseline does not tighten or loosen the loss budget:
+        // equity 96 -> loss used 4 from the INR 100 reference, budget INR 1
+        let mut k = at("96", CAMPAIGN_START_MS);
+        assert_eq!(k.loss_used(), dec!(4));
+        assert_eq!(k.risk_budget_now(), dec!(1));
+        assert!(!k.is_stopped());
+        k.observe(CAMPAIGN_START_MS + 1, Some(dec!(101.45)), P, Z, Z);
+        assert_eq!(k.loss_used(), Z);
+    }
+
+    #[test]
+    fn restart_recovers_the_23_hour_state_and_refuses_the_22_hour_one() {
+        let mut c = at("101.45", CAMPAIGN_START_MS);
+        c.observe(
+            CAMPAIGN_FIRST_ENTRY_MS + 5,
+            Some(dec!(140)),
+            P,
+            dec!(38.55),
+            Z,
+        );
+        assert!(c.entry_gate(CAMPAIGN_FIRST_ENTRY_MS + 6, 0).is_ok());
+        let s = serde_json::to_string(&c).unwrap();
+        let mut r = Campaign::restore(&s, &cfg()).unwrap();
+        assert_eq!(r.cfg.deadline_ms, CAMPAIGN_DEADLINE_MS);
+        assert_eq!(r.cfg.first_entry_ms, CAMPAIGN_FIRST_ENTRY_MS);
+        assert_eq!(r.checkpoint_actual.len(), 24);
+        assert_eq!(r.checkpoint_actual[1], Some(dec!(140)));
+        assert!(r.entry_gate(CAMPAIGN_FIRST_ENTRY_MS + 7, 0).is_ok());
+        assert!(r.entry_gate(CAMPAIGN_DEADLINE_MS, 0).is_err());
+        // a state persisted by the superseded 22-hour build is refused, never migrated
+        let mut v: Value = serde_json::from_str(&s).unwrap();
+        v["cfg"]["deadline_ms"] = json!(SUPERSEDED_22H_DEADLINE_MS);
+        let e = Campaign::restore(&v.to_string(), &cfg()).unwrap_err();
+        assert!(e.contains("SUPERSEDED 22-hour"), "{e}");
+        // a state with a different baseline is refused too (E0 is immutable)
+        let mut other = cfg();
+        other.start_equity = dec!(100);
+        assert!(Campaign::restore(&s, &other).is_err());
     }
 }

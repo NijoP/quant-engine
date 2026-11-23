@@ -1,8 +1,11 @@
 # 24 NOVEMBER 2026 CAMPAIGN - example campaign risk profile (PAPER default).
-# See docs/CAMPAIGN_24NOV.md. INR 100 -> INR 50,000 between 00:00 and 22:00 IST
-# on 24 Nov 2026, one continuous campaign with no intermediate withdrawals.
+# See docs/CAMPAIGN_24NOV.md. INR 101.45 -> INR 50,000 between 00:00 and 23:00 IST
+# on 24 Nov 2026 (23 hours; first entry permitted 01:00 IST), one continuous
+# campaign with no intermediate withdrawals and no resets. The former 22-hour
+# schedule (INR 100 -> 50,000 by 22:00 IST, 100 * 500^(h/22)) is SUPERSEDED.
 #
-# The hourly schedule target_equity(h) = 100 * 500^(h/22) is a mathematical
+# The hourly schedule target_equity(h) = 101.45 * (50000/101.45)^(h/23)
+# (x1.3094071 per hour, about 30.9407 %/h) is a mathematical
 # requirement for progress reporting, NOT a trading forecast. It never changes
 # sizing, leverage, signal thresholds or entries. These limits are fixed: do not
 # loosen them to make the target reachable.
@@ -10,16 +13,18 @@ execution_mode = "paper"              # live stays owner-armed only (docs/GO_LIV
 
 [schedule]
 start = "2026-11-24T00:00:00+05:30"   # epoch ms 1795458600000
-deadline = "2026-11-24T22:00:00+05:30" # epoch ms 1795537800000; after it: exit-only
-start_equity_inr = "100"
+first_entry = "2026-11-24T01:00:00+05:30" # no campaign entries before (preparation hour)
+deadline = "2026-11-24T23:00:00+05:30" # epoch ms 1795541400000; at/after it: exit-only
+start_equity_inr = "101.45"           # E0: last verified real-account read; immutable baseline
 target_inr = "50000"
-hours = 22
+hours = 23
+superseded_deadline = "2026-11-24T22:00:00+05:30" # historical record only (epoch ms 1795537800000)
 display_rounding = "nearest_rupee_half_away_from_zero"  # calculations stay unrounded
 
 [risk]
 floor_inr = "95"                      # permanent campaign stop at or below this equity
 per_trade_max_loss_inr = "1"          # includes estimated fees, slippage and stop-loss loss
-campaign_loss_budget_inr = "5"        # cumulative loss from the initial INR 100
+campaign_loss_budget_inr = "5"        # cumulative loss from the INR 100 risk reference (unchanged)
 max_open_positions = 1
 max_hold_ms = 120000
 isolated_margin = true

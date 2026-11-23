@@ -3,6 +3,10 @@
 // behind schedule is shown in the same neutral style as being ahead (no red, no urgency cues, no "catch up" prompts).
 import type { Campaign } from "./api";
 import {
+  CAMPAIGN_HOURS,
+  CAMPAIGN_START_EQUITY,
+  CAMPAIGN_TARGET,
+  FIRST_ENTRY_HOUR,
   actualPath,
   actualPoints,
   chartGeom,
@@ -44,7 +48,10 @@ export function CampaignPanel({ campaign, serverNow }: { campaign: Campaign | nu
   const delta = n(c.delta_inr);
   const pos = c.open_position;
   const terminal = c.status === "stopped" || c.status === "completed" || c.status === "expired";
-  const mult = hourlyMultiplier(n(c.start_equity_inr) ?? 100, n(c.target_inr) ?? 50000);
+  const mult = hourlyMultiplier(n(c.start_equity_inr) ?? CAMPAIGN_START_EQUITY, n(c.target_inr) ?? CAMPAIGN_TARGET);
+  const hours = c.duration_hours ?? (deadlineMs - startMs) / 3_600_000;
+  const firstEntryMs = c.first_entry ? Date.parse(c.first_entry) : startMs + FIRST_ENTRY_HOUR * 3_600_000;
+  const windowOpen = c.entry_window_open ?? (serverNow >= firstEntryMs && serverNow < deadlineMs);
   return (
     <section className="panel campaign">
       <h2>
@@ -58,7 +65,13 @@ export function CampaignPanel({ campaign, serverNow }: { campaign: Campaign | nu
         </div>
       )}
       <div className="kv cols">
-        <span>starting capital</span><b>{inr(c.start_equity_inr)}</b>
+        <span>campaign start</span><b>{istDateTime(startMs)}</b>
+        <span>first entry permitted</span>
+        <b>
+          {istDateTime(firstEntryMs)} <span className="muted">({windowOpen ? "entry window open: evaluation permitted, never forced" : "entry window closed: no new campaign entries"})</span>
+        </b>
+        <span>duration</span><b>{Number.isFinite(hours) ? `${hours} hours` : DASH}</b>
+        <span>starting baseline (E0)</span><b>{inr(c.start_equity_inr)} <span className="muted">(last verified account read; never reset)</span></b>
         <span>actual equity</span>
         <b>
           {equity === null ? "unverified — not shown" : inr(equity)} <span className="muted">({c.equity_source === "live_exchange" ? "live exchange" : "paper"})</span>
@@ -70,7 +83,7 @@ export function CampaignPanel({ campaign, serverNow }: { campaign: Campaign | nu
         <span>hourly milestone</span>
         <b>
           h{c.prev_milestone.hour} {inr(c.prev_milestone.required_inr)} → h{c.next_milestone.hour} {inr(c.next_milestone.required_inr)} at{" "}
-          {istHourMinute(Date.parse(c.next_milestone.at))} · {c.checkpoints_done}/22 checkpoints passed
+          {istHourMinute(Date.parse(c.next_milestone.at))} · {c.checkpoints_done}/{CAMPAIGN_HOURS} checkpoints passed
         </b>
         <span>required now</span><b>{inr(c.required_now_inr)}</b>
         <span>actual vs required</span>
@@ -84,7 +97,7 @@ export function CampaignPanel({ campaign, serverNow }: { campaign: Campaign | nu
         <span>remaining time</span><b>{duration(c.remaining_secs)}</b>
         <span>required future rate</span>
         <b>{c.required_hourly_rate === null ? DASH : `${pct(c.required_hourly_rate, 2)} per hour, compounded`}</b>
-        <span>schedule rate</span><b>{pct(mult - 1, 4)} per hour (×{mult.toFixed(6)})</b>
+        <span>schedule rate</span><b>{pct(mult - 1, 4)} per hour (×{mult.toFixed(7)}), mathematical requirement</b>
         <span>drawdown</span><b>{inr(c.drawdown_inr)}</b>
         <span>campaign floor</span><b>{inr(c.floor_inr)}</b>
         <span>loss budget used</span><b>{inr(c.loss_used_inr)} of {inr(c.loss_budget_inr)}</b>
@@ -98,9 +111,11 @@ export function CampaignPanel({ campaign, serverNow }: { campaign: Campaign | nu
         <span>realised P&L</span><b>{inr(c.realised_pnl_inr, true)}</b>
         <span>unrealised P&L</span><b>{inr(c.unrealised_pnl_inr, true)} <span className="muted">(open, not banked)</span></b>
       </div>
+      <CheckpointTable c={c} />
       <CampaignChart c={c} startMs={startMs} serverNow={serverNow} />
       <p className="campaign-note">
-        The hourly curve is a mathematical requirement, not a trading forecast: 100 × 500^(h/22). A missed checkpoint is a reporting
+        The hourly curve is a mathematical requirement, not a trading forecast: {inr(c.start_equity_inr)} × ({inr(c.target_inr)} / {inr(c.start_equity_inr)})^(h/{CAMPAIGN_HOURS}),
+        00:00 → 23:00 IST; no campaign entries before 01:00 IST and exit-only from 23:00 IST. The earlier 22-hour curve (₹100 × 500^(h/22), 22:00 IST) is superseded. A missed checkpoint is a reporting
         condition only. It never raises leverage, position size or trade frequency, never lowers the signal threshold and never bypasses the
         risk governor ({inr(c.per_trade_max_loss_inr)} per trade, {inr(c.loss_budget_inr)} campaign loss, {inr(c.floor_inr)} floor).
       </p>
@@ -109,8 +124,8 @@ export function CampaignPanel({ campaign, serverNow }: { campaign: Campaign | nu
 }
 
 function CampaignChart({ c, startMs, serverNow }: { c: Campaign; startMs: number; serverNow: number }) {
-  const start = n(c.start_equity_inr) ?? 100;
-  const target = n(c.target_inr) ?? 50000;
+  const start = n(c.start_equity_inr) ?? CAMPAIGN_START_EQUITY;
+  const target = n(c.target_inr) ?? CAMPAIGN_TARGET;
   const floor = n(c.floor_inr) ?? 95;
   const pts = actualPoints(startMs, c.equity_history);
   const g = chartGeom(floor, target, pts.map((p) => p.v));
@@ -119,14 +134,14 @@ function CampaignChart({ c, startMs, serverNow }: { c: Campaign; startMs: number
   const last = pts.length > 0 ? pts[pts.length - 1] : null;
   return (
     <figure className="campaign-chart">
-      <svg viewBox={`0 0 ${g.width} ${g.height}`} role="img" aria-label="22-hour campaign progress: mathematical target curve and verified equity">
+      <svg viewBox={`0 0 ${g.width} ${g.height}`} role="img" aria-label="23-hour campaign progress: mathematical target curve and verified equity">
         {logTicks(g).map((v) => (
           <g key={v}>
             <line className="grid" x1={g.padL} x2={g.width - g.padR} y1={yOf(g, v)} y2={yOf(g, v)} />
             <text className="axis" x={g.padL - 6} y={yOf(g, v) + 3} textAnchor="end">₹{v.toLocaleString("en-IN")}</text>
           </g>
         ))}
-        {Array.from({ length: 23 }, (_, h) => h)
+        {Array.from({ length: CAMPAIGN_HOURS + 1 }, (_, h) => h)
           .filter((h) => h % 2 === 0)
           .map((h) => (
             <text key={h} className="axis" x={xOf(g, h)} y={g.height - 8} textAnchor="middle">
@@ -156,7 +171,7 @@ function CampaignChart({ c, startMs, serverNow }: { c: Campaign; startMs: number
         })}
         {actual && <path className="actual-curve" d={actual} />}
         {last && <circle className="checkpoint-actual" cx={xOf(g, last.h)} cy={yOf(g, last.v)} r={3} />}
-        {nowH >= 0 && nowH <= 22 && <line className="now" x1={xOf(g, nowH)} x2={xOf(g, nowH)} y1={g.padT} y2={g.height - g.padB} />}
+        {nowH >= 0 && nowH <= CAMPAIGN_HOURS && <line className="now" x1={xOf(g, nowH)} x2={xOf(g, nowH)} y1={g.padT} y2={g.height - g.padB} />}
       </svg>
       <figcaption>
         <span className="lg target">— mathematical requirement, not a trading forecast</span>
@@ -165,5 +180,40 @@ function CampaignChart({ c, startMs, serverNow }: { c: Campaign; startMs: number
         <span className="muted">log scale · times IST · {pts.length === 0 ? "no verified equity samples yet" : `${pts.length} verified samples`}</span>
       </figcaption>
     </figure>
+  );
+}
+
+/** All 24 hourly checkpoints (00:00 … 23:00 IST): required vs verified equity. Display only. */
+function CheckpointTable({ c }: { c: Campaign }) {
+  return (
+    <details className="campaign-checkpoints" open>
+      <summary>
+        {c.milestones.length} hourly checkpoints · required (mathematical, not a forecast) vs verified equity
+      </summary>
+      <table>
+        <thead>
+          <tr>
+            <th>time (IST)</th>
+            <th>required</th>
+            <th>verified actual</th>
+            <th>actual − required</th>
+          </tr>
+        </thead>
+        <tbody>
+          {c.milestones.map((m) => {
+            const req = n(m.required_inr);
+            const act = n(m.actual_inr);
+            return (
+              <tr key={m.hour}>
+                <td>{istHourMinute(Date.parse(m.at))}</td>
+                <td>{inr(m.required_inr)}</td>
+                <td>{act === null ? DASH : inr(act)}</td>
+                <td>{act === null || req === null ? DASH : inr(act - req, true)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </details>
   );
 }

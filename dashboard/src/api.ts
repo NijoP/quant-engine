@@ -202,7 +202,7 @@ export interface CampaignMilestone {
   hour: number;
   /** ISO timestamp of the checkpoint. */
   at: string;
-  /** Mathematical requirement 100 × 500^(hour/22), as the desk rounds it. */
+  /** Mathematical requirement 101.45 × (50000/101.45)^(hour/23), as the desk rounds it. */
   required_inr: string;
   /** Verified equity recorded at the checkpoint; null if not reached yet or not recorded. */
   actual_inr: string | null;
@@ -212,7 +212,15 @@ export type CampaignStatus = "ahead" | "on_track" | "behind" | "stopped" | "comp
 
 export interface Campaign {
   start: string;
+  /** First instant campaign entries may be evaluated (01:00 IST); older desks omit it. */
+  first_entry?: string;
   deadline: string;
+  /** Campaign length in hours (23). */
+  duration_hours?: number;
+  /** True between 01:00 and 23:00 IST (permits evaluation; never forces a trade). */
+  entry_window_open?: boolean;
+  /** Constant hourly multiplier of the schedule, as the desk computes it. */
+  hourly_multiplier?: number;
   start_equity_inr: string;
   target_inr: string;
   /** Verified equity; null when the desk cannot verify it. */

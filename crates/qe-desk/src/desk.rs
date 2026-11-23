@@ -2961,7 +2961,7 @@ pub fn live_json() -> Value {
 }
 
 /// Scheduled reports: 20:00 paper, hourly while trading toward the single INR 50,000
-/// target, final at the 22:00 IST final checkpoint (then the plan completes). Written as
+/// target, final at the 23:00 IST final checkpoint (then the plan completes). Written as
 /// markdown under `<data dir>/reports/`.
 pub fn report_tick(d: &mut Desk, now: i64) {
     use qe_engine::report::ReportKind as K;
@@ -3432,6 +3432,31 @@ pub fn campaign_cfg(s: &Settings) -> CampaignConfig {
     }
 }
 
+/// Campaign configuration validation (23-hour schedule): the capital plan must
+/// end at the 23:00 IST campaign deadline. A config still carrying the
+/// SUPERSEDED 22:00 IST deadline (or any other end) is refused at start-up.
+pub fn validate_campaign_schedule(s: &Settings) -> Result<(), String> {
+    use qe_engine::campaign::{CAMPAIGN_DEADLINE_MS, SUPERSEDED_22H_DEADLINE_MS};
+    for (k, v) in [
+        ("stage1_checkpoint_ms", s.stage1_checkpoint_ms),
+        ("stage2_deadline_ms", s.stage2_deadline_ms),
+    ] {
+        if v == SUPERSEDED_22H_DEADLINE_MS {
+            return Err(format!(
+                "configs/risk-limits.toml {k} = {v} is the SUPERSEDED 22:00 IST deadline; \
+                 the 23-hour campaign ends at 23:00 IST ({CAMPAIGN_DEADLINE_MS})"
+            ));
+        }
+        if v != CAMPAIGN_DEADLINE_MS {
+            return Err(format!(
+                "configs/risk-limits.toml {k} = {v} is not the 23:00 IST campaign deadline \
+                 {CAMPAIGN_DEADLINE_MS}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn load_campaign(d: &mut Desk) {
     let cfg = campaign_cfg(&d.settings);
     let src = if crate::live_exec::live_installed() {
@@ -3458,7 +3483,7 @@ pub fn load_campaign(d: &mut Desk) {
     }
 }
 
-/// Feed the campaign the current equity, run the 22:00 IST deadline workflow,
+/// Feed the campaign the current equity, run the 23:00 IST deadline workflow,
 /// audit every campaign event and persist the state.
 pub fn campaign_tick(d: &mut Desk, now: i64) {
     let live = crate::live_exec::live_installed();
@@ -3470,7 +3495,9 @@ pub fn campaign_tick(d: &mut Desk, now: i64) {
     } else {
         (Some(d.cap.equity), EquitySource::Paper)
     };
-    let realised = d.cap.equity - d.campaign.cfg.start_equity;
+    // paper ledger P&L against the paper start (never against E0, which is the
+    // live measurement baseline)
+    let realised = d.cap.equity - dec(d.settings.paper_start_equity_inr);
     let unreal = dec(d.unrealized());
     d.campaign.observe(now, eq, src, realised, unreal);
     if d.campaign.is_stopped() && !d.controls.entries_paused {
@@ -3495,7 +3522,7 @@ pub fn campaign_tick(d: &mut Desk, now: i64) {
             };
             d.campaign
                 .record_step(now, DeadlineStep::CancelEntryOrders, !live, cancel.into());
-            let n = flatten(d, "campaign deadline 22:00 IST");
+            let n = flatten(d, "campaign deadline 23:00 IST");
             let fl = if live {
                 "live close path NOT verified: owner alerted, flatten via the validated owner procedure"
                     .to_string()
@@ -3507,7 +3534,7 @@ pub fn campaign_tick(d: &mut Desk, now: i64) {
             if live {
                 d.incident(
                     "campaign",
-                    "22:00 IST deadline: live close path not verified; entries stopped, OWNER must flatten and reconcile".into(),
+                    "23:00 IST deadline: live close path not verified; entries stopped, OWNER must flatten and reconcile".into(),
                 );
             }
         }
@@ -3542,7 +3569,7 @@ pub fn campaign_tick(d: &mut Desk, now: i64) {
                 true,
                 "paper ledger flat".into(),
             );
-            let realised = d.cap.equity - d.campaign.cfg.start_equity;
+            let realised = d.cap.equity - dec(d.settings.paper_start_equity_inr);
             d.campaign.observe(
                 now,
                 Some(d.cap.equity),
@@ -3634,9 +3661,69 @@ mod campaign_tests {
         assert_eq!(j["floor_inr"], "95");
         assert_eq!(j["loss_budget_inr"], "5");
         assert_eq!(j["per_trade_max_loss_inr"], "1");
-        assert_eq!(j["deadline"], "2026-11-24T22:00:00+05:30");
-        assert_eq!(j["milestones"].as_array().unwrap().len(), 23);
+        assert_eq!(j["deadline"], "2026-11-24T23:00:00+05:30");
+        assert_eq!(j["first_entry"], "2026-11-24T01:00:00+05:30");
+        assert_eq!(j["start_equity_inr"], "101.45");
+        assert_eq!(j["milestones"].as_array().unwrap().len(), 24);
+        assert_eq!(j["milestones"][23]["required_inr"], "50000");
+        assert_eq!(j["entry_window_open"], false);
         assert_eq!(j["equity_source"], "paper");
+    }
+
+    #[test]
+    fn campaign_schedule_validation_refuses_the_22_hour_deadline() {
+        use qe_engine::campaign::{CAMPAIGN_DEADLINE_MS, SUPERSEDED_22H_DEADLINE_MS};
+        let mut s = Settings::default();
+        assert_eq!(s.stage2_deadline_ms, CAMPAIGN_DEADLINE_MS);
+        assert!(validate_campaign_schedule(&s).is_ok());
+        s.stage2_deadline_ms = SUPERSEDED_22H_DEADLINE_MS;
+        let e = validate_campaign_schedule(&s).unwrap_err();
+        assert!(e.contains("SUPERSEDED 22:00"), "{e}");
+        s.stage2_deadline_ms = CAMPAIGN_DEADLINE_MS + 1;
+        assert!(validate_campaign_schedule(&s).is_err());
+        // the shipped configs carry the 23:00 IST deadline and unchanged risk limits
+        let rl: toml::Table = include_str!("../../../configs/risk-limits.toml")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            rl["stage2_deadline_ms"].as_integer(),
+            Some(CAMPAIGN_DEADLINE_MS)
+        );
+        assert_eq!(
+            rl["stage1_checkpoint_ms"].as_integer(),
+            Some(CAMPAIGN_DEADLINE_MS)
+        );
+        let c: toml::Table = include_str!("../../../configs/campaign-24nov.toml")
+            .parse()
+            .unwrap();
+        let sch = c["schedule"].as_table().unwrap();
+        assert_eq!(sch["hours"].as_integer(), Some(23));
+        assert_eq!(sch["deadline"].as_str(), Some("2026-11-24T23:00:00+05:30"));
+        assert_eq!(
+            sch["first_entry"].as_str(),
+            Some("2026-11-24T01:00:00+05:30")
+        );
+        assert_eq!(sch["start_equity_inr"].as_str(), Some("101.45"));
+        let r = c["risk"].as_table().unwrap();
+        assert_eq!(r["floor_inr"].as_str(), Some("95"));
+        assert_eq!(r["per_trade_max_loss_inr"].as_str(), Some("1"));
+        assert_eq!(r["campaign_loss_budget_inr"].as_str(), Some("5"));
+        assert_eq!(r["max_hold_ms"].as_integer(), Some(120_000));
+        assert_eq!(r["max_open_positions"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn simulation_horizons_end_at_23_00_ist() {
+        use qe_engine::campaign::{CAMPAIGN_DEADLINE_MS, CAMPAIGN_START_MS, HOUR_MS};
+        let d = Desk::new(Settings::default());
+        let now = CAMPAIGN_START_MS + 2 * HOUR_MS;
+        // the capital plan (target_json / Monte Carlo / gamble odds) uses 23:00
+        let (_, dl) = d.cap.target();
+        assert_eq!(dl as i64, CAMPAIGN_DEADLINE_MS);
+        let req = d.cap.required(now as u64);
+        assert!((req.hours - 21.0).abs() < 1e-9, "{}", req.hours);
+        let hours = (d.settings.stage2_deadline_ms - now) as f64 / 3.6e6;
+        assert!((hours - 21.0).abs() < 1e-9);
     }
 
     #[test]

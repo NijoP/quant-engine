@@ -6,7 +6,9 @@
 # The protective INR 1 / INR 5 alternative is configs/campaign-24nov.toml (desk default).
 #
 # Stake: each bet's margin is sized so ONE take-profit win (net of round-trip
-# cost) lifts equity to the NEXT hourly milestone (100 * 500^(h/22)), capped by
+# cost) lifts equity to the NEXT hourly milestone (101.45 * (50000/101.45)^(h/23),
+# 23-hour schedule 00:00-23:00 IST, first entry 01:00 IST; the 22-hour
+# 100 * 500^(h/22) curve is SUPERSEDED), capped by
 # the equity above floor_inr. There is NO proven edge: each bet's expected value
 # after costs is usually negative, and a run of stops ends at the floor.
 # Kept, never removed: exchange SL + TP on every entry (flatten if protection is

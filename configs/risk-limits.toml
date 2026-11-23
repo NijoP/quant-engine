@@ -6,11 +6,12 @@ paper_start_equity_inr = 100.0
 paper_slippage_bps = 2.0
 # Stage 0 paper until 2026-11-23 20:00 IST
 stage0_end_ms = 1795444200000
-# Single target (owner, 2026-11-23): INR 50,000 by 2026-11-24 22:00 IST (24 Nov campaign; was 17:00), computed from
+# Single target: INR 50,000 by 2026-11-24 23:00 IST (23-hour campaign update, 24 Nov 2026; the
+# 22:00 IST deadline 1795537800000 is SUPERSEDED; earlier 17:00), computed from
 # actual equity. The former INR 3,000 / 22:30 IST stage and INR 2,000 withdrawal
-# checkpoint are removed; the trading stage runs to the 22:00 IST final checkpoint.
+# checkpoint are removed; the trading stage runs to the 23:00 IST final checkpoint.
 stage1_target_inr = 50000.0
-stage1_checkpoint_ms = 1795537800000
+stage1_checkpoint_ms = 1795541400000
 withdrawal_inr = 0.0
 stage2_target_inr = 50000.0
-stage2_deadline_ms = 1795537800000
+stage2_deadline_ms = 1795541400000

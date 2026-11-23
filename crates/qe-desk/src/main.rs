@@ -267,6 +267,7 @@ fn load_settings() -> anyhow::Result<Settings> {
             }
         }
     }
+    desk::validate_campaign_schedule(&st).map_err(|e| anyhow::anyhow!(e))?;
     Ok(st)
 }
 

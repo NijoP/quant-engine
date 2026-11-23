@@ -1,21 +1,27 @@
 // Pure helpers for the 24 NOVEMBER CAMPAIGN panel. No React, no fetching: unit-tested in campaign-math.test.ts.
 // The desk owns the campaign state; these helpers only format it and draw the reference curve.
 
-export const CAMPAIGN_HOURS = 22;
+/** 23-hour campaign: 00:00 → 23:00 IST on 24 Nov 2026 (the 22-hour schedule is superseded). */
+export const CAMPAIGN_HOURS = 23;
+/** E0: last verified real-account read before the campaign (immutable measurement baseline). */
+export const CAMPAIGN_START_EQUITY = 101.45;
+export const CAMPAIGN_TARGET = 50000;
+/** Hour index at which campaign entries may first be evaluated (01:00 IST). */
+export const FIRST_ENTRY_HOUR = 1;
 export const IST_TZ = "Asia/Kolkata";
 
 /**
  * Mathematical requirement, not a trading forecast: start × (target/start)^(h/hours).
- * With the campaign's ₹100 → ₹50,000 over 22 h this is 100 × 500^(h/22), ≈ +32.6418% per hour.
+ * With the campaign's ₹101.45 → ₹50,000 over 23 h this is 101.45 × (50000/101.45)^(h/23), ≈ +30.9407% per hour.
  * `h` is elapsed hours (fractional allowed), clamped to [0, hours].
  */
-export function requiredEquity(h: number, start = 100, target = 50000, hours = CAMPAIGN_HOURS): number {
+export function requiredEquity(h: number, start = CAMPAIGN_START_EQUITY, target = CAMPAIGN_TARGET, hours = CAMPAIGN_HOURS): number {
   const x = Math.min(hours, Math.max(0, h));
   return start * Math.pow(target / start, x / hours);
 }
 
 /** Hourly multiplier of the schedule: (target/start)^(1/hours). */
-export function hourlyMultiplier(start = 100, target = 50000, hours = CAMPAIGN_HOURS): number {
+export function hourlyMultiplier(start = CAMPAIGN_START_EQUITY, target = CAMPAIGN_TARGET, hours = CAMPAIGN_HOURS): number {
   return Math.pow(target / start, 1 / hours);
 }
 
@@ -37,7 +43,7 @@ export function inr(v: string | number | null | undefined, signed = false): stri
   return signed && x > 0 ? "+" + s : s;
 }
 
-/** Fraction (0.326418) as percent with `d` decimals (32.6418%). */
+/** Fraction (0.309407) as percent with `d` decimals (30.9407%). */
 export function pct(v: number | null | undefined, d = 2): string {
   return typeof v === "number" && Number.isFinite(v) ? (v * 100).toFixed(d) + "%" : DASH;
 }
@@ -52,7 +58,7 @@ export function duration(secs: number | null | undefined): string {
   return `${h}h ${String(m).padStart(2, "0")}m ${String(s % 60).padStart(2, "0")}s`;
 }
 
-/** Wall-clock in IST regardless of the viewer's timezone, e.g. "24 Nov 2026, 22:00:00 IST". */
+/** Wall-clock in IST regardless of the viewer's timezone, e.g. "24 Nov 2026, 23:00:00 IST". */
 export function istDateTime(ms: number): string {
   if (!Number.isFinite(ms)) return DASH;
   const s = new Intl.DateTimeFormat("en-GB", {
