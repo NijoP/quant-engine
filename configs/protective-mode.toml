@@ -1,0 +1,12 @@
+# Protective mode (Stage 2). Hard ceilings.
+mode = "Protective"
+risk_fraction = 0.005
+max_session_loss_fraction = 0.02
+max_drawdown_from_hwm = 0.02
+loss_step_down = 0.5
+min_expected_net_edge = 0.0
+max_open_positions = 1
+liquidation_buffer = 2.0
+exit_lead_ms = 3000
+entry_ack_timeout_ms = 2000
+exit_ack_timeout_ms = 2000
