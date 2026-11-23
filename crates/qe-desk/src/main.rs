@@ -371,12 +371,14 @@ async fn meta_loop(c: PublicClient, s: S) {
                                 && d.meta_fail.get(&k).is_none_or(|x| now - x.0 > 600_000)
                         })
                         .collect();
-                    all.sort();
+                    // INR-margined (tradable by the INR paper account) first
+                    all.sort_by(|a, b| {
+                        (a.1 != TRADE_MARGIN, &a.0).cmp(&(b.1 != TRADE_MARGIN, &b.0))
+                    });
                     if all.is_empty() {
                         None
                     } else {
-                        d.meta_cursor = (d.meta_cursor + 1) % all.len();
-                        Some(all[d.meta_cursor].clone())
+                        Some(all[0].clone())
                     }
                 }
             }

@@ -322,8 +322,8 @@ function OpportunitiesPanel({ rows }: { rows: Opportunity[] }) {
                   <td className="r">{bps(o.ev_gross_bps)}</td>
                   <td className="r">{bps(o.cost_bps)}</td>
                   <td className={"r " + sign(o.ev_net_bps)}>{bps(o.ev_net_bps)}</td>
-                  <td className="r">{pct(o.tp_pct, 3)}</td>
-                  <td className="r">{pct(o.sl_pct, 3)}</td>
+                  <td className="r">{num(o.tp_pct, 3)}%</td>
+                  <td className="r">{num(o.sl_pct, 3)}%</td>
                   <td className="r">{o.horizon_s}s</td>
                   <td className="r">{qty(o.qty)}</td>
                   <td className="r">{money(o.notional)}</td>
