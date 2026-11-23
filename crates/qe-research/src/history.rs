@@ -191,3 +191,37 @@ pub fn load(dir: &Path, pair: &str, res: &str) -> Result<Vec<Candle>> {
     let h: Vec<HCandle> = serde_json::from_slice(&b)?;
     Ok(h.iter().map(HCandle::to_math).collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qe_math::timeframe::MS_PER_DAY;
+
+    #[test]
+    fn store_roundtrip_and_completeness() {
+        let raw = |t: i64| qe_coindcx::types::Candle {
+            open: 1.0,
+            high: 2.0,
+            low: 0.5,
+            close: 1.5,
+            volume: 3.0,
+            time: t,
+        };
+        // two completed days on a 2d boundary, then today's incomplete candle
+        let mut v: Vec<Candle> = [0, MS_PER_DAY, 2 * MS_PER_DAY]
+            .iter()
+            .map(|&t| to_candle(&raw(t), MS_PER_DAY))
+            .collect();
+        mark_completeness(&mut v, 2 * MS_PER_DAY + 1);
+        assert_eq!(v.iter().filter(|c| c.complete).count(), 2);
+        let d2 = aggregate_2d(&v);
+        assert_eq!(d2.len(), 1);
+        assert_eq!(d2[0].width_ms, 2 * MS_PER_DAY);
+        let d = std::env::temp_dir().join(format!("qe-hist-test-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("B-X_USDT")).unwrap();
+        save(&d.join("B-X_USDT").join("1D.json"), &v).unwrap();
+        let back = load(&d, "B-X_USDT", "1D").unwrap();
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(back, v);
+    }
+}

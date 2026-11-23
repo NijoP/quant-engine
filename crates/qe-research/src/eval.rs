@@ -635,6 +635,50 @@ mod tests {
     }
 
     #[test]
+    fn loads_store_and_rejects_bad_records() {
+        let d = std::env::temp_dir().join(format!("qe-research-test-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("rt.jsonl"),
+            concat!(
+                r#"{"recv_ms":2,"ts":1000,"vs":1,"p":{"B-X_USDT":[100.0,100.0,5.0]}}"#,
+                "\n",
+                r#"{"recv_ms":3,"ts":1000,"vs":1,"p":{"B-X_USDT":[101.0,100.0,5.0]}}"#,
+                "\n",
+                r#"{"recv_ms":4,"ts":2000,"vs":2,"p":{"B-X_USDT":[102.0,null,5.0]}}"#,
+                "\n",
+                r#"{"recv_ms":5,"ts":3000,"p":{"B-X_US"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("books.jsonl"),
+            concat!(
+                r#"{"pair":"B-X_USDT","ts":1500,"bids":[[99.0,3.0]],"asks":[[101.0,1.0]]}"#,
+                "\n",
+                r#"{"pair":"B-X_USDT","ts":1600,"bids":[[102.0,3.0]],"asks":[[101.0,1.0]]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("instruments.jsonl"),
+            r#"{"instrument":{"pair":"B-X_USDT","taker_fee":0.05}}"#,
+        )
+        .unwrap();
+        let r = load_recording(&d).unwrap();
+        std::fs::remove_dir_all(&d).unwrap();
+        // duplicate exchange ts keeps the first; truncated last line skipped
+        assert_eq!(r.rt["B-X_USDT"], vec![(1000, 100.0), (2000, 102.0)]);
+        assert_eq!(r.rt_polls, 3);
+        // crossed book (bid >= ask) dropped
+        assert_eq!(r.books["B-X_USDT"].len(), 1);
+        assert!((r.books["B-X_USDT"][0].1 - 0.5).abs() < 1e-12);
+        assert!((r.books["B-X_USDT"][0].2 - 0.02).abs() < 1e-12);
+        assert!((r.fees["B-X_USDT"] - 0.0005).abs() < 1e-15);
+    }
+
+    #[test]
     fn rt_replay_uses_no_future_data() {
         // flat history then a jump after t: the forecast at t must not see it
         let mut rt = HashMap::new();
