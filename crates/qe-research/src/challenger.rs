@@ -328,7 +328,7 @@ const BRACKET_TARGETS: [&str; 4] = [
 ];
 
 fn bracket_y(o: &[(Outcome, f64); 2], k: usize) -> bool {
-    let want = if k % 2 == 0 {
+    let want = if k.is_multiple_of(2) {
         Outcome::Target
     } else {
         Outcome::Stop
@@ -477,8 +477,7 @@ fn oos(
     bounds: &[i64],
 ) -> Vec<(usize, f64, f64, bool)> {
     let mut out = vec![];
-    for k in 1..folds {
-        let start = bounds[k];
+    for (k, &start) in bounds.iter().enumerate().take(folds).skip(1) {
         let tr: Vec<usize> = (0..rows.len())
             .filter(|&i| {
                 rows[i].fold < k
@@ -611,8 +610,8 @@ fn trade(
     bounds: &[i64],
 ) -> BTreeMap<usize, Vec<f64>> {
     let mut out: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
-    for k in 1..folds {
-        let m = train_moments(rows, c, k, bounds[k]);
+    for (k, &start) in bounds.iter().enumerate().take(folds).skip(1) {
+        let m = train_moments(rows, c, k, start);
         if m.iter().any(|x| !x.0.is_finite()) {
             continue;
         }
@@ -1038,9 +1037,9 @@ mod tests {
     #[test]
     fn trading_gate_rejects_negative_or_thin_results() {
         let mut m = BTreeMap::new();
-        m.insert(1, vec![5.0, 6.0, 4.0, 5.5].repeat(10));
-        m.insert(2, vec![-1.0, -0.5].repeat(20));
-        m.insert(3, vec![2.0, 3.0].repeat(20));
+        m.insert(1, [5.0, 6.0, 4.0, 5.5].repeat(10));
+        m.insert(2, [-1.0, -0.5].repeat(20));
+        m.insert(3, [2.0, 3.0].repeat(20));
         assert!(trading_failures(&summarize(&m)).is_empty());
         m.insert(2, vec![-20.0; 40]);
         let f = trading_failures(&summarize(&m));

@@ -88,7 +88,7 @@ Data:
   futures pairs and 5 916 depth-20 books on the 10 most liquid USDT pairs.
 * 7 days of completed 1m candles for the 30 most liquid USDT pairs.
 
-The full machine-readable report is `crates/qe-research/calibration.json`, which s2-desk loads.
+The committed `crates/qe-research/calibration.json` was regenerated in sprint 3 from the 30.6-minute recording of 18:50–19:21 IST and 5 days of 1m history on 20 pairs (see the sprint 3 section). The tables below are the sprint 2 run.
 Reproduce it with `qe-research evaluate --rec <store> --hist <store> --out calibration.json`.
 
 **Headline (honest):**
@@ -197,11 +197,182 @@ With measured cost: n=100171, mean round-trip cost 13.41 bps, mean TP 17.75 bps 
 | 2.0 | 58 | 6.92 | -24.10 | 0.362 | -1398.0 | 1398.0 |
 
 
+## Sprint 3: champion/challenger results (2026-11-23, 18:50–19:21 IST)
+
+Reproduce with `qe-research record --out REC --minutes 34 --focus 8`, then
+`qe-research challenge --rec REC --out crates/qe-research/models.json --stride 2`.
+s3-learn and s3-desk load the registry through `qe_research::registry::ModelRegistry`.
+A missing file means the champion only and nothing promotable.
+
+**Headline (honest):**
+1. **No challenger has an edge after costs, and none is promotable.** Every model loses
+   money out of sample in every cost scenario, including the optimistic maker/maker bound
+   (2 × 0.0236 % fee, no spread, perfect passive fills).
+   * The nested parameter search over k_s, k_t and the EV threshold took no trade in any
+     fold: the best past cell never had positive net. It abstained, as designed.
+   * The fixed champion bracket at EV > 0 realised −9.5 to −13.1 bps per trade with
+     taker costs. Only 0–12 trades passed the filter, too few to measure anything except
+     the sign.
+2. **The order-flow logistic (`logit.flow.v2`) is worse than climatology** on every target
+   (Brier skill −0.07 to −0.62). It overfits on about 6-minute folds whose regime keeps
+   shifting.
+3. **The conditional-historical cells (`cond.flow.v2`) come closest:** Brier skill +0.009
+   to +0.011 on three of the four bracket targets. That is still below the 0.01 gate on
+   most targets and not consistent across folds (2–3 of 4). The ECE of 0.10–0.22 on the SL
+   targets fails, so it is not calibrated.
+4. **Isotonic and Platt recalibration of the champion bring no skill on this sample**
+   (skill −0.002 to −0.015). The training-fold base rate does not carry over: the session
+   drifted down, so SL-first for longs was realised at 0.39 against 0.19 for shorts.
+5. **The champion's large positive "skill" on some targets is an artifact.** It shows up
+   on `sl_first_long`, `tp_first_short` and `up_120s` (+0.17 to +0.22) only because the
+   climatology reference comes from earlier folds whose base rate differed. Its ECE is
+   0.05–0.14, it is positive in only 1–3 of 4 folds, and the same sample loses money.
+   It is not evidence of edge.
+6. **The champion on the larger datasets (`evaluate`, refreshed below) stays `calibrating`
+   on all 32 entries.** On 5 days × 20 pairs of 1m history, EV>0 selections at 1× cost
+   realise −13.05 bps per trade against +4.58 bps predicted. The forecast still overstates
+   EV and costs about 13 bps per round trip.
+7. Consequence: **the registry champion stays `desk.fp.v1`, with rollback `desk.fp.v1`
+   and nothing promotable.** The desk must keep withholding strategy authority. The target
+   controller must not treat any forecast here as an edge.
+
+### Promotion criteria (fixed before the run, also stored in `models.json`)
+* calibration, each of tp_first_{long,short} and sl_first_{long,short} at the champion bracket (k_s=1.0, k_t=1.5): n_oos >= 1000 over >= 3 OOS folds
+* calibration: ECE (10 bins) <= 0.03 and Brier skill vs training-fold climatology >= 0.01, skill > 0 in >= 2/3 of OOS folds
+* trading under the taker_taker cost (2 x taker fee + spread + 2 x 1 bp), one bracket per pair at a time: n_trades >= 100
+* trading: mean realised net > 0 bps with t-stat >= 2, and positive net in >= 2/3 of >= 3 OOS folds
+* challengers with a parameter search are judged on the nested walk-forward result (config for fold k chosen on folds < k), never on the best grid cell
+* maker_taker and maker_maker results are reported but cannot promote: passive fills and adverse selection are not modelled
+
+### Results
+
+Data: 30.6 min live recording, 1554 RT polls, 4583 valid depth-20 books on 8 pairs, 22091 de-duplicated public trades; 4936 decision rows every 2.0 s (~82 non-overlapping 120 s windows); aggressor-sign agreement with the tick rule 0.933.
+
+#### Probability scores (OOS folds 1–4, champion bracket k_s = 1.0, k_t = 1.5)
+
+| model | target | n_oos | base rate | mean p | Brier | Brier clim | skill | ECE | log loss | folds skill>0 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `desk.fp.v1` | `sl_first_long` | 3928 | 0.392 | 0.359 | 0.2533 | 0.3210 | 0.2107 | 0.103 | 0.7092 | 1/4 |
+| `desk.fp.v1` | `sl_first_short` | 3928 | 0.191 | 0.327 | 0.1856 | 0.1682 | -0.1037 | 0.138 | 0.5567 | 1/4 |
+| `desk.fp.v1` | `tp_first_long` | 3928 | 0.090 | 0.142 | 0.0896 | 0.0814 | -0.1013 | 0.053 | 0.3246 | 1/4 |
+| `desk.fp.v1` | `tp_first_short` | 3928 | 0.226 | 0.164 | 0.1826 | 0.2201 | 0.1702 | 0.075 | 0.5767 | 3/4 |
+| `desk.fp.v1` | `up_10s` | 3288 | 0.454 | 0.495 | 0.2508 | 0.2514 | 0.0022 | 0.041 | 0.6948 | 2/4 |
+| `desk.fp.v1` | `up_120s` | 3548 | 0.365 | 0.482 | 0.2657 | 0.3354 | 0.2080 | 0.143 | 0.7301 | 2/4 |
+| `desk.fp.v1` | `up_30s` | 3517 | 0.441 | 0.490 | 0.2593 | 0.2626 | 0.0123 | 0.080 | 0.7125 | 2/4 |
+| `desk.fp.v1` | `up_60s` | 3562 | 0.399 | 0.486 | 0.2628 | 0.2868 | 0.0837 | 0.116 | 0.7208 | 2/4 |
+| `desk.fp.v1+iso` | `sl_first_long` | 3928 | 0.392 | 0.244 | 0.3224 | 0.3210 | -0.0044 | 0.214 | 1.0471 | 1/4 |
+| `desk.fp.v1+iso` | `sl_first_short` | 3928 | 0.191 | 0.283 | 0.1705 | 0.1682 | -0.0140 | 0.095 | 0.5268 | 1/4 |
+| `desk.fp.v1+iso` | `tp_first_long` | 3928 | 0.090 | 0.106 | 0.0818 | 0.0814 | -0.0052 | 0.016 | 0.3001 | 1/4 |
+| `desk.fp.v1+iso` | `tp_first_short` | 3928 | 0.226 | 0.154 | 0.2234 | 0.2201 | -0.0149 | 0.185 | 1.3271 | 2/4 |
+| `desk.fp.v1+iso` | `up_10s` | 3288 | 0.454 | 0.500 | 0.2524 | 0.2514 | -0.0043 | 0.060 | 0.6981 | 2/4 |
+| `desk.fp.v1+iso` | `up_120s` | 3548 | 0.365 | 0.610 | 0.3391 | 0.3354 | -0.0110 | 0.245 | 0.9049 | 2/4 |
+| `desk.fp.v1+iso` | `up_30s` | 3517 | 0.441 | 0.517 | 0.2662 | 0.2626 | -0.0138 | 0.152 | 0.7260 | 1/4 |
+| `desk.fp.v1+iso` | `up_60s` | 3562 | 0.399 | 0.548 | 0.2888 | 0.2868 | -0.0070 | 0.185 | 0.7741 | 2/4 |
+| `desk.fp.v1+platt` | `sl_first_long` | 3928 | 0.392 | 0.242 | 0.3224 | 0.3210 | -0.0045 | 0.257 | 1.0161 | 2/4 |
+| `desk.fp.v1+platt` | `sl_first_short` | 3928 | 0.191 | 0.285 | 0.1704 | 0.1682 | -0.0134 | 0.093 | 0.5265 | 1/4 |
+| `desk.fp.v1+platt` | `tp_first_long` | 3928 | 0.090 | 0.106 | 0.0815 | 0.0814 | -0.0020 | 0.016 | 0.2975 | 1/4 |
+| `desk.fp.v1+platt` | `tp_first_short` | 3928 | 0.226 | 0.153 | 0.2221 | 0.2201 | -0.0092 | 0.186 | 1.1478 | 1/4 |
+| `desk.fp.v1+platt` | `up_10s` | 3288 | 0.454 | 0.502 | 0.2544 | 0.2514 | -0.0121 | 0.052 | 0.7020 | 1/4 |
+| `desk.fp.v1+platt` | `up_120s` | 3548 | 0.365 | 0.601 | 0.3396 | 0.3354 | -0.0124 | 0.238 | 0.9010 | 2/4 |
+| `desk.fp.v1+platt` | `up_30s` | 3517 | 0.441 | 0.522 | 0.2676 | 0.2626 | -0.0193 | 0.137 | 0.7296 | 1/4 |
+| `desk.fp.v1+platt` | `up_60s` | 3562 | 0.399 | 0.547 | 0.2919 | 0.2868 | -0.0179 | 0.209 | 0.7812 | 1/4 |
+| `logit.flow.v2` | `sl_first_long` | 3928 | 0.392 | 0.263 | 0.3448 | 0.3210 | -0.0742 | 0.262 | 2.0052 | 1/4 |
+| `logit.flow.v2` | `sl_first_short` | 3928 | 0.191 | 0.420 | 0.2732 | 0.1682 | -0.6245 | 0.228 | 0.8098 | 1/4 |
+| `logit.flow.v2` | `tp_first_long` | 3928 | 0.090 | 0.177 | 0.1157 | 0.0814 | -0.4223 | 0.087 | 0.3822 | 2/4 |
+| `logit.flow.v2` | `tp_first_short` | 3928 | 0.226 | 0.194 | 0.2403 | 0.2201 | -0.0918 | 0.231 | 1.4860 | 1/4 |
+| `logit.flow.v2` | `up_10s` | 3288 | 0.454 | 0.569 | 0.2879 | 0.2514 | -0.1455 | 0.130 | 0.8050 | 0/4 |
+| `logit.flow.v2` | `up_120s` | 3548 | 0.365 | 0.623 | 0.3958 | 0.3354 | -0.1799 | 0.264 | 1.5237 | 1/4 |
+| `logit.flow.v2` | `up_30s` | 3517 | 0.441 | 0.609 | 0.3333 | 0.2626 | -0.2694 | 0.209 | 1.0206 | 0/4 |
+| `logit.flow.v2` | `up_60s` | 3562 | 0.399 | 0.631 | 0.3734 | 0.2868 | -0.3018 | 0.251 | 1.3315 | 0/4 |
+| `cond.flow.v2` | `sl_first_long` | 3928 | 0.392 | 0.244 | 0.3180 | 0.3210 | 0.0092 | 0.221 | 1.0445 | 2/4 |
+| `cond.flow.v2` | `sl_first_short` | 3928 | 0.191 | 0.287 | 0.1665 | 0.1682 | 0.0099 | 0.096 | 0.5152 | 3/4 |
+| `cond.flow.v2` | `tp_first_long` | 3928 | 0.090 | 0.107 | 0.0805 | 0.0814 | 0.0106 | 0.016 | 0.2907 | 2/4 |
+| `cond.flow.v2` | `tp_first_short` | 3928 | 0.226 | 0.154 | 0.2209 | 0.2201 | -0.0037 | 0.191 | 1.2301 | 2/4 |
+| `cond.flow.v2` | `up_10s` | 3288 | 0.454 | 0.500 | 0.2526 | 0.2514 | -0.0049 | 0.058 | 0.6985 | 2/4 |
+| `cond.flow.v2` | `up_120s` | 3548 | 0.365 | 0.602 | 0.3295 | 0.3354 | 0.0178 | 0.238 | 0.8957 | 3/4 |
+| `cond.flow.v2` | `up_30s` | 3517 | 0.441 | 0.519 | 0.2661 | 0.2626 | -0.0133 | 0.101 | 0.7272 | 1/4 |
+| `cond.flow.v2` | `up_60s` | 3562 | 0.399 | 0.549 | 0.2904 | 0.2868 | -0.0125 | 0.183 | 0.7859 | 1/4 |
+
+#### Trading after costs (bps of notional per trade, one bracket per pair at a time)
+
+| model | scenario | basis | trades | mean net | t-stat | win rate | sum net | folds + |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| `desk.fp.v1` | maker_maker | fixed k_s=1, k_t=1.5, EV>0 | 41 | -3.81 | -2.20 | 0.390 | -156.3 | 1/4 |
+| `desk.fp.v1` | maker_taker | fixed k_s=1, k_t=1.5, EV>0 | 8 | -5.18 | -1.25 | 0.125 | -41.4 | 1/3 |
+| `desk.fp.v1` | taker_taker | fixed k_s=1, k_t=1.5, EV>0 | 1 | -9.57 | — | 0.000 | -9.6 | 0/1 |
+| `desk.fp.v1+iso` | maker_maker | fixed k_s=1, k_t=1.5, EV>0 | 28 | -9.53 | -5.88 | 0.143 | -266.9 | 2/4 |
+| `desk.fp.v1+iso` | maker_taker | fixed k_s=1, k_t=1.5, EV>0 | 8 | -9.85 | -2.30 | 0.250 | -78.8 | 0/2 |
+| `desk.fp.v1+iso` | taker_taker | fixed k_s=1, k_t=1.5, EV>0 | 2 | -9.48 | -3.72 | 0.000 | -19.0 | 0/1 |
+| `desk.fp.v1+platt` | maker_maker | fixed k_s=1, k_t=1.5, EV>0 | 13 | -13.04 | -5.00 | 0.077 | -169.5 | 0/3 |
+| `desk.fp.v1+platt` | maker_taker | fixed k_s=1, k_t=1.5, EV>0 | 3 | -8.41 | -4.60 | 0.000 | -25.2 | 0/1 |
+| `desk.fp.v1+platt` | taker_taker | fixed k_s=1, k_t=1.5, EV>0 | 0 | — | — | — | -0.0 | 0/0 |
+| `logit.flow.v2` | maker_maker | fixed k_s=1, k_t=1.5, EV>0 | 46 | -6.96 | -4.53 | 0.217 | -320.0 | 1/4 |
+| `logit.flow.v2` | maker_maker | nested search | 0 | — | — | — | -0.0 | 0/0 |
+| `logit.flow.v2` | maker_taker | fixed k_s=1, k_t=1.5, EV>0 | 19 | -10.27 | -3.44 | 0.211 | -195.1 | 0/3 |
+| `logit.flow.v2` | maker_taker | nested search | 0 | — | — | — | -0.0 | 0/0 |
+| `logit.flow.v2` | taker_taker | fixed k_s=1, k_t=1.5, EV>0 | 12 | -13.12 | -3.08 | 0.250 | -157.5 | 0/3 |
+| `logit.flow.v2` | taker_taker | nested search | 0 | — | — | — | -0.0 | 0/0 |
+| `cond.flow.v2` | maker_maker | fixed k_s=1, k_t=1.5, EV>0 | 16 | -10.26 | -4.88 | 0.062 | -164.1 | 0/4 |
+| `cond.flow.v2` | maker_maker | nested search | 0 | — | — | — | -0.0 | 0/0 |
+| `cond.flow.v2` | maker_taker | fixed k_s=1, k_t=1.5, EV>0 | 3 | -8.94 | -5.11 | 0.000 | -26.8 | 0/1 |
+| `cond.flow.v2` | maker_taker | nested search | 0 | — | — | — | -0.0 | 0/0 |
+| `cond.flow.v2` | taker_taker | fixed k_s=1, k_t=1.5, EV>0 | 2 | -11.82 | -132.74 | 0.000 | -23.6 | 0/1 |
+| `cond.flow.v2` | taker_taker | nested search | 0 | — | — | — | -0.0 | 0/0 |
+
+#### Best grid cells (selection-biased: shown only to bound what a search could find)
+
+| model | scenario | k_s | k_t | thr bps | trades | mean net | t-stat |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `logit.flow.v2` | maker_taker | 0.5 | 1.5 | 0.0 | 20 | -9.83 | -5.93 |
+| `logit.flow.v2` | maker_maker | 0.5 | 1.5 | 0.0 | 45 | -5.34 | -4.30 |
+
+#### Promotion decision
+
+Champion: `desk.fp.v1` (no challenger passed the predefined out-of-sample gates; the champion stays (it has no strategy authority unless qe-research calibration grants it)). Rollback: `desk.fp.v1`.
+
+* `desk.fp.v1` (champion): **not promotable**: 13 gate failures, e.g. tp_first_long: ECE 0.053 > 0.03; tp_first_long: Brier skill -0.1013 < 0.01; tp_first_long: skill > 0 in 1/4 folds
+* `desk.fp.v1+iso` (challenger): **not promotable**: 15 gate failures, e.g. tp_first_long: Brier skill -0.0052 < 0.01; tp_first_long: skill > 0 in 1/4 folds; sl_first_long: ECE 0.214 > 0.03
+* `desk.fp.v1+platt` (challenger): **not promotable**: 15 gate failures, e.g. tp_first_long: Brier skill -0.0020 < 0.01; tp_first_long: skill > 0 in 1/4 folds; sl_first_long: ECE 0.257 > 0.03
+* `logit.flow.v2` (challenger): **not promotable**: 16 gate failures, e.g. tp_first_long: ECE 0.087 > 0.03; tp_first_long: Brier skill -0.4223 < 0.01; tp_first_long: skill > 0 in 2/4 folds
+* `cond.flow.v2` (challenger): **not promotable**: 13 gate failures, e.g. tp_first_long: skill > 0 in 2/4 folds; sl_first_long: ECE 0.221 > 0.03; sl_first_long: Brier skill 0.0092 < 0.01
+
+#### Champion on the larger datasets (`qe-research evaluate`, refreshed)
+
+| model | target | n_oos | skill raw | skill recal | ECE raw | ECE recal | status |
+|---|---|---:|---:|---:|---:|---:|---|
+| `desk.fp.v1` | `tp_first_long` | 1888 | -0.1041 | -0.0060 | 0.055 | 0.018 | calibrating |
+| `desk.fp.v1` | `sl_first_long` | 1888 | 0.2199 | -0.0111 | 0.092 | 0.221 | calibrating |
+| `desk.fp.v1` | `tp_first_short` | 1888 | 0.1767 | -0.0097 | 0.072 | 0.186 | calibrating |
+| `desk.fp.v1` | `sl_first_short` | 1888 | -0.0969 | -0.0207 | 0.134 | 0.124 | calibrating |
+| `desk.fp.v1` | `up_60s` | 1716 | 0.0845 | -0.0251 | 0.100 | 0.185 | calibrating |
+| `desk.fp.v1` | `up_120s` | 1735 | 0.2250 | -0.0335 | 0.145 | 0.273 | calibrating |
+| `mom.fp.v1` | `tp_first_long` | 119180 | -0.2582 | -0.0105 | 0.103 | 0.061 | calibrating |
+| `mom.fp.v1` | `sl_first_long` | 119180 | -0.0126 | -0.0005 | 0.124 | 0.150 | calibrating |
+| `mom.fp.v1` | `tp_first_short` | 119180 | 0.0271 | 0.0027 | 0.059 | 0.065 | calibrating |
+| `mom.fp.v1` | `sl_first_short` | 119180 | -0.4466 | -0.0130 | 0.222 | 0.100 | calibrating |
+| `mom.fp.v1` | `up_60s` | 89649 | 0.0245 | -0.0030 | 0.107 | 0.145 | calibrating |
+| `mom.fp.v1` | `up_120s` | 96408 | 0.0513 | -0.0141 | 0.115 | 0.155 | calibrating |
+| `mom.fp.v1.1m` | `tp_first_long` | 114182 | -0.0375 | 0.0015 | 0.051 | 0.004 | calibrating |
+| `mom.fp.v1.1m` | `sl_first_long` | 114182 | -0.0756 | 0.0060 | 0.104 | 0.003 | calibrating |
+| `mom.fp.v1.1m` | `tp_first_short` | 114182 | -0.0286 | 0.0045 | 0.051 | 0.007 | calibrating |
+| `mom.fp.v1.1m` | `sl_first_short` | 114182 | -0.0807 | 0.0042 | 0.103 | 0.009 | calibrating |
+| `mom.fp.v1.1m` | `up_60s` | 104984 | -0.0320 | 0.0001 | 0.065 | 0.009 | calibrating |
+| `mom.fp.v1.1m` | `up_120s` | 107749 | -0.0603 | 0.0005 | 0.093 | 0.011 | calibrating |
+
+* `desk.fp.v1`: mean cost 13.14 bps; unconditional long gross -0.79 bps, short gross 0.81 bps; EV>0 at 1× cost: 15 trades, mean realised net -3.62 bps vs predicted 0.71 bps.
+* `mom.fp.v1`: mean cost 13.14 bps; unconditional long gross -0.79 bps, short gross 0.81 bps; EV>0 at 1× cost: 0 trades, mean realised net — bps vs predicted — bps.
+* `mom.fp.v1.1m`: mean cost 13.14 bps; unconditional long gross 0.01 bps, short gross 0.26 bps; EV>0 at 1× cost: 539 trades, mean realised net -13.05 bps vs predicted 4.58 bps.
+
+
 ## Not done / next
-* Trade-tape features (aggressor flow and intensity) are recorded but not yet scored.
+* Trade-tape features are now scored (sprint 3). The tape is still REST-polled, so it can
+  miss trades on busy pairs.
   The WebSocket feed (s2-ws) will replace 1 s RT polling for barrier monitoring.
-* No parameter search was run. The desk priors are scored as-is. Any (λ, γ, k_s, k_t)
-  search must use the same walk-forward split, so the search itself isn't fitted in-sample.
+* The k_s, k_t and threshold search now runs nested inside the walk-forward (sprint 3).
+  λ and γ are still not searched.
+* About 30 minutes on 8 pairs (~82 independent 120 s windows) cannot establish calibration.
+  Recording longer, from the WS feed, and running a paper-forward test are prerequisites
+  for any promotion.
 * XAU instrument metadata failed to decode (qe-coindcx type), so the default 0.059 % taker fee was used for it. PAXG metadata reports 0.0118 %.
 * Book-dependent results cover about 40 minutes of 10 pairs, which is far too short to
   claim calibration of `desk.fp.v1`. Keep recording.
