@@ -365,7 +365,11 @@ async fn meta_loop(c: PublicClient, s: S) {
                         .iter()
                         .map(|p| (p.clone(), "INR".to_string()))
                         .chain(d.fut_usdt.iter().map(|p| (p.clone(), "USDT".to_string())))
-                        .filter(|(p, m)| !d.instruments.contains_key(&format!("{p}|{m}")))
+                        .filter(|(p, m)| {
+                            let k = format!("{p}|{m}");
+                            !d.instruments.contains_key(&k)
+                                && d.meta_fail.get(&k).is_none_or(|x| now - x.0 > 600_000)
+                        })
                         .collect();
                     all.sort();
                     if all.is_empty() {
@@ -391,6 +395,7 @@ async fn meta_loop(c: PublicClient, s: S) {
                             d.audit("universe", format!("{p} {m} status/exit-only change"), ev);
                         }
                     }
+                    d.meta_fail.remove(&key);
                     d.instruments.insert(key, (now_ms(), i));
                     let n = d.instruments.len();
                     d.agent_ok(
@@ -401,6 +406,13 @@ async fn meta_loop(c: PublicClient, s: S) {
                 }
                 Err(e) => {
                     let mut d = s.write().await;
+                    let why = if e.to_string().contains("decode") {
+                        "response did not match the documented schema (e.g. null max leverage)"
+                            .to_string()
+                    } else {
+                        e.to_string()
+                    };
+                    d.meta_fail.insert(format!("{p}|{m}"), (now_ms(), why));
                     d.agent_err("metadata", t0, format!("{p} {m}: {e}"));
                 }
             }
@@ -652,6 +664,9 @@ async fn h_status(a: AxState<App>) -> Json<Value> {
 
 fn eligibility(d: &Desk, pair: &str, m: &str) -> (Option<bool>, String) {
     let Some((_, i)) = d.instruments.get(&format!("{pair}|{m}")) else {
+        if let Some((_, e)) = d.meta_fail.get(&format!("{pair}|{m}")) {
+            return (Some(false), format!("metadata unavailable: {e}"));
+        }
         return (None, "metadata not fetched yet".into());
     };
     if !i.is_tradable() {

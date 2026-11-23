@@ -6,25 +6,27 @@ or seconds where the field name ends in `_s`. Any numeric field may be `null` wh
 value is not yet computable (insufficient data); the UI must render `null` as "—".
 The desk serves `dashboard/dist` at `/` when it exists.
 
-Execution mode in this sprint is always `"paper"`. Live order submission is compiled and
-configured OFF; no endpoint can enable it.
+Execution mode in this sprint is always `"paper"`. The desk holds no private client and never
+reads credentials; no endpoint can enable live orders. `state.live` only *reports* the s2-live
+gate (`qe_coindcx::live::LiveGate`) and its checklist.
 
 ## GET endpoints
 
 | Path | Returns |
 |---|---|
 | `/api/state` | Aggregate snapshot used by the dashboard poll loop (shape below). |
-| `/api/status` | `state.health` + `state.mode` + `state.live_orders_enabled` + readiness flags. |
+| `/api/status` | `health`, `mode`, `live_orders_enabled` (always false), `live` (gate status + checklist), `readiness` flags, `calibration`, `controls`. |
+| `/api/calibration` | `Calibration` (forward calibration of P(TP before SL within 120 s); gates strategy authority). |
 | `/api/universe` | `{ "spot": [SpotMarket], "futures": [FuturesInstrument], "events": [UniverseEvent] }` |
 | `/api/scanner` | `[ScannerRow]` ranked by `score` (all tracked futures). |
 | `/api/opportunities` | `[Opportunity]` newest first. |
-| `/api/instrument/{pair}?margin=USDT\|INR` | `{ "instrument": FuturesInstrument, "features": ScannerRow, "forecast": Forecast\|null, "book": Book\|null }` |
-| `/api/instrument/{pair}/candles?resolution=1\|5\|15\|60\|1D&margin=USDT` | `[Candle]` (proxied + cached from CoinDCX candlesticks, completed candles only, `complete` flag). |
+| `/api/instrument/{pair}?margin=USDT\|INR` | `{ "instrument": FuturesInstrument (live metadata), "capability": InstrumentCapability, "eligible": bool\|null, "eligibility": string, "features": ScannerRow, "forecast": Forecast\|null, "book": {ts, vs, bids[10], asks[10], sane}\|null, "mtf": {timeframes: {3d,2d,1d,1h,15m,5m,1m: {completed, ctx}}}\|null, "regime": [string], "decisions": [Decision] }` |
+| `/api/instrument/{pair}/candles?resolution=1\|5\|15\|60\|1D\|2D\|3D` | `[Candle]` (proxied + 15 s cache; `complete` flag; `2D` aggregated from two completed `1D`; 1 s candles are not served without a trade stream). |
 | `/api/forecasts` | `[Forecast]` for current candidates. |
-| `/api/decisions` | `[Decision]` (every approve/reject with full numeric explanation). |
+| `/api/decisions` | `[Decision]` newest first, last 300 (every approve/reject with full numeric explanation). |
 | `/api/audit?limit=N` | `[AuditEvent]` newest first. |
-| `/api/positions` | `{ "open": [Position], "closed": [ClosedTrade], "fills": [Fill] }` |
-| `/api/capital` | `Account` + `Target` |
+| `/api/positions` | `{ "open": [Position], "closed": [ClosedTrade], "fills": [Fill], "incidents": [Incident] }` |
+| `/api/capital` | `Account` + `"target": Target` + `"equity_curve": [[ts_ms, equity]]` |
 | `/api/agents` | `[AgentStatus]` |
 | `/api/risk` | `RiskParams` (current mode's hard ceilings and live governor state) |
 
@@ -39,6 +41,9 @@ configured OFF; no endpoint can enable it.
 | `/api/control/cancel_entries` | cancel outstanding (paper) entry orders |
 | `/api/control/flatten` | emergency flatten all paper positions at market |
 | `/api/control/kill` | kill switch: flatten + disable entries until restart |
+| `/api/control/confirm_withdrawal` body `{ "amount": number, "confirmed_balance": number, "user_confirmed": true }` | only at the stage-1 checkpoint: records the user-confirmed withdrawal and reconciled balance, switches the paper ledger to stage 2 / protective policy (never touches a wallet) |
+
+Malformed bodies return `ok: false` with the expected shape in `message`.
 
 ## WebSocket
 
@@ -61,8 +66,32 @@ State = {
   "positions": [Position],
   "fills": [Fill], "closed": [ClosedTrade],
   "account": Account, "target": Target, "agents": [AgentStatus], "controls": ControlsState,
-  "audit": [AuditEvent]             // newest first, last 200
+  "audit": [AuditEvent],            // newest first, last 200
+  "calibration": Calibration, "readiness": { FLAG: boolean, ... }, "live": LiveStatus
 }
+Decision = { "ts_ms", "trace_id", "pair", "side": "Long"|"Short", "decision": "taken"|"rejected",
+  "reason": string, "entry", "tp_price", "sl_price", "ev_net_bps", "approved_order": ApprovedOrder|null,
+  "instrument": InstrumentCapability|null,
+  "explanation": { "model_id", "formulas": {..}, "inputs": {bid, ask, mid, obi_10, spread_bps, r_60,
+     sigma_1s, book_age_ms, lambda_mom, gamma_obi, k_stop, k_target, taker_fee, paper_slippage, fx_usdtinr},
+     "intermediates": {mu_per_s, sigma_120, tp_ret, sl_ret, cost},
+     "sides": [{side, p_target, p_stop, p_neither, e_t_target, e_t_stop, e_ret_neither, ev_gross, ev_net}],
+     "regime": [string], "data_ok": bool, "calibrated": bool } }
+Calibration = { "model", "target", "n_resolved", "n_pending", "n_dropped_gaps", "brier",
+  "brier_climatology", "log_loss", "ece_10bin", "mean_p", "hit_rate", "calibrated": bool,
+  "verdict": string, "criteria": string, "method": string }
+LiveStatus = { "gate": { compiled, execution_mode, operator_confirmed, credentials_configured,
+  enabled, blocked_by, readiness: { items: { ITEM: { status: "pass"|"fail"|"not_run", detail } } } },
+  "desk_live_path": string, "owner_command": string }
+```
+
+## Audit store
+
+Append-only JSONL under `data/desk/` (gitignored; override `QE_DATA_DIR`): `decisions.jsonl`,
+`governor.jsonl` (raw qe-risk audit records), `fills.jsonl`, `closed.jsonl`, `equity.jsonl`
+(per trade + 10 s heartbeat), `incidents.jsonl`, `audit.jsonl`. Lines are never rewritten.
+
+```jsonc
 ScannerRow = { "pair": string, "margin": "USDT"|"INR", "last": number, "mark": number|null,
   "funding_rate": number|null, "change_24h_pct": number|null, "volume_24h": number|null,
   "ret_10s": number|null, "ret_30s": number|null, "ret_60s": number|null, "ret_300s": number|null,

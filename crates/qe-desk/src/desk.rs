@@ -261,6 +261,8 @@ pub struct Desk {
     pub ew_spread: HashMap<String, (f64, u32)>,
     pub instruments: HashMap<String, (i64, FuturesInstrument)>,
     pub meta_cursor: usize,
+    /// instrument key -> (failed at, error); retried after 10 min, never guessed
+    pub meta_fail: HashMap<String, (i64, String)>,
     pub mtf: HashMap<String, (i64, Value)>,
     pub ctx: HashMap<String, BTreeMap<ContextTf, features::TfContext>>,
     pub regimes: HashMap<String, Vec<String>>,
@@ -385,6 +387,7 @@ impl Desk {
             ew_spread: HashMap::new(),
             instruments: HashMap::new(),
             meta_cursor: 0,
+            meta_fail: HashMap::new(),
             mtf: HashMap::new(),
             ctx: HashMap::new(),
             regimes: HashMap::new(),
