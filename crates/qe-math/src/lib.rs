@@ -4,6 +4,7 @@
 //! pseudo-random routine (`SplitMix64`) is explicitly seeded, so identical inputs
 //! always reproduce identical outputs. Formulas are documented inline.
 
+pub mod barrier;
 pub mod dist;
 pub mod explain;
 pub mod features;
