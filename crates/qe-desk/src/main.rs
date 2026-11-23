@@ -41,7 +41,22 @@ struct App {
 
 // ---------------------------------------------------------------- config
 
-fn load_settings() -> Settings {
+/// Profile requested on the command line (`--profile <name>`) or by `QE_PROFILE`.
+fn requested_profile() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let cli = args
+        .iter()
+        .position(|a| a == "--profile")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| {
+            args.iter()
+                .find_map(|a| a.strip_prefix("--profile=").map(String::from))
+        });
+    cli.or_else(|| std::env::var("QE_PROFILE").ok())
+        .filter(|p| !p.trim().is_empty())
+}
+
+fn load_settings() -> anyhow::Result<Settings> {
     let mut st = Settings::default();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
     let read = |f: &str| -> Option<toml::Table> {
@@ -50,7 +65,34 @@ fn load_settings() -> Settings {
             .parse::<toml::Table>()
             .ok()
     };
-    if let Some(t) = read("risk-limits.toml") {
+    let limits = read("risk-limits.toml");
+    let profile = requested_profile();
+    let experiment = match profile.as_deref() {
+        None | Some("standard") | Some("default") => None,
+        Some("experiment") | Some(EXPERIMENT_PROFILE) => {
+            let t = read("experiment-max-leverage.toml").ok_or_else(|| {
+                anyhow::anyhow!(
+                    "experiment profile: configs/experiment-max-leverage.toml missing or invalid"
+                )
+            })?;
+            let mode = |t: &toml::Table| {
+                t.get("execution_mode")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            };
+            experiment_guard(
+                mode(&t).as_deref(),
+                limits.as_ref().and_then(mode).as_deref(),
+                std::env::var(qe_coindcx::live::ENV_EXECUTION_MODE)
+                    .ok()
+                    .as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            Some(t)
+        }
+        Some(other) => anyhow::bail!("unknown profile {other:?} (use standard or experiment)"),
+    };
+    if let Some(t) = limits {
         let f = |k: &str| t.get(k).and_then(|v| v.as_float());
         if let Some(m) = t.get("execution_mode").and_then(|v| v.as_str()) {
             // Only "paper" is honoured; anything else is refused and logged.
@@ -108,7 +150,25 @@ fn load_settings() -> Settings {
         qe_risk::RiskPolicy::protective(),
         read("protective-mode.toml"),
     );
-    st
+    if let Some(t) = experiment {
+        st.profile = EXPERIMENT_PROFILE.into();
+        let f = |k: &str| t.get(k).and_then(|v| v.as_float());
+        if let Some(v) = f("paper_start_equity_inr") {
+            st.paper_start_equity_inr = v;
+        }
+        if let Some(v) = f("paper_slippage_bps") {
+            st.paper_slippage_bps = v.max(0.0);
+        }
+        if std::env::var_os("QE_DATA_DIR").is_none() {
+            if let Some(dd) = t.get("data_dir").and_then(|v| v.as_str()) {
+                let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(dd);
+                std::env::set_var("QE_DATA_DIR", p);
+            }
+        }
+    }
+    Ok(st)
 }
 
 // ---------------------------------------------------------------- loops
@@ -416,7 +476,13 @@ async fn meta_loop(c: PublicClient, s: S) {
                 .iter()
                 .take(TOP_N * 2)
                 .filter_map(|r| r["pair"].as_str().map(String::from))
-                .find(|p| stale(&d, &format!("{p}|{TRADE_MARGIN}")));
+                // only pairs that have an INR contract, and not a record that just
+                // failed: either would pin this loop on one pair forever
+                .filter(|p| d.fut_inr.contains(p))
+                .find(|p| {
+                    let k = format!("{p}|{TRADE_MARGIN}");
+                    stale(&d, &k) && d.meta_fail.get(&k).is_none_or(|x| now - x.0 > 600_000)
+                });
             match top {
                 Some(p) => Some((p, TRADE_MARGIN.to_string())),
                 None => {
@@ -435,14 +501,13 @@ async fn meta_loop(c: PublicClient, s: S) {
                     all.sort_by(|a, b| {
                         (a.1 != TRADE_MARGIN, &a.0).cmp(&(b.1 != TRADE_MARGIN, &b.0))
                     });
-                    if all.is_empty() {
-                        None
-                    } else {
-                        Some(all[0].clone())
-                    }
+                    all.into_iter().next()
                 }
             }
         };
+        // INR records are what the paper account trades: fetch them at 4 req/s
+        // until all are cached (the metadata client paces itself at 8 req/s).
+        let fast = next.as_ref().is_some_and(|(_, m)| m == TRADE_MARGIN);
         if let Some((p, m)) = next {
             let t0 = now_ms();
             match c.futures_instrument(&p, &m).await {
@@ -479,7 +544,7 @@ async fn meta_loop(c: PublicClient, s: S) {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(if fast { 250 } else { 1_000 })).await;
     }
 }
 
@@ -831,7 +896,7 @@ fn readiness(d: &Desk) -> Value {
 fn state_json(d: &Desk) -> Value {
     let now = now_ms();
     json!({
-        "server_time_ms": now, "mode": "paper",
+        "server_time_ms": now, "mode": "paper", "profile": profile_json(d),
         "live_orders_enabled": false, "live": live_status(),
         "health": health_json(d), "universe": universe_counts(d),
         "scanner": d.scanner.iter().take(60).collect::<Vec<_>>(),
@@ -852,9 +917,11 @@ async fn h_state(a: AxState<App>) -> Json<Value> {
 
 async fn h_status(a: AxState<App>) -> Json<Value> {
     let d = a.s.read().await;
-    Json(json!({"health": health_json(&d), "mode": "paper",
+    Json(
+        json!({"health": health_json(&d), "mode": "paper", "profile": profile_json(&d),
         "live_orders_enabled": false, "live": live_status(),
-        "readiness": readiness(&d), "calibration": d.calibration_json(), "controls": controls_json(&d)}))
+        "readiness": readiness(&d), "calibration": d.calibration_json(), "controls": controls_json(&d)}),
+    )
 }
 
 fn eligibility(d: &Desk, pair: &str, m: &str) -> (Option<bool>, String) {
@@ -1275,7 +1342,16 @@ async fn ws_push(mut sock: WebSocket, a: App) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let addr = std::env::var("QE_DESK_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
-    let settings = load_settings();
+    let settings = match load_settings() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[config] startup refused: {e}");
+            std::process::exit(2);
+        }
+    };
+    if settings.is_experiment() {
+        eprintln!("*** {EXPERIMENT_BANNER} *** (paper only; configs/experiment-max-leverage.toml)");
+    }
     let mut desk = Desk::new(settings);
     desk.load_calibration();
     let s: S = Arc::new(RwLock::new(desk));
@@ -1283,9 +1359,10 @@ async fn main() -> anyhow::Result<()> {
         let mut d = s.write().await;
         let st = serde_json::to_value(&d.settings).unwrap_or_default();
         let dir = d.store.dir.display().to_string();
+        let profile = d.settings.profile.clone();
         d.audit(
             "startup",
-            format!("desk started (paper only); store {dir}"),
+            format!("desk started (paper only, profile {profile}); store {dir}"),
             st,
         );
     }
