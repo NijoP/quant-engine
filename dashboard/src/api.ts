@@ -154,9 +154,17 @@ export interface AuditEntry {
   data: unknown;
 }
 
+export interface DeskProfile {
+  name: string;
+  experiment: boolean;
+  banner: string | null;
+  rules: string[];
+}
+
 export interface DeskState {
   server_time_ms: number;
   mode: string;
+  profile?: DeskProfile;
   live_orders_enabled: boolean;
   health: Health;
   universe: Universe;
