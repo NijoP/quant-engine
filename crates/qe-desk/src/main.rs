@@ -556,6 +556,28 @@ async fn monitor_loop(c: PublicClient, s: S) {
 
 // ---------------------------------------------------------------- views
 
+/// s2-live readiness, surfaced read-only. The desk never loads credentials
+/// (credentials_configured is passed as false) and holds no private client, so
+/// live execution is refused by construction; this only reports the gate and
+/// its checklist. The signing self-test is a pure RFC 4231 vector check.
+fn live_status() -> Value {
+    let mut gate = qe_coindcx::live::LiveGate::from_env(false);
+    let st = match qe_coindcx::auth::signing_self_test() {
+        Ok(()) => qe_coindcx::live::CheckStatus::Pass("HMAC-SHA256 test vectors pass".into()),
+        Err(e) => qe_coindcx::live::CheckStatus::Fail(e),
+    };
+    gate.readiness
+        .set(qe_coindcx::live::CheckItem::SigningSelfTest, st);
+    gate.readiness.set(
+        qe_coindcx::live::CheckItem::CredentialsConfigured,
+        qe_coindcx::live::CheckStatus::NotRun(
+            "the desk never reads credentials; the owner runs the live_readiness command".into(),
+        ),
+    );
+    json!({"gate": gate.status(), "desk_live_path": "none: qe-desk holds no private client; live orders refused",
+        "owner_command": "cargo run -p qe-coindcx --bin live_readiness"})
+}
+
 fn controls_json(d: &Desk) -> Value {
     json!({"scanner_running": d.controls.scanner_running, "paper_running": d.controls.paper_running,
         "strategy_enabled": d.controls.strategy_enabled, "entries_paused": d.gov.entries_paused,
@@ -603,7 +625,7 @@ fn state_json(d: &Desk) -> Value {
     let now = now_ms();
     json!({
         "server_time_ms": now, "mode": "paper",
-        "live_orders_enabled": qe_coindcx::orders::LiveGate::default().enabled(),
+        "live_orders_enabled": false, "live": live_status(),
         "health": health_json(d), "universe": universe_counts(d),
         "scanner": d.scanner.iter().take(60).collect::<Vec<_>>(),
         "opportunities": d.opportunities,
@@ -624,7 +646,7 @@ async fn h_state(a: AxState<App>) -> Json<Value> {
 async fn h_status(a: AxState<App>) -> Json<Value> {
     let d = a.s.read().await;
     Json(json!({"health": health_json(&d), "mode": "paper",
-        "live_orders_enabled": qe_coindcx::orders::LiveGate::default().enabled(),
+        "live_orders_enabled": false, "live": live_status(),
         "readiness": readiness(&d), "calibration": d.calib.status(), "controls": controls_json(&d)}))
 }
 
