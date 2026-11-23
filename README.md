@@ -20,6 +20,9 @@ exit-only. Live execution stays owner-controlled and disabled by default. Full m
 rounding and deadline procedure: [docs/CAMPAIGN_24NOV.md](docs/CAMPAIGN_24NOV.md). Example
 profile: `configs/campaign-24nov.toml`.
 
+**Live decision: NO-GO** ([docs/LIVE_GO_NO_GO.md](docs/LIVE_GO_NO_GO.md)). The requirement-by-requirement evidence is in
+[docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md).
+
 Earlier targets (INR 18,000; INR 3,000 at 22:30 IST plus an INR 2,000 withdrawal; INR 50,000 by
 17:00 IST) are **historical** and superseded.
 
