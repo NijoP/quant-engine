@@ -69,8 +69,30 @@ State = {
   "fills": [Fill], "closed": [ClosedTrade],
   "account": Account, "target": Target, "agents": [AgentStatus], "controls": ControlsState,
   "audit": [AuditEvent],            // newest first, last 200
-  "calibration": Calibration, "readiness": { FLAG: boolean, ... }, "live": LiveStatus
+  "calibration": Calibration, "readiness": { FLAG: boolean, ... }, "live": LiveStatus,
+  "campaign": Campaign              // 24 Nov campaign, see docs/CAMPAIGN_24NOV.md
 }
+// Money is a decimal string. Milestone required_inr is rounded to the whole rupee; live amounts use 2 dp.
+// The schedule is a mathematical requirement, not a forecast; no field here feeds sizing or entries.
+Campaign = { "start": iso8601, "deadline": iso8601,          // 2026-11-24T00:00+05:30 / 22:00+05:30
+  "start_equity_inr": string, "target_inr": "50000",
+  "equity_inr": string|null,                                  // null when no verified figure exists
+  "equity_source": "live_exchange"|"paper",                   // paper is never shown as real capital
+  "equity_currency_note": string,                             // currency and any INR/USDT conversion source
+  "required_now_inr": string, "delta_inr": string,            // delta = actual - required (negative = behind)
+  "prev_milestone": Milestone, "next_milestone": Milestone,
+  "milestones": [Milestone],                                  // hours 0..22, actual_inr null until reached
+  "realised_pnl_inr": string, "unrealised_pnl_inr": string,   // always reported separately
+  "remaining_inr": string, "remaining_secs": number, "drawdown_inr": string,
+  "required_hourly_rate": number|null,                        // (50000/E)^(1/(22-h)) - 1, display only
+  "checkpoints_done": number,
+  "status": "ahead"|"on_track"|"behind"|"stopped"|"completed"|"expired",
+  "floor_inr": "95", "loss_budget_inr": "5", "loss_used_inr": string,
+  "per_trade_max_loss_inr": "1", "risk_budget_now_inr": string,
+  "open_position": null | { "pair": string, "side": string, "held_secs": number, "unrealised_inr": string },
+  "stop_reason": string|null, "exit_only": boolean,
+  "equity_history": [ { "t": iso8601, "equity_inr": string } ] }  // verified campaign equity only, never synthesised
+Milestone = { "hour": number, "at": iso8601, "required_inr": string, "actual_inr": string|null }
 Decision = { "ts_ms", "trace_id", "pair", "side": "Long"|"Short", "decision": "taken"|"rejected",
   "reason": string, "entry", "tp_price", "sl_price", "ev_net_bps", "approved_order": ApprovedOrder|null,
   "instrument": InstrumentCapability|null,
@@ -127,6 +149,7 @@ Account = { "currency": "INR", "paper": true, "starting_equity": number, "equity
   "policy": { "tier": "growth"|"protective", "risk_per_trade_frac": number, "max_leverage": number,
               "max_positions": number, "daily_loss_limit_frac": number, "kelly_fraction": number,
               "max_hold_s": 120 } }
+// Target: older stage-plan view; its deadline comes from configs/risk-limits.toml. Use Campaign for the 24 Nov campaign.
 Target = { "stage": 1|2, "start_equity": number, "target_equity": number, "deadline_ms": number,
   "hours_remaining": number, "growth_required": number,
   "scenarios": [ { "trades_per_hour": number, "required_return_per_trade": number } ],

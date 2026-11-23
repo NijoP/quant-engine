@@ -1,0 +1,36 @@
+# 24 NOVEMBER 2026 CAMPAIGN - example campaign risk profile (PAPER default).
+# See docs/CAMPAIGN_24NOV.md. INR 100 -> INR 50,000 between 00:00 and 22:00 IST
+# on 24 Nov 2026, one continuous campaign with no intermediate withdrawals.
+#
+# The hourly schedule target_equity(h) = 100 * 500^(h/22) is a mathematical
+# requirement for progress reporting, NOT a trading forecast. It never changes
+# sizing, leverage, signal thresholds or entries. These limits are fixed: do not
+# loosen them to make the target reachable.
+execution_mode = "paper"              # live stays owner-armed only (docs/GO_LIVE.md)
+
+[schedule]
+start = "2026-11-24T00:00:00+05:30"   # epoch ms 1795458600000
+deadline = "2026-11-24T22:00:00+05:30" # epoch ms 1795537800000; after it: exit-only
+start_equity_inr = "100"
+target_inr = "50000"
+hours = 22
+display_rounding = "nearest_rupee_half_away_from_zero"  # calculations stay unrounded
+
+[risk]
+floor_inr = "95"                      # permanent campaign stop at or below this equity
+per_trade_max_loss_inr = "1"          # includes estimated fees, slippage and stop-loss loss
+campaign_loss_budget_inr = "5"        # cumulative loss from the initial INR 100
+max_open_positions = 1
+max_hold_ms = 120000
+isolated_margin = true
+allow_size_up_after_loss = false      # no martingale, no doubling, no averaging down
+allow_raise_to_min_notional = false   # reject, never raise size to meet exchange minimums
+allow_stop_beyond_liquidation = false
+behind_schedule_changes_risk = false  # a missed milestone is a reporting condition only
+require_calibration_for_live = true
+require_positive_net_ev_for_live = true
+
+[equity]
+live_source = "exchange_wallet"       # live reporting uses the real exchange balance
+paper_label = "PAPER"                 # paper equity is never shown as real capital
+combine_currencies = false            # INR and USDT are not summed without a stated rate source

@@ -35,7 +35,7 @@ Check the current text yourself before running anything live.
 - [ ] I flattened all positions and cancelled all orders before the first live session (the readiness check fails while exposure exists).
 - [ ] I alone set `QE_EXECUTION_MODE=live` and `QE_LIVE_OPERATOR_CONFIRM`. No automated process sets them.
 - [ ] I know how to stop everything: `qe-live-check kill`, then `qe-live-check checkpoint --kind adhoc`. If that cannot confirm flat, use the CoinDCX app to cancel orders and exit positions.
-- [ ] I do the 17:00 IST final checkpoint with `qe-live-check checkpoint` (the 22:30 checkpoint and INR 2,000 withdrawal were removed on 23 Nov 2026). Any withdrawal is mine to do manually in the CoinDCX app. `data/live/` (audit log and reports) is part of my 5-year archive.
+- [ ] I do the 22:00 IST 24 Nov campaign final checkpoint with `qe-live-check checkpoint` ([CAMPAIGN_24NOV.md](CAMPAIGN_24NOV.md)). The 22:30 checkpoint, the INR 2,000 withdrawal and the 17:00 deadline are historical. Any withdrawal is mine to do manually in the CoinDCX app. `data/live/` (audit log and reports) is part of my 5-year archive.
 
 ## Engineering commitments in this repository
 
