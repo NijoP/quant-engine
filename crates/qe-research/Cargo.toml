@@ -1,0 +1,17 @@
+[package]
+name = "qe-research"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "qe-research"
+path = "src/main.rs"
+
+[dependencies]
+qe-math = { path = "../qe-math" }
+qe-coindcx = { path = "../qe-coindcx" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }

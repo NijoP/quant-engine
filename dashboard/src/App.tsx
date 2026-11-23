@@ -9,7 +9,7 @@ import {
   type Position,
   type ScannerRow,
 } from "./api";
-import { AgentsPanel, ControlsPanel, DecisionsPanel, GlobalStatus, InstrumentPanel, TargetPanel, UniverseTable } from "./panels";
+import { AgentsPanel, ControlsPanel, DecisionsPanel, GlobalStatus, InstrumentPanel, ReadinessPanel, TargetPanel, UniverseTable } from "./panels";
 
 const POLL_MS = 1000;
 const DASH = "—";
@@ -126,6 +126,7 @@ export default function App() {
       {state ? (
         <>
           <GlobalStatus state={state} serverNow={serverNow} offline={offline} />
+          <ReadinessPanel state={state} />
           <ControlsPanel controls={state.controls} offline={offline} />
           <AccountStrip state={state} />
           <div className="grid2">
@@ -321,8 +322,8 @@ function OpportunitiesPanel({ rows }: { rows: Opportunity[] }) {
                   <td className="r">{bps(o.ev_gross_bps)}</td>
                   <td className="r">{bps(o.cost_bps)}</td>
                   <td className={"r " + sign(o.ev_net_bps)}>{bps(o.ev_net_bps)}</td>
-                  <td className="r">{pct(o.tp_pct, 3)}</td>
-                  <td className="r">{pct(o.sl_pct, 3)}</td>
+                  <td className="r">{num(o.tp_pct, 3)}%</td>
+                  <td className="r">{num(o.sl_pct, 3)}%</td>
                   <td className="r">{o.horizon_s}s</td>
                   <td className="r">{qty(o.qty)}</td>
                   <td className="r">{money(o.notional)}</td>

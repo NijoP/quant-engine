@@ -120,7 +120,8 @@ input { width: 140px; }
 .errline { color: var(--warn); padding: 2px 0; }
 th.sortable { cursor: pointer; }
 tr.click { cursor: pointer; }
-.kv.cols { grid-template-columns: repeat(auto-fit, minmax(110px, auto) minmax(0, 1fr)); margin: 6px 0; }
+.kv.cols { grid-template-columns: repeat(auto-fill, 190px minmax(170px, 1fr)); margin: 6px 0; }
+.kv b { min-width: 0; overflow-wrap: anywhere; }
 .chart { width: 100%; height: 200px; background: #0e131b; border: 1px solid var(--border); }
 .chart .cu line, .chart .cu rect { stroke: var(--pos); fill: var(--pos); }
 .chart .cd line, .chart .cd rect { stroke: var(--neg); fill: var(--neg); }

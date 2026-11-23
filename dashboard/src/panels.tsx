@@ -74,7 +74,8 @@ export function GlobalStatus({ state, serverNow, offline }: { state: DeskState; 
   const c = state.controls;
   const items: [string, string, "ok" | "warn" | "bad"][] = [
     ["CoinDCX REST", offline ? "desk offline" : h.errors > 0 ? `${h.errors} errors` : "ok", offline ? "bad" : h.errors > 0 ? "warn" : "ok"],
-    ["Futures feed", rtAge === null ? "no data" : `${rtAge.toFixed(1)}s ago${h.stale ? " STALE" : ""}`, rtAge === null || h.stale || rtAge > 5 ? "bad" : "ok"],
+    ["Futures feed", rtAge === null ? "no data" : `${(h as { feed?: string }).feed ?? ""} ${rtAge.toFixed(1)}s ago${h.stale ? " STALE" : ""}`, rtAge === null || h.stale || rtAge > 5 ? "bad" : (h as { feed?: string }).feed === "ws" ? "ok" : "warn"],
+    ["WebSocket", (() => { const w = (h as { ws?: { connected?: boolean; disconnects?: number } }).ws; const n = (h as { ws_live_books?: number }).ws_live_books; return w ? `${w.connected ? "connected" : "DOWN"} · ${n ?? 0} live books · ${w.disconnects ?? 0} disc.` : "not reported"; })(), (h as { ws?: { connected?: boolean } }).ws?.connected ? "ok" : "warn"],
     ["Universe scan", isNum(state.universe.refreshed_ms) ? `${ago(state.universe.refreshed_ms, serverNow)} ago` : "pending", isNum(state.universe.refreshed_ms) ? "ok" : "warn"],
     ["Forecast / strategy", c ? (c.strategy_enabled ? "evaluating" : "disabled") : "not reported", c?.strategy_enabled ? "ok" : "warn"],
     ["Agents", agents.length ? `${agents.length - bad}/${agents.length} ok` : "not reported", agents.length && !bad ? "ok" : "warn"],
@@ -90,6 +91,83 @@ export function GlobalStatus({ state, serverNow, offline }: { state: DeskState; 
           <div className="value">{v}</div>
         </div>
       ))}
+    </section>
+  );
+}
+
+/* ---------------- A2. Readiness, calibration authority, live gate ---------------- */
+export function ReadinessPanel({ state }: { state: DeskState }) {
+  const r = state.readiness ?? {};
+  const cal = state.calibration;
+  const live = state.live;
+  const flags = Object.entries(r).filter(([, v]) => typeof v === "boolean") as [string, boolean][];
+  return (
+    <section className="panel">
+      <h2>Readiness — each flag from an observed runtime condition</h2>
+      <div className="kv cols">
+        {flags.map(([k, v]) => (
+          <Fragment key={k}>
+            <span>{k}</span>
+            <b className={v ? "pos" : "neg"}>{v ? "YES" : "NO"}</b>
+          </Fragment>
+        ))}
+      </div>
+      <h2>
+        Forecast calibration (strategy authority){" "}
+        {cal && <span className={"badge " + (cal.calibrated ? "safe" : "danger")}>{cal.calibrated ? "CALIBRATED" : "UNCALIBRATED — entries denied"}</span>}
+      </h2>
+      {!cal ? (
+        <div className="empty">Calibration not reported</div>
+      ) : (
+        <>
+          <div className="kv cols">
+            <span>resolved / pending / dropped</span><b>{cal.n_resolved} / {cal.n_pending} / {cal.n_dropped_gaps}</b>
+            <span>Brier vs climatology</span><b>{num(cal.brier, 4)} vs {num(cal.brier_climatology, 4)}</b>
+            <span>ECE (10 bins)</span><b>{num(cal.ece_10bin, 4)}</b>
+            <span>mean p / hit rate</span><b>{pct(cal.mean_p, 1)} / {pct(cal.hit_rate, 1)}</b>
+          </div>
+          <div className="muted">{cal.verdict} · forward-monitor criteria: {cal.criteria} · {cal.method}</div>
+          {(() => {
+            const reg = (cal as unknown as { registry?: { model: string; generated_ms: number | null; load_error: string | null;
+              targets: Record<string, { status: string; n_oos: number | null; reasons: string[] | null }> } }).registry;
+            if (!reg) return null;
+            return (
+              <div className="kv cols">
+                <span>registry model</span><b>{reg.model}{reg.load_error ? ` (load error: ${reg.load_error})` : ""}</b>
+                {Object.entries(reg.targets).map(([t, e]) => (
+                  <Fragment key={t}>
+                    <span>{t}</span>
+                    <b className={e.status === "calibrated" ? "pos" : "neg"}>{e.status} · n_oos {e.n_oos ?? "—"} · {(e.reasons ?? []).join("; ")}</b>
+                  </Fragment>
+                ))}
+              </div>
+            );
+          })()}
+        </>
+      )}
+      <h2>
+        Live execution gate (s2-live){" "}
+        <span className={"badge " + (live?.gate.enabled ? "danger" : "safe")}>{live?.gate.enabled ? "OPEN" : "CLOSED"}</span>
+      </h2>
+      {!live ? (
+        <div className="empty">Live gate not reported</div>
+      ) : (
+        <>
+          <div className="kv cols">
+            <span>compiled</span><b>{String(live.gate.compiled)}</b>
+            <span>execution mode</span><b>{live.gate.execution_mode}</b>
+            <span>operator confirmed</span><b>{String(live.gate.operator_confirmed)}</b>
+            <span>blocked by</span><b>{JSON.stringify(live.gate.blocked_by)}</b>
+            {Object.entries(live.gate.readiness.items).map(([k, v]) => (
+              <Fragment key={k}>
+                <span>{k}</span>
+                <b className={v.status === "pass" ? "pos" : v.status === "fail" ? "neg" : "muted"}>{v.status}: {v.detail}</b>
+              </Fragment>
+            ))}
+          </div>
+          <div className="muted">{live.desk_live_path} · owner check: <code>{live.owner_command}</code></div>
+        </>
+      )}
     </section>
   );
 }
@@ -192,7 +270,7 @@ export function UniverseTable({ onSelect }: { onSelect: (pair: string, margin: s
 
 /* ---------------- D/E. Instrument intelligence + forecast ---------------- */
 const RES = [
-  ["1m", "1"], ["5m", "5"], ["15m", "15"], ["1h", "60"], ["1d", "1D"],
+  ["1s", "1S"], ["1m", "1"], ["5m", "5"], ["15m", "15"], ["1h", "60"], ["1d", "1D"], ["2d", "2D"], ["3d", "3D"],
 ] as const;
 
 function CandleChart({ candles }: { candles: Candle[] }) {
@@ -245,7 +323,7 @@ export function InstrumentPanel({ sel }: { sel: { pair: string; margin: string }
             {RES.map(([l, r]) => (
               <button key={r} className={"tab " + (res === r ? "on" : "")} onClick={() => setRes(r)}>{l}</button>
             ))}
-            <span className="muted">completed candles only · 3d / 2d / 1s views not exposed by desk API v1</span>
+            <span className="muted">completed candles only · 2d aggregated from two completed 1d candles · 1s built from WS trades (subscribed candidates only)</span>
           </div>
           {candles.data ? <CandleChart candles={candles.data} /> : <div className="empty">{candles.error ? "Candles unavailable" : "Loading candles…"}</div>}
           {ft && (
@@ -451,6 +529,7 @@ const CONTROLS: Ctl[] = [
   { label: "Strategy eval", path: "/api/control/strategy", body: (c) => ({ enabled: !c.strategy_enabled }), on: (c) => c.strategy_enabled },
   { label: "Pause entries", path: "/api/control/pause_entries", body: (c) => ({ paused: !c.entries_paused }), on: (c) => c.entries_paused },
   { label: "Cancel entry orders", path: "/api/control/cancel_entries" },
+  { label: "Reconnect WS", path: "/api/control/ws_reconnect" },
   { label: "Emergency flatten", path: "/api/control/flatten", danger: true, confirm: "Flatten ALL paper positions at market?" },
   { label: "KILL SWITCH", path: "/api/control/kill", danger: true, confirm: "Kill: flatten and disable entries until restart?" },
 ];

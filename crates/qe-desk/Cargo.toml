@@ -11,6 +11,9 @@ path = "src/main.rs"
 [dependencies]
 qe-math = { path = "../qe-math" }
 qe-coindcx = { path = "../qe-coindcx" }
+qe-risk = { path = "../qe-risk" }
+qe-research = { path = "../qe-research" }
+toml = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
